@@ -56,10 +56,21 @@ class AuthFI:
         client_secret=None,
         auto_sync=True,
         jwks_ttl=300,
+        issuer=None,
+        base_domain="authfi.io",
     ):
         self.tenant = tenant
         self.api_key = api_key
+        # Where this SDK's management calls go. NOT where signing keys live — see self.issuer.
         self.api_url = api_url
+        # The project's own origin, and the only place its signing keys are published.
+        #
+        # Every AuthFI project IS an issuer at https://<tenant>.authfi.io, and that origin serves
+        # /.well-known/jwks.json. Pass `issuer` for a self-hosted deployment or a custom domain;
+        # pass `base_domain` for a different zone (authfi.app on dev). A domain must never be
+        # hard-coded into an issuer, which is why both levels are configurable.
+        self.base_domain = base_domain
+        self.issuer = (issuer or f"https://{tenant}.{base_domain}").rstrip("/")
         self.application_id = application_id
         self.client_secret = client_secret  # required for cloud identity
         self.auto_sync = auto_sync
@@ -88,6 +99,30 @@ class AuthFI:
     def _auth_url(self):
         return f"{self._tenant_base}/v1"
 
+    @property
+    def jwks_url(self):
+        """Where this project publishes its signing keys.
+
+        NOT `_tenant_base`. Both shapes answer for an ordinary tenant and return the same keys —
+        measured 2026-09-24, `api.authfi.io/quefly/.well-known/jwks.json` and
+        `https://quefly.authfi.io/.well-known/jwks.json` serve the identical kid — so the
+        api-host form is not wrong so much as narrower, in two ways that matter:
+
+          - It 404s for a RESERVED-but-routable project. `api.authfi.io/platform/...` is a 404
+            while `https://platform.authfi.io/...` is a 200, because the edge dispatches those
+            names differently. A tenant whose slug the platform reserves would be unverifiable.
+          - It is not the ISSUER. `verify_token` asserts `iss == self.issuer`, so fetching keys
+            from a different origin than the issuer being asserted means trusting one host to
+            vouch for tokens minted by another. Fetching from the issuer is the security
+            property, not merely a URL that happens to work.
+
+        The original `{api_url}/v1/{tenant}/...` is dead on every axis — /v1 404s for every
+        tenant, reserved or not. A JWKS that cannot be fetched means no token can be verified,
+        which is this SDK's whole job, so on defaults the failure was total and surfaced as
+        "token verification failed" rather than as a misconfigured URL.
+        """
+        return f"{self.issuer}/.well-known/jwks.json"
+
     # --- JWKS ---
 
     def _fetch_jwks(self):
@@ -95,7 +130,7 @@ class AuthFI:
         if self._jwks and now - self._jwks_fetched < self.jwks_ttl:
             return self._jwks
 
-        req = Request(f"{self._tenant_base}/.well-known/jwks.json")
+        req = Request(self.jwks_url)
         with urlopen(req) as res:
             self._jwks = json.loads(res.read())
             self._jwks_fetched = now
@@ -122,7 +157,7 @@ class AuthFI:
                 "Install with: pip install 'PyJWT[crypto]'"
             ) from e
 
-        jwks_url = f"{self._tenant_base}/.well-known/jwks.json"
+        jwks_url = self.jwks_url
         try:
             jwks_client = PyJWKClient(jwks_url)
             signing_key = jwks_client.get_signing_key_from_jwt(token)

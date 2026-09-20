@@ -25,11 +25,37 @@ class TestAuthFIInit(unittest.TestCase):
         # The edge dispatch is /<slug>/<path> — slug FIRST — and no /manage/ prefix exists.
         self.assertEqual(auth._manage_url, "https://api.authfi.io/acme/v1")
 
-    def test_auth_url(self):
+    def test_jwks_is_on_the_project_origin(self):
+        # It used to be {api_url}/v1/{tenant}/.well-known/jwks.json, which 404s:
+        # api.authfi.io answers 404 for every path this SDK built, and the tenant-in-path
+        # form 404s even against a live project host. No JWKS means no token can be
+        # verified, which is the whole job.
         auth = AuthFI(tenant="acme", api_key="sk_test")
+        # The api-host shape stays correct for what it is for — API calls hang off /v1, and the
+        # tenant base is the slug-first form, NOT /v1/<tenant>.
         self.assertEqual(auth._auth_url, "https://api.authfi.io/acme/v1")
-        # JWKS hangs off the tenant ROOT, not /v1 — the distinction the transposition hid.
         self.assertEqual(auth._tenant_base, "https://api.authfi.io/acme")
+        # But the KEYS come from the issuer, which is a different host on purpose.
+        self.assertEqual(auth.issuer, "https://acme.authfi.io")
+        self.assertEqual(auth.jwks_url, "https://acme.authfi.io/.well-known/jwks.json")
+
+    def test_base_domain_and_issuer_override(self):
+        # A dev deployment lives under authfi.app and a self-hosted one under neither, so a
+        # domain must never be hard-coded into an issuer.
+        self.assertEqual(
+            AuthFI(tenant="acme", api_key="k", base_domain="authfi.app").issuer,
+            "https://acme.authfi.app",
+        )
+        self.assertEqual(
+            AuthFI(tenant="acme", api_key="k", issuer="https://login.acme.example/").jwks_url,
+            "https://login.acme.example/.well-known/jwks.json",
+        )
+
+    def test_api_url_does_not_move_the_keys(self):
+        # Conflating "where I call the API" with "where this project publishes its keys" is
+        # how the wrong host became the default in the first place.
+        auth = AuthFI(tenant="acme", api_key="k", api_url="https://custom.api.com")
+        self.assertEqual(auth.jwks_url, "https://acme.authfi.io/.well-known/jwks.json")
 
 
 class TestTokenVerification(unittest.TestCase):
