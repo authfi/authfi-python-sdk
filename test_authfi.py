@@ -113,6 +113,160 @@ class TestTokenVerification(unittest.TestCase):
             self.assertIn("PyJWT is required", str(ctx.exception))
 
 
+def _rsa_signer():
+    """An RSA keypair, as a real signer and as the JWK the issuer would publish."""
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+    return key, jwk
+
+
+class TestVerifyTokenFetchesTheJWKSItself(unittest.TestCase):
+    """Verification must go through this SDK's own fetcher, not PyJWT's.
+
+    PyJWT's `PyJWKClient` opens its own urllib connection and sends the default
+    `Python-urllib/3.x`, which Cloudflare answers 403 for — so on every production origin
+    verification failed at the edge and reported itself as a signature problem. These tests
+    fail if anything reaches the network except through `_fetch_jwks`, which sends USER_AGENT.
+    """
+
+    def setUp(self):
+        try:
+            import jwt  # noqa: F401
+        except ImportError:
+            self.skipTest("PyJWT not installed")
+        self.key, self.jwk = _rsa_signer()
+        self.jwk["kid"] = "k1"
+        self.auth = AuthFI(tenant="acme", api_key="sk_test")
+        self.requests = []
+
+    def _serve(self, keys):
+        """Stand in for the network, recording every request the SDK actually makes."""
+        def fake_urlopen(req, *a, **kw):
+            self.requests.append(req)
+            body = json.dumps({"keys": keys}).encode()
+            res = MagicMock()
+            res.read.return_value = body
+            res.__enter__.return_value = res
+            res.__exit__.return_value = False
+            return res
+        return patch("authfi.urlopen", side_effect=fake_urlopen)
+
+    # `{}` is a meaningful value here — it means "a token carrying no kid" — so it cannot be
+    # spelled with `headers or {...}`, which treats an empty dict as absent.
+    _DEFAULT_HEADERS = object()
+
+    def _token(self, claims=None, headers=_DEFAULT_HEADERS, key=None, alg="RS256"):
+        import jwt
+
+        body = {"sub": "usr_1", "iss": self.auth.issuer, "exp": int(time.time()) + 300}
+        body.update(claims or {})
+        if headers is self._DEFAULT_HEADERS:
+            headers = {"kid": "k1"}
+        return jwt.encode(body, key or self.key, algorithm=alg, headers=headers)
+
+    def test_verifies_through_our_fetcher_with_the_named_user_agent(self):
+        with self._serve([self.jwk]):
+            claims = self.auth.verify_token(self._token())
+        self.assertEqual(claims["sub"], "usr_1")
+        # One request, ours, named. A PyJWKClient fetch would not appear here at all — it
+        # would bypass this patch entirely and hit the real network.
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0].full_url, self.auth.jwks_url)
+        self.assertEqual(self.requests[0].get_header("User-agent"), "authfi-python-sdk/0.1.0")
+
+    def test_the_jwks_is_cached_across_verifications(self):
+        """PyJWKClient held a fresh client per call, so every verification refetched."""
+        with self._serve([self.jwk]):
+            self.auth.verify_token(self._token())
+            self.auth.verify_token(self._token())
+        self.assertEqual(len(self.requests), 1)
+
+    def test_a_token_naming_an_unpublished_kid_is_refused(self):
+        with self._serve([self.jwk]):
+            with self.assertRaises(AuthFIError) as ctx:
+                self.auth.verify_token(self._token(headers={"kid": "retired"}))
+        self.assertIn("retired", str(ctx.exception))
+
+    def test_a_kidless_token_is_refused_when_several_keys_are_published(self):
+        """Trying keys until one verifies would let a retired key keep validating tokens."""
+        _, second = _rsa_signer()
+        second["kid"] = "k2"
+        with self._serve([self.jwk, second]):
+            with self.assertRaises(AuthFIError) as ctx:
+                self.auth.verify_token(self._token(headers={}))
+        self.assertIn("2 keys", str(ctx.exception))
+
+    def test_a_kidless_token_verifies_against_a_single_published_key(self):
+        with self._serve([self.jwk]):
+            self.assertEqual(self.auth.verify_token(self._token(headers={}))["sub"], "usr_1")
+
+    def test_the_algorithm_comes_from_the_key_not_the_header(self):
+        """alg:none and HS256 confusion both die here: the key decides, the sender does not."""
+        import jwt
+        from cryptography.hazmat.primitives import serialization
+
+        forged = ".".join([
+            base64.urlsafe_b64encode(json.dumps({"alg": "none", "kid": "k1"}).encode())
+            .rstrip(b"=").decode(),
+            base64.urlsafe_b64encode(json.dumps({"sub": "attacker"}).encode())
+            .rstrip(b"=").decode(),
+            "",
+        ])
+        with self._serve([self.jwk]):
+            with self.assertRaises(AuthFIError):
+                self.auth.verify_token(forged)
+
+        # And the classic HS256 confusion: sign with the issuer's PUBLIC key as an HMAC secret,
+        # which succeeds against any verifier that takes its algorithm from the header. Built by
+        # hand with hmac, because PyJWT refuses to encode it — and so would an attacker's own
+        # tooling never be PyJWT.
+        pub = self.key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        import hmac as _hmac
+        import hashlib as _hashlib
+
+        def seg(obj):
+            return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+        signing_input = f'{seg({"alg": "HS256", "kid": "k1"})}.{seg({"sub": "attacker", "iss": self.auth.issuer})}'
+        sig = base64.urlsafe_b64encode(
+            _hmac.new(pub, signing_input.encode(), _hashlib.sha256).digest()
+        ).rstrip(b"=").decode()
+        with self._serve([self.jwk]):
+            with self.assertRaises(AuthFIError):
+                self.auth.verify_token(f"{signing_input}.{sig}")
+
+    def test_an_ed25519_key_verifies_too(self):
+        """Agent tokens under the AI Agent Auth Protocol are EdDSA, not RS256."""
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        key = ed25519.Ed25519PrivateKey.generate()
+        jwk = json.loads(jwt.algorithms.OKPAlgorithm.to_jwk(key.public_key()))
+        jwk["kid"] = "ed1"
+        with self._serve([jwk]):
+            claims = self.auth.verify_token(
+                self._token(headers={"kid": "ed1"}, key=key, alg="EdDSA")
+            )
+        self.assertEqual(claims["sub"], "usr_1")
+
+    def test_a_token_from_another_issuer_is_refused(self):
+        with self._serve([self.jwk]):
+            with self.assertRaises(AuthFIError):
+                self.auth.verify_token(self._token({"iss": "https://evil.example"}))
+
+    def test_an_issuer_publishing_no_keys_is_named_as_such(self):
+        with self._serve([]):
+            with self.assertRaises(AuthFIError) as ctx:
+                self.auth.verify_token(self._token())
+        self.assertIn("published no keys", str(ctx.exception))
+
+
 class TestPermissionRegistration(unittest.TestCase):
     def test_register(self):
         auth = AuthFI(tenant="acme", api_key="sk_test")

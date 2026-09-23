@@ -164,36 +164,82 @@ class AuthFI:
             self._jwks_fetched = now
         return self._jwks
 
-    def verify_token(self, token):
-        """Verify JWT and return decoded claims.
+    @staticmethod
+    def _segment(token, index):
+        """Decode one base64url JWT segment as JSON. Never trusted — only read."""
+        try:
+            return json.loads(_b64decode(token.split(".")[index]))
+        except Exception as e:
+            raise AuthFIError(f"Invalid token format: {e}") from e
 
-        Uses PyJWT with JWKS if available, falls back to unverified decode.
-        Install PyJWT for production: pip install PyJWT[crypto]
+    # The algorithm a key can possibly have signed with, by key type. Taken from the KEY —
+    # fetched over TLS from the issuer — and never from the token header, which the sender
+    # controls. That is what closes alg:none (no key is ever selected) and the HS256 confusion
+    # (a public key is never handed to PyJWT as an HMAC secret).
+    _ALG_BY_KTY = {"RSA": "RS256", "EC": "ES256", "OKP": "EdDSA"}
+
+    def _signing_key_for(self, token):
+        """Find the published key that this token names, as a PyJWK."""
+        import jwt
+
+        kid = self._segment(token, 0).get("kid")
+        keys = (self._fetch_jwks() or {}).get("keys") or []
+        if not keys:
+            raise AuthFIError(f"{self.jwks_url} published no keys")
+
+        # A token without a kid is only unambiguous when the issuer publishes exactly one key.
+        # Guessing among several would mean trying keys until one verifies, which turns a
+        # rotation into a window where a retired key still validates tokens.
+        if kid is None:
+            if len(keys) != 1:
+                raise AuthFIError(
+                    f"token names no kid and {self.jwks_url} publishes {len(keys)} keys"
+                )
+            jwk = keys[0]
+        else:
+            jwk = next((k for k in keys if k.get("kid") == kid), None)
+            if jwk is None:
+                raise AuthFIError(f"no published key with kid {kid!r}")
+
+        alg = jwk.get("alg") or self._ALG_BY_KTY.get(jwk.get("kty"))
+        if not alg:
+            raise AuthFIError(f"key {kid!r} declares no usable algorithm")
+        return jwt.PyJWK(jwk, algorithm=alg), alg
+
+    def verify_token(self, token):
+        """Verify the signature against this project's published keys, and return the claims.
+
+        The JWKS comes from `_fetch_jwks` — this SDK's own fetcher, which sends a named
+        User-Agent and caches for `jwks_ttl`.
+
+        It used to come from PyJWT's `PyJWKClient`, which fetches the document itself through
+        urllib and sends the default `Python-urllib/3.x`. AuthFI's origins sit behind Cloudflare,
+        which answers 403 to that agent — see USER_AGENT. So verification failed at the edge for
+        every caller on a production origin, and reported itself as "token verification failed":
+        a signature problem, for what was a blocked client. The cache was the second cost — every
+        verification re-fetched the JWKS, because PyJWKClient held a fresh client per call.
+
+        There is NO unverified fallback. Accepting an unverified token is an auth bypass.
         """
-        parts = token.split(".")
-        if len(parts) != 3:
+        if len(token.split(".")) != 3:
             raise AuthFIError("Invalid token format")
 
-        # RS256 signature verification via PyJWT is REQUIRED. There is NO
-        # unverified fallback — accepting an unverified token is an auth bypass.
         try:
             import jwt
-            from jwt import PyJWKClient
         except ImportError as e:
             raise AuthFIError(
                 "PyJWT is required for token verification. "
                 "Install with: pip install 'PyJWT[crypto]'"
             ) from e
 
-        jwks_url = self.jwks_url
+        signing_key, alg = self._signing_key_for(token)
         try:
-            jwks_client = PyJWKClient(jwks_url)
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
             return jwt.decode(
                 token,
                 signing_key.key,
-                algorithms=["RS256"],  # pin RS256; blocks alg:none / HS256 confusion
-                options={"verify_aud": False},
+                algorithms=[alg],  # the one algorithm this key can have signed with
+                issuer=self.issuer,
+                options={"verify_aud": False, "verify_iss": True},
             )
         except jwt.PyJWTError as e:
             raise AuthFIError(f"Token verification failed: {e}") from e
