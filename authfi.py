@@ -130,8 +130,8 @@ class AuthFI:
         """Where this project publishes its signing keys.
 
         NOT `_tenant_base`. Both shapes answer for an ordinary tenant and return the same keys —
-        measured 2026-09-24, `api.authfi.io/quefly/.well-known/jwks.json` and
-        `https://quefly.authfi.io/.well-known/jwks.json` serve the identical kid — so the
+        measured 2026-09-24, `api.authfi.io/<tenant>/.well-known/jwks.json` and
+        `https://<tenant>.authfi.io/.well-known/jwks.json` serve the identical kid — so the
         api-host form is not wrong so much as narrower, in two ways that matter:
 
           - It 404s for a RESERVED-but-routable project. `api.authfi.io/platform/...` is a 404
