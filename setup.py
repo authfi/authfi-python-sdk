@@ -25,7 +25,7 @@ setup(
         "cryptography>=3.4.0",
     ],
     author="Quefly",
-    url="https://github.com/queflyhq/authfi-python-sdk",
+    url="https://github.com/authfi/authfi-python-sdk",
     license="Apache-2.0",
     classifiers=[
         "Framework :: Flask",
