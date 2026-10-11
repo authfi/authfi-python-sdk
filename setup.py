@@ -24,7 +24,7 @@ setup(
         # the day that extra changes.
         "cryptography>=3.4.0",
     ],
-    author="Quefly",
+    author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",
     license="Apache-2.0",
     classifiers=[
