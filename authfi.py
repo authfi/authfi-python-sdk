@@ -26,7 +26,7 @@ Usage:
     # On startup
     auth.sync()
 
-Agent authentication (the AI Agent Auth Protocol):
+Agent authentication (the AuthFI Agent Profile):
 
     from authfi import AgentAuth
 
@@ -439,7 +439,7 @@ def _b64encode(raw):
 
 
 # =============================================================================
-# Agent authentication — the AI Agent Auth Protocol (AAP)
+# Agent authentication — the AuthFI Agent Profile
 # =============================================================================
 #
 # An AuthFI agent holds its OWN Ed25519 keypair. It authenticates by signing a
