@@ -43,7 +43,7 @@ async def get_users(user=Depends(auth.require('read:users'))):
     return users
 ```
 
-## Agent authentication (AI Agent Auth Protocol)
+## Agent authentication (AuthFI Agent Profile)
 
 An AuthFI agent holds its **own** Ed25519 keypair. It authenticates by signing a short
 assertion (`private_key_jwt`, RFC 7523 §2.2) — the private half never leaves the process

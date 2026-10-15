@@ -242,7 +242,7 @@ class TestVerifyTokenFetchesTheJWKSItself(unittest.TestCase):
                 self.auth.verify_token(f"{signing_input}.{sig}")
 
     def test_an_ed25519_key_verifies_too(self):
-        """Agent tokens under the AI Agent Auth Protocol are EdDSA, not RS256."""
+        """Agent tokens under the AuthFI Agent Profile are EdDSA, not RS256."""
         import jwt
         from cryptography.hazmat.primitives.asymmetric import ed25519
 
