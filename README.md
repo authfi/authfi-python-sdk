@@ -73,6 +73,7 @@ from authfi import AgentAuth, AgentKey
 agent = AgentAuth(
     agent_id="agt_...",
     key=AgentKey.from_file("/run/secrets/agent.key", key_id="k1"),
+    platform_url="https://acme.authfi.io",   # your project's authfi.io address
     audience="https://api.acme.com",   # optional — RFC 8707 resource
 )
 
@@ -88,7 +89,7 @@ Or from the environment — `AgentAuth.from_env()`:
 | `AUTHFI_AGENT_KEY_FILE` | path to the private key — **preferred** |
 | `AUTHFI_AGENT_KID` | the registered `kid` |
 | `AUTHFI_AGENT_PRIVATE_KEY` | PEM inline — fallback, warns |
-| `AUTHFI_PLATFORM_URL` | defaults to `https://platform.authfi.io` |
+| `AUTHFI_PLATFORM_URL` | your project's authfi.io address, for example `https://acme.authfi.io` |
 | `AUTHFI_AGENT_AUDIENCE` | optional resource the token is for |
 
 Prefer the file. A private key in an environment variable is visible in `ps`, inherited by
