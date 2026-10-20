@@ -38,6 +38,7 @@ Agent authentication (the AuthFI Agent Profile):
 
 import os
 import json
+import asyncio
 import time
 import uuid
 import base64
@@ -48,9 +49,9 @@ import logging
 import re
 import warnings
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.error import HTTPError
-from threading import local
+from threading import Lock, local
 from types import SimpleNamespace
 
 __version__ = "0.1.0"
@@ -468,6 +469,12 @@ CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
 #: The OpenID CIBA grant — an agent redeeming a person's out-of-band approval.
 CIBA_GRANT_TYPE = "urn:openid:params:grant-type:ciba"
+
+#: RFC 8693 token exchange — an agent acting for a person whose token it holds.
+TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
+
+#: RFC 8693 §3 token type of an OAuth access token.
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 #: The algorithm each accepted key type signs with. The KEY decides, as it does on
 #: the server: a P-256 key signs ES256 and an RSA key signs PS256, and a label that
@@ -989,8 +996,12 @@ class AgentAuth:
 
         self._token_endpoint = token_endpoint
         self._backchannel_endpoint = backchannel_endpoint
+        self._approval_endpoint = None
         self._discovery = None
         self._as_metadata = None
+        # One mint at a time: the async client and httpx auth call token() from
+        # worker threads, and N callers at expiry must not sign N assertions.
+        self._lock = Lock()
 
         self._access_token = None
         self._token_audience = None
@@ -1176,14 +1187,18 @@ class AgentAuth:
         credential is rejected for the same reason.
         """
         requested = audience if audience is not None else self.audience
-        if (
-            not force
-            and self._access_token
-            and requested == self._token_audience
-            and time.time() < self._expires_at - self.refresh_skew
-        ):
-            return self._access_token
+        with self._lock:
+            if (
+                not force
+                and self._access_token
+                and requested == self._token_audience
+                and time.time() < self._expires_at - self.refresh_skew
+            ):
+                return self._access_token
+            return self._mint(requested)
 
+    def _mint(self, requested):
+        """Mint the agent's own token (client_credentials). Called under ``self._lock``."""
         params = {
             "grant_type": "client_credentials",
             "client_id": self.agent_id,
@@ -1272,49 +1287,37 @@ class AgentAuth:
         ``access_denied``, ``expired_token`` and ``invalid_grant`` are decisions,
         and are raised immediately rather than retried — the person said no, or
         the window closed, and polling past that is just load.
-        """
-        if isinstance(approval, dict):
-            auth_req_id = approval.get("auth_req_id")
-            interval = int(approval.get("interval") or 5)
-        else:
-            auth_req_id, interval = approval, 5
-        if not auth_req_id:
-            raise AuthFIError("No auth_req_id to poll", status=400)
 
+        The result is a :class:`DelegatedToken`: the token response itself, which
+        also knows when it expires. This blocks the calling thread; in asyncio
+        code use :class:`AsyncAgentAuth`, whose wait does not block the loop.
+        """
+        auth_req_id, interval = _ciba_handle(approval)
         requested = audience if audience is not None else self.audience
         deadline = time.time() + timeout
         while True:
-            params = {
-                "grant_type": CIBA_GRANT_TYPE,
-                "client_id": self.agent_id,
-                "client_assertion_type": CLIENT_ASSERTION_TYPE,
-                # A fresh assertion every poll: the server replay-caches jti, so
-                # reusing one would turn a slow approval into a refused poll.
-                "client_assertion": self.key.client_assertion(
-                    self.agent_id, self.token_endpoint
-                ),
-                "auth_req_id": auth_req_id,
-            }
-            if requested:
-                params["resource"] = requested
             try:
-                return _post_form(self.token_endpoint, params)
+                return self._ciba_redeem(auth_req_id, requested)
             except AgentAuthError as e:
-                if e.error == "slow_down":
-                    # The server is telling us our interval is too fast, and it
-                    # has already widened its own. Honour it rather than keep
-                    # the pace that earned the warning.
-                    interval += 5
-                elif e.error != "authorization_pending":
-                    raise
+                interval = _ciba_next_interval(e, interval)
             if time.time() + interval >= deadline:
-                raise AgentAuthError(
-                    "authorization_pending",
-                    "the person had not decided within %ss; the request may still be "
-                    "open — poll again with the same auth_req_id" % timeout,
-                    status=408,
-                )
+                raise _ciba_timeout(timeout)
             sleep(interval)
+
+    def _ciba_redeem(self, auth_req_id, requested):
+        """One CIBA poll: the delegated token, or the AgentAuthError the server answered."""
+        params = {
+            "grant_type": CIBA_GRANT_TYPE,
+            "client_id": self.agent_id,
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
+            # A fresh assertion every poll: the server replay-caches jti, so
+            # reusing one would turn a slow approval into a refused poll.
+            "client_assertion": self.key.client_assertion(self.agent_id, self.token_endpoint),
+            "auth_req_id": auth_req_id,
+        }
+        if requested:
+            params["resource"] = requested
+        return DelegatedToken(_post_form(self.token_endpoint, params), refresh_skew=self.refresh_skew)
 
     def token_as_user(self, login_hint, binding_message=None, scope=None, timeout=300):
         """Request approval and wait for it — :meth:`request_user_approval` then
@@ -1325,12 +1328,379 @@ class AgentAuth:
         )
         return self.await_user_token(approval, timeout=timeout)
 
+    # --- Acting as a person by token exchange (RFC 8693) ---
 
-def _get_json(url, what):
+    def exchange(self, subject_token, audience=None, scope=None, subject_token_type=ACCESS_TOKEN_TYPE):
+        """Act for a person whose token this agent holds: their token in, a token
+        whose ``sub`` is the person and ``act.sub`` is this agent out.
+
+        For an agent that already has the person's token, typically because the
+        person signed in to the application the agent runs in. The project
+        decides whether this agent may act for this person; a refusal is raised
+        as :class:`AgentAuthError` (``access_denied``, ``invalid_grant``).
+
+        Returns a :class:`DelegatedToken`. When it nears expiry it is exchanged
+        again from the same subject token, so it lives as long as the person's
+        own token does and no longer.
+        """
+        if not subject_token or not str(subject_token).strip():
+            raise AuthFIError("subject_token is required: the token of the person to act for",
+                              status=400)
+        requested = audience if audience is not None else self.audience
+
+        def mint():
+            return self._exchange(str(subject_token).strip(), subject_token_type, requested, scope)
+
+        return DelegatedToken(mint(), renew=mint, refresh_skew=self.refresh_skew)
+
+    def _exchange(self, subject_token, subject_token_type, requested, scope):
+        params = {
+            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+            "subject_token": subject_token,
+            "subject_token_type": subject_token_type,
+            # The agent proves who it is with its own, current access token as the
+            # actor (RFC 8693 §2.1). The server verifies that token and asks policy
+            # whether this agent may act for this person. No client assertion is
+            # sent: the actor token is the agent's credential here.
+            "actor_token": self.token(),
+            "actor_token_type": ACCESS_TOKEN_TYPE,
+        }
+        if requested:
+            params["resource"] = requested
+        if scope:
+            params["scope"] = scope
+        return _post_form(self.token_endpoint, params)
+
+    # --- Approvals this agent raised (human in the loop) ---
+
+    @property
+    def approval_endpoint(self):
+        """The approval address from discovery (``endpoints.approval``), with ``{id}`` in it."""
+        if not self._approval_endpoint:
+            template = (self.discovery().get("endpoints") or {}).get("approval")
+            if not template or "{id}" not in template:
+                raise AuthFIError(
+                    "Discovery at %s advertises no approval address, so an agent cannot "
+                    "read its approvals here." % self.discovery_url,
+                    status=400,
+                )
+            self._approval_endpoint = template
+        return self._approval_endpoint
+
+    def approval_status(self, approval_id):
+        """The current state of an approval this agent raised.
+
+        Returns the approval record: ``approval_id``, ``status`` (``pending``,
+        ``approved``, ``denied`` or ``expired``), ``requesting_action``,
+        ``expires_at`` and, once decided, ``resolved_at``. It is read at the
+        address discovery advertises, with this agent's own access token. A
+        project that does not let the agent read it answers 403, raised as
+        :class:`AuthFIError` with that status.
+        """
+        if not approval_id or not str(approval_id).strip():
+            raise AuthFIError("approval_id is required", status=400)
+        url = self.approval_endpoint.replace("{id}", quote(str(approval_id).strip(), safe=""))
+        body = _get_json(url, "Reading approval %s" % approval_id,
+                         {"Authorization": "Bearer " + self.token()})
+        return body.get("data", body) if isinstance(body, dict) else body
+
+    def wait_for_approval(self, approval_id, timeout=300, interval=5, sleep=time.sleep):
+        """Poll :meth:`approval_status` until a person decides or the approval lapses.
+
+        Returns the record whatever the outcome: branch on ``status``. Raises
+        :class:`AuthFIError` with status 408 when it is still pending at
+        ``timeout``; the approval itself stays open. This blocks the calling
+        thread; in asyncio code use :class:`AsyncAgentAuth`.
+        """
+        deadline = time.time() + timeout
+        while True:
+            record = self.approval_status(approval_id)
+            if record.get("status") != APPROVAL_PENDING:
+                return record
+            if time.time() + interval >= deadline:
+                raise _approval_timeout(approval_id, timeout)
+            sleep(interval)
+
+    # --- HTTP clients ---
+
+    def httpx_auth(self, audience=None):
+        """An ``httpx.Auth`` that sends this agent's token as ``Authorization: Bearer``.
+
+        The token is taken for every request, so it is refreshed before it
+        expires without the client being rebuilt. It works with ``httpx.Client``
+        and ``httpx.AsyncClient``; with the async client the token is fetched off
+        the event loop. Needs ``httpx`` (``pip install 'authfi[httpx]'``).
+        """
+        return _bearer_auth(lambda: self.token(audience=audience))
+
+
+#: The status of an approval nobody has decided yet.
+APPROVAL_PENDING = "pending"
+
+
+def _ciba_handle(approval):
+    """The ``auth_req_id`` and starting poll interval from a CIBA request's answer."""
+    if isinstance(approval, dict):
+        auth_req_id = approval.get("auth_req_id")
+        interval = int(approval.get("interval") or 5)
+    else:
+        auth_req_id, interval = approval, 5
+    if not auth_req_id:
+        raise AuthFIError("No auth_req_id to poll", status=400)
+    return auth_req_id, interval
+
+
+def _ciba_next_interval(error, interval):
+    """How long to wait after a poll the server refused, or the refusal itself when it is a decision."""
+    if error.error == "slow_down":
+        # The server is telling us our interval is too fast, and it has already
+        # widened its own. Honour it rather than keep the pace that earned it.
+        return interval + 5
+    if error.error == "authorization_pending":
+        return interval
+    raise error
+
+
+def _ciba_timeout(timeout):
+    return AgentAuthError(
+        "authorization_pending",
+        "the person had not decided within %ss; the request may still be "
+        "open — poll again with the same auth_req_id" % timeout,
+        status=408,
+    )
+
+
+def _approval_timeout(approval_id, timeout):
+    return AuthFIError(
+        "Approval %s was still pending after %ss; it stays open — wait on it again "
+        "with the same id" % (approval_id, timeout),
+        status=408,
+    )
+
+
+def _unverified_claims(token):
+    """A JWT's claims WITHOUT checking its signature, for scheduling a refresh and naming
+    the subject only. Never for a decision: that is the resource server's job."""
+    try:
+        return json.loads(_b64decode(token.split(".")[1]))
+    except Exception:
+        return {}
+
+
+class DelegatedToken(dict):
+    """A token this agent holds to act for a person, with refresh-or-expire handling.
+
+    It IS the token response (``token["access_token"]``, ``token["subject"]``,
+    ``token["expires_in"]``), so code that used the plain dict keeps working.
+    Call :meth:`token` (or :meth:`atoken` in asyncio code) rather than reading
+    ``access_token`` when the token is used for longer than a moment:
+
+    - while it is fresh, it is returned as is;
+    - near its expiry, a token from :meth:`AgentAuth.exchange` is exchanged
+      again from the same subject token;
+    - a token from CIBA cannot be renewed, because the approval was the
+      person's consent for this token. Past its expiry :meth:`token` raises
+      :class:`AgentAuthError` ``expired_token`` instead of handing out a dead
+      token, and acting for them again means asking them again.
+    """
+
+    def __init__(self, body, renew=None, refresh_skew=60):
+        super().__init__(body or {})
+        if not self.get("access_token"):
+            raise AuthFIError("The token endpoint returned no access_token", status=502)
+        self._renew = renew
+        self.refresh_skew = refresh_skew
+        self._lock = Lock()
+        self._set_expiry()
+
+    def __reduce__(self):
+        # Pickled (a checkpoint, a cache) as the plain response it is. The renew
+        # function holds the agent's key and is not something to persist.
+        return (dict, (dict(self),))
+
+    def _set_expiry(self):
+        # expires_in when the server gives it, which it does; otherwise the token's
+        # own exp. With neither, the token is treated as already expired.
+        if self.get("expires_in"):
+            self.expires_at = time.time() + int(self["expires_in"])
+        else:
+            self.expires_at = float(_unverified_claims(self["access_token"]).get("exp") or 0)
+
+    @property
+    def subject(self):
+        """The person this token acts for (the response's ``subject``, else the token's ``sub``)."""
+        return self.get("subject") or _unverified_claims(self["access_token"]).get("sub")
+
+    @property
+    def expired(self):
+        """True once the token is within ``refresh_skew`` seconds of its expiry."""
+        return time.time() >= self.expires_at - self.refresh_skew
+
+    def token(self):
+        """The access token, renewed if it can be, or ``expired_token`` if it cannot."""
+        with self._lock:
+            if not self.expired:
+                return self["access_token"]
+            if self._renew is None:
+                raise AgentAuthError(
+                    "expired_token",
+                    "the token acting for %s has expired, and it came from their "
+                    "approval, which only they can give again" % (self.subject or "this person"),
+                    status=401,
+                )
+            body = self._renew()
+            if not body.get("access_token"):
+                raise AuthFIError("The token endpoint returned no access_token", status=502)
+            self.update(body)
+            self._set_expiry()
+            return self["access_token"]
+
+    async def atoken(self):
+        """:meth:`token` without blocking the event loop when it has to renew."""
+        return await _in_thread(self.token)
+
+    def auth_header(self):
+        """``{"Authorization": "Bearer ..."}`` with the current token."""
+        return {"Authorization": "Bearer " + self.token()}
+
+    def httpx_auth(self):
+        """An ``httpx.Auth`` sending this token, renewed or refused as :meth:`token` is."""
+        return _bearer_auth(self.token)
+
+
+async def _in_thread(fn, *args, **kwargs):
+    """Run a blocking call in the loop's default executor and await it."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+
+def _bearer_auth(get_token):
+    """An ``httpx.Auth`` setting ``Authorization: Bearer`` from ``get_token()`` on every request."""
+    try:
+        import httpx
+    except ImportError as e:
+        raise AuthFIError(
+            "httpx_auth() needs httpx. Install with: pip install 'authfi[httpx]'", status=500
+        ) from e
+
+    class AuthFIBearerAuth(httpx.Auth):
+        def sync_auth_flow(self, request):
+            request.headers["Authorization"] = "Bearer " + get_token()
+            yield request
+
+        async def async_auth_flow(self, request):
+            # Off the loop: getting the token may mean signing and minting a new one.
+            request.headers["Authorization"] = "Bearer " + await _in_thread(get_token)
+            yield request
+
+    return AuthFIBearerAuth()
+
+
+class AsyncAgentAuth:
+    """The agent client for asyncio frameworks: LangGraph, the OpenAI Agents SDK,
+    Google ADK, the Claude Agent SDK.
+
+    It wraps an :class:`AgentAuth` and shares its key, endpoints and token
+    cache. Each network call runs in a worker thread and each wait is an
+    ``asyncio`` sleep, so nothing here blocks the event loop: a CIBA wait of
+    minutes leaves the loop serving every other task.
+
+        agent = AsyncAgentAuth(AgentAuth.from_env())
+
+        token = await agent.token()
+        approval = await agent.request_user_approval("priya@acme.com", binding_message="Send it?")
+        as_priya = await agent.await_user_token(approval)
+        headers = {"Authorization": "Bearer " + await as_priya.atoken()}
+    """
+
+    def __init__(self, agent):
+        if not isinstance(agent, AgentAuth):
+            raise AuthFIError(
+                "AsyncAgentAuth wraps an AgentAuth: AsyncAgentAuth(AgentAuth(...)) "
+                "or AsyncAgentAuth.from_env()",
+                status=400,
+            )
+        self.agent = agent
+
+    @classmethod
+    def from_env(cls, **overrides):
+        """:meth:`AgentAuth.from_env`, wrapped."""
+        return cls(AgentAuth.from_env(**overrides))
+
+    async def token(self, audience=None, force=False):
+        """:meth:`AgentAuth.token`, off the event loop."""
+        return await _in_thread(self.agent.token, audience=audience, force=force)
+
+    async def capabilities(self):
+        """:meth:`AgentAuth.capabilities`, off the event loop."""
+        return await _in_thread(self.agent.capabilities)
+
+    async def auth_header(self, audience=None):
+        """``{"Authorization": "Bearer ..."}`` with a current token."""
+        return {"Authorization": "Bearer " + await self.token(audience=audience)}
+
+    async def exchange(self, subject_token, audience=None, scope=None, subject_token_type=ACCESS_TOKEN_TYPE):
+        """:meth:`AgentAuth.exchange`, off the event loop."""
+        return await _in_thread(self.agent.exchange, subject_token, audience=audience, scope=scope,
+                                subject_token_type=subject_token_type)
+
+    async def request_user_approval(self, login_hint, binding_message=None, scope=None, requested_expiry=None):
+        """:meth:`AgentAuth.request_user_approval`, off the event loop."""
+        return await _in_thread(self.agent.request_user_approval, login_hint,
+                                binding_message=binding_message, scope=scope,
+                                requested_expiry=requested_expiry)
+
+    async def await_user_token(self, approval, timeout=300, audience=None, sleep=asyncio.sleep):
+        """:meth:`AgentAuth.await_user_token`, waiting with ``asyncio`` sleeps.
+
+        The same rules: ``authorization_pending`` and ``slow_down`` keep it
+        waiting, a decision is raised at once, and the timeout is an
+        ``authorization_pending`` error with status 408.
+        """
+        auth_req_id, interval = _ciba_handle(approval)
+        requested = audience if audience is not None else self.agent.audience
+        deadline = time.time() + timeout
+        while True:
+            try:
+                return await _in_thread(self.agent._ciba_redeem, auth_req_id, requested)
+            except AgentAuthError as e:
+                interval = _ciba_next_interval(e, interval)
+            if time.time() + interval >= deadline:
+                raise _ciba_timeout(timeout)
+            await sleep(interval)
+
+    async def token_as_user(self, login_hint, binding_message=None, scope=None, timeout=300):
+        """Request a person's approval and wait for it without blocking the loop."""
+        approval = await self.request_user_approval(login_hint, binding_message=binding_message, scope=scope)
+        return await self.await_user_token(approval, timeout=timeout)
+
+    async def approval_status(self, approval_id):
+        """:meth:`AgentAuth.approval_status`, off the event loop."""
+        return await _in_thread(self.agent.approval_status, approval_id)
+
+    async def wait_for_approval(self, approval_id, timeout=300, interval=5, sleep=asyncio.sleep):
+        """:meth:`AgentAuth.wait_for_approval`, waiting with ``asyncio`` sleeps."""
+        deadline = time.time() + timeout
+        while True:
+            record = await self.approval_status(approval_id)
+            if record.get("status") != APPROVAL_PENDING:
+                return record
+            if time.time() + interval >= deadline:
+                raise _approval_timeout(approval_id, timeout)
+            await sleep(interval)
+
+    def httpx_auth(self, audience=None):
+        """:meth:`AgentAuth.httpx_auth`: one object serves both httpx clients."""
+        return self.agent.httpx_auth(audience=audience)
+
+
+def _get_json(url, what, headers=None):
     """GET a JSON document, reporting a Deprecation header and naming what failed."""
     req = Request(url)
     req.add_header("User-Agent", USER_AGENT)
     req.add_header("Accept", "application/json")
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
     try:
         with urlopen(req) as res:
             _note_deprecation(url, res.headers)

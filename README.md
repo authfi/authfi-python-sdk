@@ -146,6 +146,76 @@ token = agent.await_user_token(approval, timeout=300)
 The poll honours the server's `interval` and widens it on `slow_down`. `access_denied`,
 `expired_token` and `invalid_grant` are decisions and stop it immediately.
 
+The token you get back is a `DelegatedToken`: the token response itself (so `token["subject"]`
+works as above) that also knows when it expires. Use `token.token()` (or `token.auth_header()`)
+each time you send it rather than keeping `token["access_token"]`. Once it nears expiry,
+`token.token()` raises `AgentAuthError` `expired_token`: the approval was the person's consent
+for that token, and acting for them again means asking them again.
+
+### 4. Acting for a person whose token you hold (token exchange)
+
+When the person is signed in to the application the agent runs in, the agent can exchange their
+token for one that acts for them (RFC 8693). The agent's own token goes as the actor, and the
+project decides whether this agent may act for this person.
+
+```python
+as_priya = agent.exchange(priya_access_token, audience="https://api.acme.com")
+requests.get(url, headers=as_priya.auth_header())   # sub = Priya, act.sub = this agent
+```
+
+`as_priya.token()` exchanges again from the same subject token when it nears expiry, so it lives
+as long as the person's own token does. A refusal raises `AgentAuthError` (`access_denied`,
+`invalid_grant`).
+
+### 5. Approvals the agent raised
+
+```python
+record = agent.approval_status(approval_id)           # {"status": "pending", ...}
+record = agent.wait_for_approval(approval_id, timeout=300)
+record["status"]                                      # "approved", "denied" or "expired"
+```
+
+Both read the approval at the address discovery advertises (`endpoints.approval`), with the
+agent's own token. A project that does not let the agent read it answers 403, raised as
+`AuthFIError` with `err.status == 403`.
+
+### 6. Async frameworks
+
+`AsyncAgentAuth` is the same client for asyncio code (LangGraph, the OpenAI Agents SDK, Google
+ADK, the Claude Agent SDK). It shares the wrapped `AgentAuth`'s key and token cache, runs each
+request in a worker thread and waits with `asyncio.sleep`, so a CIBA wait of minutes does not
+block the event loop.
+
+```python
+from authfi import AgentAuth, AsyncAgentAuth
+
+agent = AsyncAgentAuth(AgentAuth.from_env())
+
+token = await agent.token()
+approval = await agent.request_user_approval("priya@acme.com", binding_message="Send it?")
+as_priya = await agent.await_user_token(approval)
+headers = {"Authorization": "Bearer " + await as_priya.atoken()}
+
+as_priya = await agent.exchange(priya_access_token)
+record = await agent.wait_for_approval(approval_id)
+```
+
+### 7. HTTP clients
+
+`httpx_auth()` sets `Authorization: Bearer` on every request, with a token refreshed before it
+expires. One object works with `httpx.Client` and `httpx.AsyncClient`.
+
+```bash
+pip install 'authfi[httpx]'
+```
+
+```python
+import httpx
+
+client = httpx.AsyncClient(auth=agent.httpx_auth())     # the agent itself
+client = httpx.Client(auth=as_priya.httpx_auth())       # acting for Priya
+```
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)
@@ -154,6 +224,8 @@ The poll honours the server's `interval` and widens it on `slow_down`. `access_d
 - Permission auto-sync on `sync()`
 - Agent authentication — `private_key_jwt` with Ed25519, P-256 or RSA keys, discovery-driven
 - CIBA — an agent acting as a person who approved out of band
+- Token exchange (RFC 8693) — an agent acting for a person whose token it holds
+- Async client for asyncio agent frameworks, and `httpx` auth that refreshes the token
 - Cloud credentials (GCP/AWS/Azure/OCI)
 - Cloud token exchange
 - Works with Flask, FastAPI, Django, any WSGI/ASGI framework

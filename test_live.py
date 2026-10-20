@@ -17,6 +17,7 @@ Nothing secret is printed: a failure names claims and OAuth codes, never a token
     AUTHFI_LIVE_ORIGIN=https://acme.authfi.io ... python -m unittest test_live -v
 """
 
+import asyncio
 import json
 import os
 import threading
@@ -25,7 +26,16 @@ import unittest
 import uuid
 from urllib.request import Request, urlopen
 
-from authfi import USER_AGENT, AgentAuth, AgentAuthError, AgentKey, AuthFI, _b64decode
+from authfi import (
+    USER_AGENT,
+    AgentAuth,
+    AgentAuthError,
+    AgentKey,
+    AsyncAgentAuth,
+    AuthFI,
+    DelegatedToken,
+    _b64decode,
+)
 
 ORIGIN = (os.environ.get("AUTHFI_LIVE_ORIGIN") or "").rstrip("/")
 ALGS = ("EDDSA", "ES256", "PS256")
@@ -173,6 +183,80 @@ class TestLiveCIBA(unittest.TestCase):
         self.assertEqual(claims["sub"], out["subject"])
         self.assertIn(self.agent.agent_id, claims["act"]["sub"])
         self.assertEqual(claims["client_id"], self.agent.agent_id)
+
+
+@unittest.skipUnless(ORIGIN, "AUTHFI_LIVE_ORIGIN is not set")
+class TestLiveAsync(unittest.TestCase):
+    def setUp(self):
+        agent = _agent("EDDSA")
+        if agent is None:
+            self.skipTest("AUTHFI_LIVE_EDDSA_AGENT_ID / _KEY_FILE not configured")
+        self.agent = AsyncAgentAuth(agent)
+
+    def test_the_async_ciba_wait_leaves_the_loop_free(self):
+        login_hint, person_token = _env("CIBA_LOGIN_HINT"), _env("PERSON_TOKEN")
+        if not (login_hint and person_token):
+            self.skipTest("needs AUTHFI_LIVE_CIBA_LOGIN_HINT and AUTHFI_LIVE_PERSON_TOKEN")
+        agent_id = self.agent.agent.agent_id
+
+        async def main():
+            approval = await self.agent.request_user_approval(
+                login_hint,
+                binding_message="SDK async live test %s: let the agent act for you" % uuid.uuid4().hex[:6],
+                scope=_env("CIBA_SCOPE"),
+                requested_expiry=120,
+            )
+            ticks, stop = [], asyncio.Event()
+
+            async def ticker():
+                while not stop.is_set():
+                    ticks.append(time.monotonic())
+                    await asyncio.sleep(0.05)
+            tick_task = asyncio.ensure_future(ticker())
+            loop = asyncio.get_running_loop()
+            person = loop.run_in_executor(None, approve_as_person, agent_id, person_token)
+            started = time.monotonic()
+            token = await self.agent.await_user_token(approval, timeout=90)
+            waited = time.monotonic() - started
+            decided = await person
+            stop.set()
+            await tick_task
+            return token, decided, ticks, waited, await token.atoken()
+
+        token, decided, ticks, waited, current = asyncio.run(main())
+        self.assertEqual(decided, "approved")
+        self.assertIsInstance(token, DelegatedToken)
+        self.assertEqual(current, token["access_token"])
+        claims = _verified(current)
+        self.assertEqual(claims["sub"], token.subject)
+        self.assertIn(agent_id, claims["act"]["sub"])
+        # The wait took at least one poll interval; the loop ticked through it.
+        self.assertGreater(waited, 1)
+        self.assertGreater(len(ticks), waited / 0.05 * 0.5)
+
+    def test_httpx_auth_carries_a_token_the_project_accepts(self):
+        try:
+            import httpx
+        except ImportError:
+            self.skipTest("httpx is not installed")
+        resource = self.agent.agent.discovery().get("default_location")
+        if not resource:
+            self.skipTest("discovery names no default_location to call")
+        # An MCP initialize: the cheapest call the default resource answers for an agent.
+        initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "authfi-python-sdk-live-test", "version": "0"}}}
+        headers = {"Accept": "application/json, text/event-stream", "User-Agent": USER_AGENT}
+
+        async def main():
+            async with httpx.AsyncClient(timeout=30) as client:
+                anonymous = await client.post(resource, json=initialize, headers=headers)
+                signed = await client.post(resource, json=initialize, headers=headers,
+                                           auth=self.agent.httpx_auth())
+            return anonymous.status_code, signed.status_code
+        anonymous, signed = asyncio.run(main())
+        self.assertEqual(anonymous, 401)
+        self.assertEqual(signed, 200)
 
 
 if __name__ == "__main__":

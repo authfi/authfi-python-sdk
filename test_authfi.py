@@ -3,6 +3,7 @@
 import io
 import os
 import json
+import asyncio
 import time
 import base64
 import unittest
@@ -14,9 +15,13 @@ from authfi import (
     AgentAuth,
     AgentAuthError,
     AgentKey,
+    AsyncAgentAuth,
+    DelegatedToken,
     assert_public_jwk,
+    ACCESS_TOKEN_TYPE,
     CLIENT_ASSERTION_TYPE,
     CIBA_GRANT_TYPE,
+    TOKEN_EXCHANGE_GRANT_TYPE,
     _b64decode,
 )
 
@@ -1344,6 +1349,360 @@ class TestAgentFromEnv(unittest.TestCase):
         os.environ["AUTHFI_PLATFORM_URL"] = "https://other.authfi.io"
         with self.assertWarns(UserWarning):
             self.assertEqual(AgentAuth.from_env(platform_url=ORIGIN).platform_url, ORIGIN)
+
+
+def _jwt(claims):
+    """An unsigned JWT-shaped string carrying ``claims``, for the SDK's own scheduling reads."""
+    seg = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+    return "%s.%s.sig" % (seg({"alg": "EdDSA", "typ": "at+jwt"}), seg(claims))
+
+
+def _slow(body, seconds, calls=None):
+    """A urlopen() side effect that BLOCKS its thread for ``seconds``, as a slow server would."""
+    def answer(req, data=None, *args, **kwargs):
+        if calls is not None:
+            calls.append(req.full_url)
+        time.sleep(seconds)
+        if isinstance(body, Exception):
+            raise body
+        return _response(body)
+    return answer
+
+
+APPROVAL_TEMPLATE = ORIGIN + "/apis/regional/v1/ai/auth/approvals/{id}"
+DELEGATED = {
+    "access_token": "at_delegated",
+    "token_type": "Bearer",
+    "expires_in": 900,
+    "subject": "user:priya@acme.com",
+    "scope": "send_email_external",
+}
+
+
+def _agent_c(**kw):
+    return AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN,
+                     token_endpoint=OAUTH_TOKEN,
+                     backchannel_endpoint=DISCOVERY["backchannel_authentication_endpoint"], **kw)
+
+
+class TestDelegatedToken(unittest.TestCase):
+    def test_it_is_the_token_response(self):
+        # Code written against the plain dict keeps working.
+        t = DelegatedToken(dict(DELEGATED))
+        self.assertEqual(t["access_token"], "at_delegated")
+        self.assertEqual(t["subject"], "user:priya@acme.com")
+        self.assertEqual(t.subject, "user:priya@acme.com")
+        self.assertEqual(json.loads(json.dumps(t)), DELEGATED)
+        self.assertEqual(t.token(), "at_delegated")
+        self.assertEqual(t.auth_header(), {"Authorization": "Bearer at_delegated"})
+
+    def test_a_ciba_token_past_its_expiry_is_refused_not_handed_out(self):
+        t = DelegatedToken(dict(DELEGATED, expires_in=30), refresh_skew=60)
+        self.assertTrue(t.expired)
+        with self.assertRaises(AgentAuthError) as ctx:
+            t.token()
+        self.assertEqual(ctx.exception.error, "expired_token")
+        self.assertIn("user:priya@acme.com", str(ctx.exception))
+
+    def test_a_renewable_token_is_renewed_near_expiry(self):
+        bodies = [dict(DELEGATED, access_token="at_2", expires_in=900)]
+        t = DelegatedToken(dict(DELEGATED, expires_in=30), renew=lambda: bodies.pop(0))
+        self.assertEqual(t.token(), "at_2")
+        self.assertEqual(t["access_token"], "at_2")
+        self.assertFalse(t.expired)
+        self.assertEqual(t.token(), "at_2")  # renewed once, not per call
+
+    def test_without_expires_in_the_tokens_own_exp_is_used(self):
+        tok = _jwt({"sub": "user:priya@acme.com", "exp": int(time.time()) + 600})
+        t = DelegatedToken({"access_token": tok})
+        self.assertFalse(t.expired)
+        self.assertEqual(t.subject, "user:priya@acme.com")
+        self.assertTrue(DelegatedToken({"access_token": "opaque"}).expired)
+
+    def test_a_response_without_a_token_is_an_error(self):
+        with self.assertRaises(AuthFIError):
+            DelegatedToken({"expires_in": 900})
+
+    def test_it_pickles_as_the_plain_response(self):
+        import pickle
+        t = DelegatedToken(dict(DELEGATED), renew=lambda: {})
+        self.assertEqual(pickle.loads(pickle.dumps(t)), DELEGATED)
+
+
+class TestTokenExchange(unittest.TestCase):
+    AGENT_TOKEN = {"access_token": "at_agent", "expires_in": 900}
+    EXCHANGED = {"access_token": "at_as_priya", "expires_in": 900, "token_type": "Bearer",
+                 "issued_token_type": ACCESS_TOKEN_TYPE}
+
+    @patch("authfi.urlopen")
+    def test_sends_a_conformant_token_exchange(self, mock_urlopen):
+        mock_urlopen.side_effect = [_response(self.AGENT_TOKEN), _response(self.EXCHANGED)]
+        out = _agent_c().exchange("person-token", audience="https://api.acme.com", scope="read_crm")
+        self.assertIsInstance(out, DelegatedToken)
+        self.assertEqual(out.token(), "at_as_priya")
+        form = _form(mock_urlopen.call_args_list[1])
+        self.assertEqual(mock_urlopen.call_args_list[1][0][0].full_url, OAUTH_TOKEN)
+        self.assertEqual(form["grant_type"], TOKEN_EXCHANGE_GRANT_TYPE)
+        self.assertEqual(form["subject_token"], "person-token")
+        self.assertEqual(form["subject_token_type"], ACCESS_TOKEN_TYPE)
+        # The agent is the actor, proven by its own current token.
+        self.assertEqual(form["actor_token"], "at_agent")
+        self.assertEqual(form["actor_token_type"], ACCESS_TOKEN_TYPE)
+        self.assertEqual(form["resource"], "https://api.acme.com")
+        self.assertEqual(form["scope"], "read_crm")
+        # The actor token is the credential; no assertion and no client id.
+        for absent in ("client_id", "client_assertion", "client_secret"):
+            self.assertNotIn(absent, form)
+
+    @patch("authfi.urlopen")
+    def test_near_expiry_it_is_exchanged_again_from_the_same_subject_token(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _response(self.AGENT_TOKEN),
+            _response(dict(self.EXCHANGED, expires_in=30)),
+            _response(dict(self.EXCHANGED, access_token="at_as_priya_2")),
+        ]
+        out = _agent_c().exchange("person-token")
+        self.assertEqual(out.token(), "at_as_priya_2")
+        self.assertEqual(_form(mock_urlopen.call_args_list[2])["subject_token"], "person-token")
+
+    @patch("authfi.urlopen")
+    def test_a_refusal_is_raised_with_its_code(self, mock_urlopen):
+        mock_urlopen.side_effect = [_response(self.AGENT_TOKEN),
+                                    _oauth_error("access_denied", "the actor may not act for this subject", 403)]
+        with self.assertRaises(AgentAuthError) as ctx:
+            _agent_c().exchange("person-token")
+        self.assertEqual(ctx.exception.error, "access_denied")
+
+    def test_a_subject_token_is_required(self):
+        with self.assertRaises(AuthFIError):
+            _agent_c().exchange("  ")
+
+
+class TestApprovals(unittest.TestCase):
+    RECORD = {"approval_id": "5f0c", "status": "pending", "requesting_action": "refund"}
+
+    def _agent(self):
+        a = _agent_c()
+        a._discovery = dict(DISCOVERY, endpoints=dict(DISCOVERY["endpoints"], approval=APPROVAL_TEMPLATE))
+        a._access_token, a._expires_at, a._token_audience = "at_agent", time.time() + 900, None
+        return a
+
+    @patch("authfi.urlopen")
+    def test_status_is_read_with_the_agents_token_at_the_advertised_address(self, mock_urlopen):
+        mock_urlopen.return_value = _response({"data": self.RECORD})
+        self.assertEqual(self._agent().approval_status("5f0c"), self.RECORD)
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.full_url, ORIGIN + "/apis/regional/v1/ai/auth/approvals/5f0c")
+        self.assertEqual(req.get_header("Authorization"), "Bearer at_agent")
+
+    @patch("authfi.urlopen")
+    def test_the_id_cannot_walk_out_of_the_address(self, mock_urlopen):
+        mock_urlopen.return_value = _response({"data": self.RECORD})
+        self._agent().approval_status("../agents/agt_2")
+        self.assertTrue(mock_urlopen.call_args[0][0].full_url.endswith("/approvals/..%2Fagents%2Fagt_2"))
+
+    @patch("authfi.urlopen")
+    def test_a_refused_read_is_an_error_with_its_status(self, mock_urlopen):
+        mock_urlopen.side_effect = _http_error(APPROVAL_TEMPLATE, 403)
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent().approval_status("5f0c")
+        self.assertEqual(ctx.exception.status, 403)
+
+    def test_no_advertised_address_says_so(self):
+        a = self._agent()
+        a._discovery = DISCOVERY
+        with self.assertRaises(AuthFIError) as ctx:
+            a.approval_status("5f0c")
+        self.assertIn("no approval address", str(ctx.exception))
+
+    @patch("authfi.urlopen")
+    def test_wait_returns_the_decision(self, mock_urlopen):
+        mock_urlopen.side_effect = [_response({"data": self.RECORD}),
+                                    _response({"data": dict(self.RECORD, status="denied")})]
+        slept = []
+        out = self._agent().wait_for_approval("5f0c", interval=2, sleep=slept.append)
+        self.assertEqual(out["status"], "denied")
+        self.assertEqual(slept, [2])
+
+    @patch("authfi.urlopen")
+    def test_wait_gives_up_at_the_timeout(self, mock_urlopen):
+        mock_urlopen.return_value = _response({"data": self.RECORD})
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent().wait_for_approval("5f0c", timeout=1, interval=5, sleep=lambda s: None)
+        self.assertEqual(ctx.exception.status, 408)
+
+
+class TestAsyncAgentAuth(unittest.TestCase):
+    """Nothing in the async client may block the event loop."""
+
+    def test_it_wraps_an_agent_auth(self):
+        with self.assertRaises(AuthFIError):
+            AsyncAgentAuth("not-an-agent")
+
+    @patch("authfi.urlopen")
+    def test_concurrent_callers_at_expiry_mint_once(self, mock_urlopen):
+        calls = []
+        mock_urlopen.side_effect = _slow({"access_token": "at_abc", "expires_in": 900}, 0.2, calls)
+        agent = AsyncAgentAuth(_agent_c())
+
+        async def main():
+            return await asyncio.gather(*(agent.token() for _ in range(8)))
+        self.assertEqual(asyncio.run(main()), ["at_abc"] * 8)
+        self.assertEqual(len(calls), 1)
+
+    @patch("authfi.urlopen")
+    def test_the_ciba_wait_does_not_block_the_event_loop(self, mock_urlopen):
+        # Each poll BLOCKS its thread for 0.15 s, and the person decides on the
+        # third. A task ticking every 10 ms beside the wait must keep ticking
+        # throughout; a blocking wait would starve it until the very end.
+        polls = []
+        answers = [_oauth_error("authorization_pending"), _oauth_error("authorization_pending"),
+                   _response(DELEGATED)]
+
+        def answer(req, data=None):
+            polls.append(time.monotonic())
+            time.sleep(0.15)
+            out = answers.pop(0)
+            if isinstance(out, Exception):
+                raise out
+            return out
+        mock_urlopen.side_effect = answer
+        agent = AsyncAgentAuth(_agent_c())
+
+        async def main():
+            ticks = []
+            stop = asyncio.Event()
+
+            async def ticker():
+                while not stop.is_set():
+                    ticks.append(time.monotonic())
+                    await asyncio.sleep(0.01)
+            t = asyncio.ensure_future(ticker())
+            out = await agent.await_user_token({"auth_req_id": "req_1", "interval": 1},
+                                               sleep=lambda s: asyncio.sleep(0.05))
+            stop.set()
+            await t
+            return out, ticks
+        out, ticks = asyncio.run(main())
+        self.assertIsInstance(out, DelegatedToken)
+        self.assertEqual(out.subject, "user:priya@acme.com")
+        self.assertEqual(len(polls), 3)
+        # ~0.55 s of waiting; a free loop ticks dozens of times, and ticks happen
+        # WHILE a poll is blocked in its thread.
+        self.assertGreater(len(ticks), 20)
+        during_first_poll = [t for t in ticks if polls[0] < t < polls[0] + 0.15]
+        self.assertGreater(len(during_first_poll), 3)
+
+    @patch("authfi.urlopen")
+    def test_the_async_wait_keeps_the_ciba_rules(self, mock_urlopen):
+        mock_urlopen.side_effect = [_oauth_error("slow_down"), _oauth_error("access_denied")]
+        slept = []
+
+        async def sleep(s):
+            slept.append(s)
+        with self.assertRaises(AgentAuthError) as ctx:
+            asyncio.run(AsyncAgentAuth(_agent_c()).await_user_token(
+                {"auth_req_id": "req_1", "interval": 5}, sleep=sleep))
+        self.assertEqual(ctx.exception.error, "access_denied")
+        self.assertEqual(slept, [10])
+
+    @patch("authfi.urlopen")
+    def test_the_async_wait_gives_up_at_the_timeout(self, mock_urlopen):
+        mock_urlopen.side_effect = _oauth_error("authorization_pending")
+
+        async def sleep(s):
+            pass
+        with self.assertRaises(AgentAuthError) as ctx:
+            asyncio.run(AsyncAgentAuth(_agent_c()).await_user_token(
+                {"auth_req_id": "req_1", "interval": 5}, timeout=1, sleep=sleep))
+        self.assertEqual(ctx.exception.status, 408)
+
+    @patch("authfi.urlopen")
+    def test_async_request_exchange_and_approvals(self, mock_urlopen):
+        agent = _agent_c()
+        agent._discovery = dict(DISCOVERY, endpoints=dict(DISCOVERY["endpoints"], approval=APPROVAL_TEMPLATE))
+        mock_urlopen.side_effect = [
+            _response({"auth_req_id": "req_1", "expires_in": 300, "interval": 1}),
+            _response({"access_token": "at_agent", "expires_in": 900}),
+            _response(DELEGATED),
+            _response({"data": {"approval_id": "5f0c", "status": "pending"}}),
+            _response({"data": {"approval_id": "5f0c", "status": "approved"}}),
+        ]
+        a = AsyncAgentAuth(agent)
+
+        async def main():
+            req = await a.request_user_approval("priya@acme.com", binding_message="Send it?")
+            ex = await a.exchange("person-token")
+            rec = await a.wait_for_approval("5f0c", interval=0)
+            return req, ex, rec
+        req, ex, rec = asyncio.run(main())
+        self.assertEqual(req["auth_req_id"], "req_1")
+        self.assertEqual(asyncio.run(ex.atoken()), "at_delegated")
+        self.assertEqual(rec["status"], "approved")
+
+
+try:
+    import httpx
+except ImportError:  # the extra is optional
+    httpx = None
+
+
+@unittest.skipIf(httpx is None, "httpx is not installed (pip install 'authfi[httpx]')")
+class TestHttpxAuth(unittest.TestCase):
+    def _seen(self):
+        seen = []
+
+        def handler(request):
+            seen.append(request.headers.get("Authorization"))
+            return httpx.Response(200, json={"ok": True})
+        return seen, httpx.MockTransport(handler)
+
+    @patch("authfi.urlopen")
+    def test_sync_client_gets_a_fresh_token_per_request(self, mock_urlopen):
+        mock_urlopen.side_effect = [_response({"access_token": "at_1", "expires_in": 900}),
+                                    _response({"access_token": "at_2", "expires_in": 900})]
+        agent = _agent_c()
+        seen, transport = self._seen()
+        with httpx.Client(transport=transport, auth=agent.httpx_auth()) as client:
+            client.get("https://api.acme.com/a")
+            agent._expires_at = time.time()  # the cached token is now due for refresh
+            client.get("https://api.acme.com/b")
+        self.assertEqual(seen, ["Bearer at_1", "Bearer at_2"])
+
+    @patch("authfi.urlopen")
+    def test_async_client_works_with_the_same_auth(self, mock_urlopen):
+        mock_urlopen.return_value = _response({"access_token": "at_1", "expires_in": 900})
+        agent = AsyncAgentAuth(_agent_c())
+        seen, transport = self._seen()
+
+        async def main():
+            async with httpx.AsyncClient(transport=transport, auth=agent.httpx_auth()) as client:
+                await client.get("https://api.acme.com/a")
+        asyncio.run(main())
+        self.assertEqual(seen, ["Bearer at_1"])
+
+    def test_a_delegated_token_refuses_once_expired(self):
+        t = DelegatedToken(dict(DELEGATED, expires_in=1))
+        seen, transport = self._seen()
+        with httpx.Client(transport=transport, auth=t.httpx_auth()) as client:
+            with self.assertRaises(AgentAuthError):
+                client.get("https://api.acme.com/a")
+        self.assertEqual(seen, [])
+
+
+class TestHttpxMissing(unittest.TestCase):
+    def test_says_how_to_install_it(self):
+        import builtins
+        real = builtins.__import__
+
+        def no_httpx(name, *args, **kwargs):
+            if name == "httpx":
+                raise ImportError("mocked")
+            return real(name, *args, **kwargs)
+        with patch.object(builtins, "__import__", side_effect=no_httpx):
+            with self.assertRaises(AuthFIError) as ctx:
+                _agent_c().httpx_auth()
+        self.assertIn("authfi[httpx]", str(ctx.exception))
 
 
 if __name__ == "__main__":

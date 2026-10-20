@@ -24,6 +24,11 @@ setup(
         # the day that extra changes.
         "cryptography>=3.4.0",
     ],
+    extras_require={
+        # AgentAuth.httpx_auth() and DelegatedToken.httpx_auth(). Optional: the
+        # rest of the SDK, the async client included, does not use it.
+        "httpx": ["httpx>=0.23"],
+    },
     author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",
     license="Apache-2.0",
