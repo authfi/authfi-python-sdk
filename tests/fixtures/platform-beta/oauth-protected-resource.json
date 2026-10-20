@@ -1,0 +1,9 @@
+{
+  "authorization_servers": [
+    "https://platform-beta.authfi.io"
+  ],
+  "bearer_methods_supported": [
+    "header"
+  ],
+  "resource": "https://platform-beta.authfi.io/mcp"
+}

@@ -1,0 +1,88 @@
+{
+  "acr_values_supported": [
+    "urn:authfi:acr:1fa",
+    "urn:authfi:acr:mfa",
+    "urn:authfi:acr:passkey",
+    "urn:authfi:acr:passkey_mfa"
+  ],
+  "authorization_endpoint": "https://platform-beta.authfi.io/oauth/authorize",
+  "backchannel_authentication_endpoint": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize",
+  "backchannel_token_delivery_modes_supported": [
+    "poll"
+  ],
+  "backchannel_user_code_parameter_supported": false,
+  "claims_supported": [
+    "sub",
+    "iss",
+    "aud",
+    "exp",
+    "iat",
+    "auth_time",
+    "nonce",
+    "at_hash",
+    "c_hash",
+    "email",
+    "email_verified",
+    "name",
+    "scope",
+    "groups",
+    "roles",
+    "sid",
+    "amr",
+    "acr"
+  ],
+  "code_challenge_methods_supported": [
+    "S256"
+  ],
+  "end_session_endpoint": "https://platform-beta.authfi.io/oauth/logout",
+  "grant_types_supported": [
+    "authorization_code",
+    "client_credentials",
+    "refresh_token",
+    "urn:ietf:params:oauth:grant-type:token-exchange",
+    "urn:openid:params:grant-type:ciba"
+  ],
+  "id_token_signing_alg_values_supported": [
+    "RS256"
+  ],
+  "introspection_endpoint": "https://platform-beta.authfi.io/oauth/token/introspect",
+  "introspection_endpoint_auth_methods_supported": [
+    "client_secret_basic",
+    "client_secret_post"
+  ],
+  "issuer": "https://platform-beta.authfi.io",
+  "jwks_uri": "https://platform-beta.authfi.io/.well-known/jwks.json",
+  "response_modes_supported": [
+    "query"
+  ],
+  "response_types_supported": [
+    "code"
+  ],
+  "revocation_endpoint": "https://platform-beta.authfi.io/oauth/token/revoke",
+  "revocation_endpoint_auth_methods_supported": [
+    "client_secret_basic",
+    "client_secret_post"
+  ],
+  "scopes_supported": [
+    "openid",
+    "profile",
+    "email",
+    "offline_access"
+  ],
+  "subject_types_supported": [
+    "public"
+  ],
+  "token_endpoint": "https://platform-beta.authfi.io/oauth/token",
+  "token_endpoint_auth_methods_supported": [
+    "client_secret_basic",
+    "client_secret_post",
+    "none",
+    "private_key_jwt"
+  ],
+  "token_endpoint_auth_signing_alg_values_supported": [
+    "EdDSA",
+    "ES256",
+    "PS256"
+  ],
+  "userinfo_endpoint": "https://platform-beta.authfi.io/oauth/userinfo"
+}

@@ -1,0 +1,136 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "authfi"
+dynamic = ["version"]
+description = "AuthFI SDK: sign people in, protect APIs, machine clients and AI agents on one OAuth core"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "AuthFI" }]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28,<1",
+    "PyJWT[crypto]>=2.10,<3",
+    "cryptography>=44",
+    "typing_extensions>=4.12; python_version < '3.13'",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://authfi.io"
+Documentation = "https://authfi.io/docs"
+Source = "https://github.com/authfi/authfi-python-sdk"
+Changelog = "https://github.com/authfi/authfi-python-sdk/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/authfi/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/authfi"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/authfi", "tests", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
+
+[dependency-groups]
+# What the adapters job installs beside one extra, at that extra's lowest and newest versions.
+test = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<2",
+    "hypothesis>=6.120,<7",
+    "sentry-sdk>=2.20,<3",
+    "rich>=13.9,<15",
+]
+dev = [
+    { include-group = "test" },
+    "pytest-cov>=6,<8",
+    "mypy>=1.15,<2",
+    "pyright>=1.1.390,<2",
+    "ruff>=0.9,<1",
+    "fastapi>=0.115,<1",
+    "flask>=3.0,<4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+markers = ["live: runs against a real AuthFI project; needs AUTHFI_LIVE_* settings"]
+filterwarnings = ["error::authfi.errors.AuthFIDeprecationWarning"]
+
+[tool.coverage.run]
+branch = true
+source = ["authfi"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/authfi", "tests", "scripts"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
+
+[tool.pyright]
+include = ["src/authfi", "tests", "scripts"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingModuleSource = false
+executionEnvironments = [
+    { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
+    { root = "src" },
+    { root = "scripts" },
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "UP", "S", "D", "ANN", "ASYNC", "PT", "RUF", "TID", "I"]
+ignore = [
+    "D105",   # magic methods document themselves
+    "D107",   # the class docstring documents construction
+    "ANN401", # Any is used where a JSON value really is any JSON value
+    "D401",   # docstrings name what a function returns, as the standard library's do
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S101", "S105", "S106", "ANN", "PT011", "PT018"]
+"scripts/**" = ["S603", "S607"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
