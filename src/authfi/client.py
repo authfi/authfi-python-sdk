@@ -13,23 +13,28 @@ import logging
 import os
 import threading
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Any, ClassVar, Self, TypedDict, Unpack, cast
+from typing import Any, ClassVar, Literal, Self, TypedDict, Unpack, cast
 
 import httpx
 
 from authfi._cache import AsyncCache, SyncCache
 from authfi._clock import Clock, SystemClock
 from authfi._log import get_logger
+from authfi._protocol.authz import CHECK_PATH, check_request, parse_check
 from authfi._protocol.discovery import ServerMetadata, metadata_flow, ttl_from_headers
 from authfi._protocol.jwks import KeySet, PublicKey, jwks_flow
 from authfi._protocol.retry import RetryPolicy
-from authfi._protocol.urls import origin_of, validate_issuer, validate_origin
+from authfi._protocol.urls import FIRST_PARTY_CLIENTS, is_under, origin_of, validate_issuer, validate_origin
 from authfi._transport import DEFAULT_TIMEOUT, AsyncTransport, SyncTransport, Timeout, user_agent
 from authfi.errors import ConfigurationError
+from authfi.machine import AsyncClientCredentials, ClientCredentials
+from authfi.secret import Secret
+from authfi.tokens import AsyncTokenSource, TokenSource
+from authfi.verify import AsyncTokenVerifier, CheckResult, TokenVerifier
 
-__all__ = ["AsyncAuthFI", "AuthFI", "AuthFIOptions", "Timeout"]
+__all__ = ["FIRST_PARTY_CLIENTS", "AsyncAuthFI", "AuthFI", "AuthFIOptions", "Timeout"]
 
 #: An unknown ``kid`` refetches the key set at most once per this many seconds, per issuer.
 KID_REFETCH_INTERVAL = 30.0
@@ -103,6 +108,18 @@ class _Project:
         api = self.api_origin
         return (issuer,) if api == issuer else (issuer, api)
 
+    def names_authfi(self, value: str | None) -> bool:
+        """``True`` when ``value`` (an audience or a resource) is AuthFI itself.
+
+        That is no value at all, a URL under the issuer or the API origin (``<issuer>/mcp``), or one
+        of AuthFI's own applications.
+        """
+        if value is None:
+            return True
+        if value in FIRST_PARTY_CLIENTS or is_under(value, self.issuer):
+            return True
+        return value.startswith(("https://", "http://")) and is_under(value, self.api_origin)
+
     @property
     def clock(self) -> Clock:
         """The clock this project reads (the system clock unless one was injected)."""
@@ -151,6 +168,22 @@ def _after_fork_in_child() -> None:
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _authorization(credential: TokenSource | Secret, method: str, url: str) -> dict[str, str]:
+    if isinstance(credential, Secret):
+        return {"Authorization": "Bearer " + credential.reveal()}
+    if isinstance(credential, TokenSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return credential.headers(method, url)
+    raise ConfigurationError("credential must be a TokenSource or a Secret, never a plain string")
+
+
+async def _async_authorization(credential: AsyncTokenSource | Secret, method: str, url: str) -> dict[str, str]:
+    if isinstance(credential, Secret):
+        return {"Authorization": "Bearer " + credential.reveal()}
+    if isinstance(credential, AsyncTokenSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return await credential.headers(method, url)
+    raise ConfigurationError("credential must be an AsyncTokenSource or a Secret, never a plain string")
 
 
 def _register(instance: AuthFI | AsyncAuthFI) -> None:
@@ -248,6 +281,64 @@ class AuthFI(_Project):
             return keys, ttl_from_headers(cache_control)
 
         return self._jwks.get("jwks", fetch, refresh=refresh)
+
+    # --- areas -------------------------------------------------------------------------------
+
+    def verifier(
+        self,
+        audience: Sequence[str],
+        *,
+        expected_tenant_id: str | None = None,
+        leeway: float | None = None,
+    ) -> TokenVerifier:
+        """A verifier for access tokens issued to ``audience`` (your API's client id, or your front ends').
+
+        ``audience`` is required and is never AuthFI's own (the issuer, ``<issuer>/mcp``, the
+        console). Set ``expected_tenant_id`` to pin the tenant tokens must name.
+        """
+        return TokenVerifier(self, audience, expected_tenant_id=expected_tenant_id, leeway=leeway)
+
+    def client_credentials(
+        self,
+        client_id: str,
+        client_secret: Secret,
+        *,
+        resource: str | None = None,
+        send_to: Sequence[str] = (),
+        scope: Sequence[str] | None = None,
+        auth_method: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic",
+    ) -> ClientCredentials:
+        """A machine client's token for ``resource`` (the API's client id), sent only to ``send_to``.
+
+        Without ``resource`` the token's audience is the client itself, which no API should accept;
+        that is logged once.
+        """
+        return ClientCredentials(
+            self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
+        )
+
+    def check(
+        self,
+        credential: TokenSource | Secret,
+        *,
+        subject: str,
+        relation: str,
+        object: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> CheckResult:
+        """Ask the project's policy now whether ``subject`` has ``relation`` to ``object``.
+
+        ``credential`` is any access token of this project (a :class:`TokenSource`, or a
+        :class:`Secret` you hold). Use it for per-object decisions, for a fresh answer, and for a
+        token an agent holds for a person, which carries no ``permissions``.
+        """
+        url = self.api_origin + CHECK_PATH
+        headers = _authorization(credential, "POST", url)
+        request = check_request(
+            self.api_origin, headers, subject=subject, relation=relation, obj=object, context=context
+        )
+        allowed, held, reason = parse_check(self._transport.send(request))
+        return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
         self._closables.append(weakref.ref(closable))
@@ -355,6 +446,51 @@ class AsyncAuthFI(_Project):
             return keys, ttl_from_headers(cache_control)
 
         return await self._jwks.get("jwks", fetch, refresh=refresh)
+
+    # --- areas -------------------------------------------------------------------------------
+
+    def verifier(
+        self,
+        audience: Sequence[str],
+        *,
+        expected_tenant_id: str | None = None,
+        leeway: float | None = None,
+    ) -> AsyncTokenVerifier:
+        """See :meth:`AuthFI.verifier`."""
+        return AsyncTokenVerifier(self, audience, expected_tenant_id=expected_tenant_id, leeway=leeway)
+
+    def client_credentials(
+        self,
+        client_id: str,
+        client_secret: Secret,
+        *,
+        resource: str | None = None,
+        send_to: Sequence[str] = (),
+        scope: Sequence[str] | None = None,
+        auth_method: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic",
+    ) -> AsyncClientCredentials:
+        """See :meth:`AuthFI.client_credentials`."""
+        return AsyncClientCredentials(
+            self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
+        )
+
+    async def check(
+        self,
+        credential: AsyncTokenSource | Secret,
+        *,
+        subject: str,
+        relation: str,
+        object: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> CheckResult:
+        """See :meth:`AuthFI.check`."""
+        url = self.api_origin + CHECK_PATH
+        headers = await _async_authorization(credential, "POST", url)
+        request = check_request(
+            self.api_origin, headers, subject=subject, relation=relation, obj=object, context=context
+        )
+        allowed, held, reason = parse_check(await self._transport.send(request))
+        return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
         self._closables.append(weakref.ref(closable))

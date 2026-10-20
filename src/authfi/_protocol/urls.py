@@ -14,6 +14,7 @@ from urllib.parse import SplitResult, urlsplit
 from authfi.errors import ConfigurationError, DiscoveryError
 
 __all__ = [
+    "FIRST_PARTY_CLIENTS",
     "is_loopback",
     "is_under",
     "origin_of",
@@ -23,6 +24,9 @@ __all__ = [
 ]
 
 _LOOPBACK_NAMES = frozenset({"localhost"})
+
+#: AuthFI's own applications. A token for them is never one a customer's API accepts.
+FIRST_PARTY_CLIENTS = frozenset({"authfi-console", "authfi-workspace"})
 
 
 def is_loopback(host: str | None) -> bool:

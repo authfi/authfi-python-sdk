@@ -48,7 +48,7 @@ __all__ = [
 #: RFC 7523 §2.2: the client assertion type of ``private_key_jwt``.
 CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 #: RFC 8693 §3: the token type of an OAuth access token.
-ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"  # noqa: S105 - a URN, not a secret
+ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 ClientAuthMethod = Literal["none", "client_secret_basic", "client_secret_post", "private_key_jwt"]
 
@@ -291,7 +291,7 @@ def revocation_request(
     auth: ClientAuth,
     *,
     token: Secret,
-    token_type_hint: Literal["refresh_token", "access_token"] = "refresh_token",  # noqa: S107 - a hint name
+    token_type_hint: Literal["refresh_token", "access_token"] = "refresh_token",
 ) -> HttpRequest:
     """RFC 7009 revocation. Safe to repeat: revoking twice changes nothing."""
     form = {"token": token.reveal(), "token_type_hint": token_type_hint}

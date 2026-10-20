@@ -36,6 +36,43 @@ The issuer is the one required setting. Everything else is read from the project
 document. Create one client per project and share it: it owns the caches. In asyncio code, use
 `AsyncAuthFI`, which has the same methods as coroutines; create one per event loop.
 
+## Protect an API
+
+```python
+from fastapi import Depends, FastAPI
+from authfi import AccessToken, AsyncAuthFI
+from authfi.fastapi import AuthFIBearer
+
+auth = AuthFIBearer(AsyncAuthFI.from_env().verifier(audience=["api_orders"]))
+app = FastAPI()
+auth.install(app)
+
+@app.get("/orders")
+async def orders(token: AccessToken = Depends(auth.require(permissions=["orders:read"]))):
+    return {"for": str(token.principal)}
+```
+
+`audience` is your API's client id (and your front ends' client ids, if your people call the API
+with their own tokens). Every token is checked for its type, issuer, audience, expiry and tenant;
+a refused one gets an opaque 401, and the precise reason goes to your log. Flask is supported as
+`authfi.flask.AuthFIFlask`. See [docs/verify.md](docs/verify.md).
+
+## Call an API as a machine client
+
+```python
+from authfi import AuthFI, Secret
+
+af = AuthFI.from_env()
+credential = af.client_credentials(
+    "app_reports", Secret(os.environ["AUTHFI_CLIENT_SECRET"]),
+    resource="api_orders", send_to=["https://api.example.com"],
+)
+httpx.Client(auth=credential.httpx_auth()).get("https://api.example.com/orders")
+```
+
+The token is reused and renewed before it expires, and is sent only to `send_to`. See
+[docs/machine.md](docs/machine.md).
+
 ## Errors
 
 Every error is an `authfi.AuthFIError`. Branch on its `code`, never on the message:
@@ -63,6 +100,9 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 ## Documentation
 
 - [The core: the project client, timeouts and retries, errors, secrets, credentials](docs/core.md)
+- [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
+- [Machine clients](docs/machine.md)
+- Examples: [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine)
 - [Moving from 0.1](docs/migration-0.2.md)
 - [Changelog](CHANGELOG.md)
 

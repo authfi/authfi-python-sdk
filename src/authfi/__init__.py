@@ -36,6 +36,7 @@ from authfi.errors import (
     TransportError,
     WebhookVerificationError,
 )
+from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
 from authfi.tokens import (
     AsyncInMemoryTokenStore,
@@ -46,18 +47,33 @@ from authfi.tokens import (
     TokenSource,
     TokenStore,
 )
+from authfi.verify import (
+    AccessToken,
+    AsyncMultiIssuerVerifier,
+    AsyncTokenVerifier,
+    CheckResult,
+    MultiIssuerVerifier,
+    Principal,
+    TokenVerifier,
+)
 
 __all__ = [
     "APIError",
+    "AccessToken",
     "AsyncAuthFI",
+    "AsyncClientCredentials",
     "AsyncInMemoryTokenStore",
+    "AsyncMultiIssuerVerifier",
     "AsyncTokenSource",
     "AsyncTokenStore",
+    "AsyncTokenVerifier",
     "AuthFI",
     "AuthFIDeprecationWarning",
     "AuthFIError",
     "AuthFIOptions",
     "AuthFISecurityWarning",
+    "CheckResult",
+    "ClientCredentials",
     "ConfigurationError",
     "ConsentDenied",
     "ConsentExpired",
@@ -70,8 +86,10 @@ __all__ = [
     "IntegrationError",
     "InvalidToken",
     "KnownCode",
+    "MultiIssuerVerifier",
     "NotSupportedError",
     "OAuthError",
+    "Principal",
     "Secret",
     "ServerMetadata",
     "StepUpRequired",
@@ -80,6 +98,7 @@ __all__ = [
     "TokenSet",
     "TokenSource",
     "TokenStore",
+    "TokenVerifier",
     "TransportError",
     "WebhookVerificationError",
     "__version__",
