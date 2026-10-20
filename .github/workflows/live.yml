@@ -1,6 +1,7 @@
 # The live suite against the platform-beta testing tenant. Never on a pull request: it needs the
 # sdk-live-ci machine client's secret, held in the platform-beta environment, which requires a
-# reviewer's approval for every run.
+# reviewer's approval for every run. The testing tenant's id is a variable of that environment
+# (AUTHFI_LIVE_TENANT_ID), not in this public file.
 name: Live
 
 on:
@@ -26,10 +27,10 @@ jobs:
       - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
         with:
           python-version: "3.12"
-      - run: uv sync --frozen
+      - run: uv sync --locked
       - run: uv run pytest -m live -p no:cacheprovider
         env:
           AUTHFI_LIVE_ISSUER: https://platform-beta.authfi.io
-          AUTHFI_LIVE_TENANT_ID: 4e46e0c4-ec26-48e1-b5bb-04a1ec3ff358
+          AUTHFI_LIVE_TENANT_ID: ${{ vars.AUTHFI_LIVE_TENANT_ID }}
           AUTHFI_LIVE_CLIENT_ID: ${{ secrets.SDK_LIVE_CI_CLIENT_ID }}
           AUTHFI_LIVE_CLIENT_SECRET: ${{ secrets.SDK_LIVE_CI_CLIENT_SECRET }}

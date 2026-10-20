@@ -59,8 +59,16 @@ _MIGRATION = "see docs/migration-0.2.md"
 
 
 def is_legacy_construction(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> bool:
-    """``main``'s form: ``tenant=`` or another legacy keyword, or two or more positional arguments."""
-    return len(args) >= 2 or bool(LEGACY_KEYWORDS.intersection(kwargs))
+    """``main``'s form: ``tenant=`` or another legacy keyword, or two or more positional arguments.
+
+    ``audience=`` alone is not the old form: it is what a 0.2 user writes at the wrong place, and
+    reading it as the old form would take their issuer for a tenant name.
+    """
+    if len(args) >= 2 or (LEGACY_KEYWORDS - {"audience"}).intersection(kwargs):
+        return True
+    if "audience" in kwargs:
+        raise ConfigurationError("audience= belongs to AuthFI(tenant, ...); use af.verifier(audience=[...])")
+    return False
 
 
 @dataclass(frozen=True, slots=True)

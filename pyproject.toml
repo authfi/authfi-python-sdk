@@ -60,6 +60,8 @@ test = [
     "sentry-sdk>=2.20,<3",
     "rich>=13.9,<15",
 ]
+# The weekly mutation run (Linux only): a surviving mutant is a missing test.
+mutation = ["mutmut==3.8.0"]
 dev = [
     { include-group = "test" },
     "pytest-cov>=6,<8",
@@ -81,6 +83,11 @@ filterwarnings = [
     "error::authfi.errors.AuthFIDeprecationWarning",
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
+
+[tool.mutmut]
+# Every module is copied so the package imports; the weekly job selects which mutants run.
+source_paths = ["src/authfi/"]
+pytest_add_cli_args_test_selection = ["tests/unit/"]
 
 [tool.coverage.run]
 branch = true
