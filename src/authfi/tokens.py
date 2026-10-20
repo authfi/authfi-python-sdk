@@ -162,7 +162,7 @@ class TokenSet:
     refresh_token: Secret | None = None
     id_token: Secret | None = None
     scope: frozenset[str] = field(default_factory=frozenset[str])
-    token_type: str = "Bearer"  # noqa: S105 - a token type name, not a secret
+    token_type: str = "Bearer"
 
     @classmethod
     def from_response(cls, response: TokenResponse, now: float, previous: TokenSet | None = None) -> TokenSet:

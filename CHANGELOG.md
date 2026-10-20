@@ -25,6 +25,16 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - `TokenSet`, `TokenStore` and `InMemoryTokenStore` for a person's tokens, with refreshes made
   once per refresh token across threads and tasks.
 - Type information (`py.typed`); the package passes `mypy --strict` and pyright in strict mode.
+- `af.verifier(audience=[...])`: a strict access-token verifier for APIs. It requires `typ`
+  `at+jwt`, the issuer, an audience (never AuthFI's own), `exp`, `sub` and `tenant_id`; verifies
+  RS256, ES256 and EdDSA by the issuer's key; pins the tenant; and refuses a sender-constrained
+  token presented as Bearer. `AccessToken` gives every token the same shape, with `Principal`.
+- `MultiIssuerVerifier`, pinning each accepted issuer to its tenant.
+- `af.check(...)`: a live authorization decision from the project's policy.
+- `af.client_credentials(...)`: a machine client's token for one API, cached and renewed, and
+  sent only to that API's origins.
+- `authfi.fastapi.AuthFIBearer` and `authfi.flask.AuthFIFlask`, answering refusals as RFC 6750
+  and RFC 9470 say, with the precise reason in the log only.
 
 ### Changed
 

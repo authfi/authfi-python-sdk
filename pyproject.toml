@@ -32,6 +32,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.115,<1"]
+flask = ["flask>=3.0,<4"]
+
 [project.urls]
 Homepage = "https://authfi.io"
 Documentation = "https://authfi.io/docs"
@@ -45,7 +49,7 @@ path = "src/authfi/_version.py"
 packages = ["src/authfi"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/authfi", "tests", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
+include = ["src/authfi", "tests", "conformance", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
 
 [dependency-groups]
 # What the adapters job installs beside one extra, at that extra's lowest and newest versions.
@@ -73,7 +77,10 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 xfail_strict = true
 markers = ["live: runs against a real AuthFI project; needs AUTHFI_LIVE_* settings"]
-filterwarnings = ["error::authfi.errors.AuthFIDeprecationWarning"]
+filterwarnings = [
+    "error::authfi.errors.AuthFIDeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
 
 [tool.coverage.run]
 branch = true
@@ -92,7 +99,7 @@ exclude_also = [
 [tool.mypy]
 strict = true
 python_version = "3.11"
-files = ["src/authfi", "tests", "scripts"]
+files = ["src/authfi", "tests", "scripts", "examples"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
@@ -101,7 +108,7 @@ module = ["opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
 [tool.pyright]
-include = ["src/authfi", "tests", "scripts"]
+include = ["src/authfi", "tests", "scripts", "examples"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 reportMissingModuleSource = false
@@ -109,6 +116,7 @@ executionEnvironments = [
     { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
     { root = "src" },
     { root = "scripts" },
+    { root = "examples" },
 ]
 
 [tool.ruff]
@@ -123,11 +131,15 @@ ignore = [
     "D107",   # the class docstring documents construction
     "ANN401", # Any is used where a JSON value really is any JSON value
     "D401",   # docstrings name what a function returns, as the standard library's do
+    "S105",   # "token" names a domain concept here, not a password; secrets are held in Secret
+    "S106",
+    "S107",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "S101", "S105", "S106", "ANN", "PT011", "PT018"]
+"tests/**" = ["D", "S101", "ANN", "PT011", "PT018"]
 "scripts/**" = ["S603", "S607"]
+"examples/**" = ["T201", "INP001"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"
