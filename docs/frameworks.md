@@ -98,3 +98,62 @@ For your own graph, the pieces are public: `AuthFIState` (the messages and `auth
 `langgraph.approval_node`, `route_after_tools`, and the MCP tool interceptor
 `langgraph.interceptor`, which `langgraph.client()` installs. Use LangGraph's own `ToolNode` with
 the tools; the guarding is in the tools themselves.
+
+## OpenAI Agents SDK
+
+```bash
+pip install "authfi[openai-agents] @ git+https://github.com/authfi/authfi-python-sdk@main"
+```
+
+```python
+from agents import Agent, Runner
+from authfi import AsyncAuthFI
+from authfi.openai_agents import OpenAIAgentsIntegration
+
+af = AsyncAuthFI.from_env()
+openai_agents = OpenAIAgentsIntegration(af.agent_from_env())
+openai_agents.configure_tracing()                  # first, before any run
+
+async with openai_agents.mcp_server() as tools:
+    agent = Agent(name="support", model=openai_agents.model("claude-haiku-5-5"), mcp_servers=[tools])
+    config = openai_agents.run_config()
+    result = await Runner.run(agent, "Refund order 4411", run_config=config)
+    while result.interruptions:
+        state = result.to_state()
+        waiting = await tools.resolve(state, result.interruptions)
+        if waiting:
+            show(waiting)                          # approval_id, tool, args; the person decides in AuthFI
+            continue                               # resolve again once they have
+        result = await Runner.run(agent, state, run_config=config)
+```
+
+**Tracing.** The SDK's default exporter sends traces to OpenAI with the OpenAI key, and records
+prompts, answers and tool results unless told otherwise. `configure_tracing(processors=(),
+capture_content=False)` removes that exporter, sends spans only to the processors you name (each
+wrapped in `AuthFITraceProcessor`, which removes content before your processor sees a span), and
+makes every `RunConfig` default to no content. With no processors, tracing is off. `run_config()`
+names the agent in the trace's metadata (`authfi_agent_id`).
+
+**Models.** `model(name)` is Claude on the AI gateway through LiteLLM; `model(name, api="openai")` is
+the SDK's Chat Completions model, for a project with an OpenAI-compatible provider. The agent's
+token goes on each call; no OpenAI key is set, so nothing can export it.
+
+**Tools.** `mcp_server()` is the SDK's streamable HTTP MCP server on the gateway: the current token
+on every request, the gateway's tool names, `never_allowed` tools left out (`include_never_allowed=True`
+keeps them), and a refusal handed to the model as the tool's error, naming why. A refused token
+raises `GatewayTokenRefused`.
+
+**Approvals.** The SDK asks for approval before a call; the gateway decides when it arrives. A tool
+the gateway marks `may_require_approval` pauses the run as the SDK's own `ToolApprovalItem`.
+`resolve(state, interruptions)` sends each paused call to the gateway:
+
+- the gateway opens an approval: the call is returned as waiting (a `PendingApproval` with the
+  `approval_id`), and `state` is left alone;
+- the gateway has decided (the person approved or denied, or no approval was needed): the item is
+  approved in `state`, and the run receives the gateway's answer, the tool's result or the
+  refusal, without the call being sent again.
+
+Call `resolve` again once the person has decided, then run again with `state`. Only the gateway's
+decision approves an item, one call at a time. A hold the gateway did not announce reaches the
+model as "This action is waiting for a person's approval.", and the next call to that tool pauses
+the run. The approval id never reaches the model.

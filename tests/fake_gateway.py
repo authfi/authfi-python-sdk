@@ -198,6 +198,8 @@ class FakeGateway:
             )
         if path.endswith("/v1/messages"):
             return self._model(json.loads(body))
+        if path.endswith("/v1/chat/completions"):
+            return self._chat(json.loads(body))
         message = cast(dict[str, Any], json.loads(body))
         method, rid = message.get("method"), message.get("id")
         if rid is None:
@@ -294,6 +296,12 @@ class FakeGateway:
         }
         return 200, {}, _rpc(rid, result)
 
+    def _chat(self, request: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
+        with self._lock:
+            blocks = self.model_script.pop(0) if self.model_script else [{"type": "text", "text": "Done."}]
+        text = "".join(str(b.get("text", "")) for b in blocks)
+        return 200, {}, _chat_answer(request.get("model"), text)
+
     def _model(self, request: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
         with self._lock:
             blocks = self.model_script.pop(0) if self.model_script else [{"type": "text", "text": "Done."}]
@@ -325,6 +333,19 @@ class FakeGateway:
         if request.get("stream"):
             return 200, {"Content-Type": "text/event-stream"}, _sse(message)
         return 200, {}, json.dumps(message).encode()
+
+
+def _chat_answer(model: object, text: str) -> bytes:
+    return json.dumps(
+        {
+            "id": "chatcmpl-" + uuid.uuid4().hex[:12],
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }
+    ).encode()
 
 
 def _rpc(rid: Any, result: dict[str, Any]) -> bytes:
