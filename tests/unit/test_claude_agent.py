@@ -409,3 +409,22 @@ def test_the_pending_approval_is_the_one_every_adapter_uses() -> None:
     from authfi.gateway import PendingApproval as Base
 
     assert PendingApproval is Base
+
+
+# --- the helper is told where the machine APIs are ----------------------------------------------------
+
+
+async def test_the_helper_is_told_the_machine_api_host_of_a_custom_domain_project(key_file: Path) -> None:
+    with FakeGateway(api_origin="https://acme.authfi.io") as gateway:
+        async with AsyncAuthFI(gateway.issuer) as project:
+            claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+            assert "AUTHFI_API_ORIGIN" not in claude.helper_env()  # discovery has not been read yet
+            options = await claude.options(model="claude-haiku-5-5")
+    assert dict(options.env)["AUTHFI_API_ORIGIN"] == "https://acme.authfi.io"
+
+
+async def test_the_helper_is_not_pinned_to_an_api_origin_when_there_is_nothing_to_say(
+    claude: ClaudeAgentIntegration,
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5")
+    assert "AUTHFI_API_ORIGIN" not in dict(options.env)
