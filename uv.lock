@@ -44,7 +44,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "pyjwt", extra = ["crypto"] },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -75,7 +75,7 @@ requires-dist = [
     { name = "flask", marker = "extra == 'flask'", specifier = ">=3.0,<4" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'", specifier = ">=4.12" },
+    { name = "typing-extensions", specifier = ">=4.12" },
 ]
 provides-extras = ["fastapi", "flask"]
 

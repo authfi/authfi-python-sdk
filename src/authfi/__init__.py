@@ -12,10 +12,25 @@ Every area is made from it and shares its discovery document, key set and HTTP c
 import warnings
 from typing import TYPE_CHECKING, Final
 
+from authfi._protocol.agent import CIBA_GRANT as CIBA_GRANT_TYPE
 from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.ids import idempotency_key, request_id
+from authfi._protocol.oauth import CLIENT_ASSERTION_TYPE
 from authfi._transport import user_agent
 from authfi._version import __version__
+from authfi.agents import (
+    ActionDecision,
+    AgentAuth,
+    AgentKey,
+    Approval,
+    AsyncAgentAuth,
+    AsyncDelegatedToken,
+    CibaRequest,
+    DelegatedToken,
+    Signer,
+    TransactionToken,
+    assert_public_jwk,
+)
 from authfi.client import AsyncAuthFI, AuthFI, AuthFIOptions, Timeout
 from authfi.errors import (
     APIError,
@@ -83,11 +98,19 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "CIBA_GRANT_TYPE",
+    "CLIENT_ASSERTION_TYPE",
     "USER_AGENT",
     "APIError",
     "AccessToken",
+    "ActionDecision",
+    "AgentAuth",
+    "AgentKey",
+    "Approval",
+    "AsyncAgentAuth",
     "AsyncAuthFI",
     "AsyncClientCredentials",
+    "AsyncDelegatedToken",
     "AsyncInMemoryTokenStore",
     "AsyncMultiIssuerVerifier",
     "AsyncTokenSource",
@@ -99,10 +122,12 @@ __all__ = [
     "AuthFIOptions",
     "AuthFISecurityWarning",
     "CheckResult",
+    "CibaRequest",
     "ClientCredentials",
     "ConfigurationError",
     "ConsentDenied",
     "ConsentExpired",
+    "DelegatedToken",
     "DiscoveryError",
     "GatewayTokenRefused",
     "InMemoryTokenStore",
@@ -118,6 +143,7 @@ __all__ = [
     "Principal",
     "Secret",
     "ServerMetadata",
+    "Signer",
     "StepUpRequired",
     "TemporarilyUnavailable",
     "Timeout",
@@ -125,9 +151,11 @@ __all__ = [
     "TokenSource",
     "TokenStore",
     "TokenVerifier",
+    "TransactionToken",
     "TransportError",
     "WebhookVerificationError",
     "__version__",
+    "assert_public_jwk",
     "idempotency_key",
     "request_id",
 ]

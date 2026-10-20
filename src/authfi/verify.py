@@ -78,6 +78,11 @@ class Principal:
     def __str__(self) -> str:
         return f"{self.kind}:{self.id}"
 
+    @classmethod
+    def parse(cls, value: str, default: PrincipalKind = "user") -> Principal:
+        """A party from a ``sub``-style value: ``user:abc``, ``agent:agt_1``, a bare ``agt_1``, or ``default``."""
+        return _parse_party(value, default)
+
 
 _TYPED = {"user:": "user", "app:": "app", "agent:": "agent"}
 

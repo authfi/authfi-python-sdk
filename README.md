@@ -73,6 +73,36 @@ httpx.Client(auth=credential.httpx_auth()).get("https://api.example.com/orders")
 The token is reused and renewed before it expires, and is sent only to `send_to`. See
 [docs/machine.md](docs/machine.md).
 
+## Give an AI agent its own identity
+
+```bash
+authfi keygen --out agent.key      # register the printed public key on the agent in the console
+```
+
+```python
+from authfi import AuthFI
+
+agent = AuthFI.from_env().agent_from_env()     # AUTHFI_AGENT_ID, AUTHFI_AGENT_KEY_FILE, AUTHFI_AGENT_KID
+httpx.Client(auth=agent.httpx_auth())          # its own token, for the AuthFI gateway
+```
+
+The agent signs a short assertion with a key that never leaves the process; its token is reused
+and renewed before it expires. See [docs/agents.md](docs/agents.md).
+
+## Act for a person
+
+```python
+# A caller with no browser approves on their own phone (CIBA):
+request = agent.request_user_token("priya@acme.com", binding_message="Refund order 4411")
+as_priya = agent.await_user_token(request)
+
+# A person signed in to your app (token exchange):
+as_her = agent.exchange(Secret(her_access_token))
+```
+
+Each is a token whose subject is the person and whose actor is the agent. It never prints and
+never pickles.
+
 ## Errors
 
 Every error is an `authfi.AuthFIError`. Branch on its `code`, never on the message:
@@ -102,7 +132,10 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 - [The core: the project client, timeouts and retries, errors, secrets, credentials](docs/core.md)
 - [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
 - [Machine clients](docs/machine.md)
-- Examples: [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine)
+- [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
+- Examples: [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine),
+  [agent identity](examples/agent-identity), [a caller with no browser](examples/agent-for-a-person-voice),
+  [a person signed in to your app](examples/agent-for-a-signed-in-user), [the action gate](examples/action-gate)
 - [Moving from 0.1](docs/migration-0.2.md)
 - [Changelog](CHANGELOG.md)
 

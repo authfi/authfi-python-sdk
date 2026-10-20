@@ -33,6 +33,7 @@ __all__ = [
     "AsyncInMemoryTokenStore",
     "AsyncTokenSource",
     "AsyncTokenStore",
+    "Destinations",
     "InMemoryTokenStore",
     "TokenSet",
     "TokenSource",
@@ -58,6 +59,44 @@ def normalise_send_to(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(validate_origin(v) for v in values))
 
 
+class _Project(Protocol):
+    """What a destination rule reads from the project."""
+
+    def names_authfi(self, value: str | None) -> bool: ...
+
+    @property
+    def authfi_origins(self) -> tuple[str, ...]: ...
+
+
+class Destinations:
+    """Where one credential may be sent, decided when the credential is made.
+
+    A credential for AuthFI itself (no resource, ``<issuer>/mcp``, the console) may go to the
+    issuer and the API origin, plus any ``send_to`` given. A credential for a customer's API may go
+    only to ``send_to``, which is then required: its audience is that API, so it has no business
+    anywhere else, AuthFI included.
+    """
+
+    __slots__ = ("_extra", "_own", "_project")
+
+    def __init__(self, project: _Project, resource: str | None, send_to: Sequence[str]) -> None:
+        self._project = project
+        self._own = project.names_authfi(resource)
+        self._extra = normalise_send_to(send_to)
+        if not self._own and not self._extra:
+            raise ConfigurationError(
+                f"send_to is required with resource={resource!r}: name the API's origin, such as "
+                'send_to=["https://api.example.com"], so the credential can go nowhere else.'
+            )
+
+    @property
+    def origins(self) -> tuple[str, ...]:
+        """The allowed origins, now (the API origin may be learned from discovery)."""
+        if self._own:
+            return tuple(dict.fromkeys((*self._project.authfi_origins, *self._extra)))
+        return self._extra
+
+
 class TokenSource(abc.ABC):
     """A credential that blocking code sends: ``token()``, ``headers()``, and an ``httpx.Auth``.
 
@@ -66,6 +105,8 @@ class TokenSource(abc.ABC):
     dispatch on ``isinstance`` (or on :attr:`is_async`) without calling a coroutine as if it were
     a function.
     """
+
+    __slots__ = ()
 
     is_async: ClassVar[Literal[False]] = False
 
@@ -90,6 +131,8 @@ class TokenSource(abc.ABC):
 
 class AsyncTokenSource(abc.ABC):
     """A credential that asyncio code sends. The same as :class:`TokenSource`, with coroutines."""
+
+    __slots__ = ()
 
     is_async: ClassVar[Literal[True]] = True
 

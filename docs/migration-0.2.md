@@ -43,6 +43,21 @@ removed at 1.0.
 | `AgentAuthError` | `OAuthError`; `.error` is `.code`. |
 | `AuthFIError(message, status)` | Unchanged, with `.code` added. |
 
+## Agents
+
+| 0.1 | 0.2 |
+|---|---|
+| `AgentAuth(agent_id, key, platform_url=...)` | `AuthFI(issuer).agent(agent_id, key)`. The old form still works when `platform_url` is given, and warns. |
+| `AgentAuth.from_env()` with `AUTHFI_PLATFORM_URL`, `AUTHFI_AGENT_AUDIENCE` | `AuthFI.from_env().agent_from_env()` with `AUTHFI_ISSUER`, `AUTHFI_AGENT_RESOURCE`. The old names are read, with a warning. The key variables are unchanged. |
+| `agent.token(audience)`, `audience=` | `agent.token(resource=...)`; `resource=` names the API. |
+| `agent.auth_header()` | `agent.headers(method, url)`, or `httpx.Client(auth=agent.httpx_auth())` |
+| `agent.can(name)` | `name in agent.capabilities()` |
+| `agent.request_user_approval(...)` | `agent.request_user_token(..., binding_message=...)`; the message is required. |
+| `agent.await_user_token(...)`, `token_as_user(...)` returning a `dict` | They return a `DelegatedToken`: call `.token()` for the value, and read `.subject`, `.actor`. |
+| `AgentKey.generate("k1")`, `from_pem(pem, "k1")`, `key_id=`, `.key_id` | `kid=` everywhere: `AgentKey.generate(kid="k1")`. |
+| `key.private_pem()` | `key.write(path)`: a new file only its owner can read. |
+| `token_endpoint=`, `backchannel_endpoint=`, `discovery_url=` | Not used: endpoints come from the project's discovery document. |
+
 ## What no longer works, on purpose
 
 - **A token is never verified without an audience.** `verify_token` on a project built without
@@ -52,5 +67,12 @@ removed at 1.0.
   publishes one key.
 - **Only access tokens are accepted.** A person's ID token, or any other JWT the project signs,
   is refused by the verifier (`typ` must be `at+jwt`).
+- **An agent's project has no default.** 0.1 sent an agent with no address to
+  `platform.authfi.io`, where it does not exist.
+- **A key file others can read is refused.** Make it readable by its owner only
+  (`chmod 600`), or write it with `AgentKey.write`.
+- **A person's token never comes back as a dict.** A `DelegatedToken` does not print or pickle its
+  token; a checkpoint stores the person's id.
+- **The first CIBA poll waits the interval** the project asks for, as the CIBA standard says.
 - **The answer to a refused request does not say why.** A 401 carries one fixed description,
   and a 403 no list of missing permissions; the reason is in your log.

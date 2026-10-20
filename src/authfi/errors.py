@@ -240,8 +240,8 @@ class APIError(AuthFIError):
         self,
         code: str,
         description: str | None = None,
-        *,
         status: int | None = None,
+        *,
         request_id: str | None = None,
     ) -> None:
         message = code if not description else f"{code}: {description}"
