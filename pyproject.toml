@@ -47,8 +47,10 @@ langgraph = [
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
+    "claude-agent-sdk>=0.2.168,<0.3",
 ]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
+claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -84,6 +86,7 @@ dev = [
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
+    "claude-agent-sdk>=0.2.168,<0.3",
 ]
 
 [tool.pytest.ini_options]
@@ -98,6 +101,8 @@ filterwarnings = [
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
     # openai-agents 0.24 opens MCP sessions with the client mcp renamed
     "ignore:Use `streamable_http_client` instead:DeprecationWarning",
+    # The fork-safety tests fork on purpose, after the adapter tests' local servers have started threads
+    "ignore:This process .* is multi-threaded, use of fork:DeprecationWarning",
 ]
 
 [tool.coverage.run]

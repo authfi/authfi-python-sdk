@@ -157,3 +157,65 @@ Call `resolve` again once the person has decided, then run again with `state`. O
 decision approves an item, one call at a time. A hold the gateway did not announce reaches the
 model as "This action is waiting for a person's approval.", and the next call to that tool pauses
 the run. The approval id never reaches the model.
+
+## Claude Agent SDK
+
+```bash
+pip install "authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main"
+```
+
+```python
+from claude_agent_sdk import ClaudeSDKClient
+from authfi import AsyncAuthFI
+from authfi.claude_agent import ClaudeAgentIntegration, PendingApproval
+
+async def until_decided(pending: PendingApproval) -> None:
+    ...   # tell someone, and return once the person has decided in AuthFI
+
+af = AsyncAuthFI.from_env()                        # AUTHFI_AGENT_KEY_FILE: the agent's key is a file
+claude = ClaudeAgentIntegration(af.agent_from_env(), wait_for_decision=until_decided)
+options = await claude.options(model="claude-haiku-5-5")
+async with ClaudeSDKClient(options) as client:
+    await client.query("Refund order 4411")
+    async for message in client.receive_response():
+        ...
+```
+
+**The model.** Claude Code runs `python -m authfi token` as its `apiKeyHelper` and calls the AI
+gateway with that token, running it again every four minutes. The helper signs as the agent with
+the agent's key file, so the agent's key must be loaded from a file (`AgentKey.from_file` or
+`AUTHFI_AGENT_KEY_FILE`). Claude Code's options and environment hold the file's path, never the key
+or a token; an `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` passed in `env` is refused.
+
+**The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
+(`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code
+they are named `mcp__authfi__<server>__<tool>`. A tool the gateway marks `never_allowed` is left out.
+
+**Approvals.** Claude Code asks `can_use_tool` before a tool runs only when a permission mode asks
+it to. The options set `permission_mode="default"` and a `PreToolUse` hook that sends each of the
+gateway's tools to the permission flow, so `can_use_tool` always runs for them;
+`permission_mode="bypassPermissions"` is refused. `can_use_tool` sends the call to the gateway:
+
+| The gateway | What happens |
+|---|---|
+| allows it | Claude Code runs the tool and receives the gateway's answer; the call is not sent twice |
+| refuses it | the model reads the refusal as the tool's error, naming why |
+| holds it for approval | `wait_for_decision(pending)` is awaited, then the call is sent again with the approval, and the gateway decides |
+
+Without `wait_for_decision`, a held call is refused for now with "This action is waiting for a
+person's approval."; the same call made after the person decides goes with the approval. The
+approval id never reaches the model, and one the model writes is removed. `can_use_tool` never
+grants a lasting permission. Tools that are not AuthFI's are refused, unless you pass your own
+`can_use_tool` to `options()`, which then decides them.
+
+**A refused token** stops the run (`can_use_tool` interrupts it), and
+`claude.token_refused` holds the `GatewayTokenRefused`.
+
+**Content.** Claude Code's OpenTelemetry content switches (`OTEL_LOG_USER_PROMPTS`,
+`OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_TOOL_DETAILS`,
+`OTEL_LOG_RAW_API_BODIES`) are set off unless `capture_content=True`, and the agent's id is a
+resource attribute (`authfi.agent_id`). `configure_tracing()` turns on LangSmith's Claude Agent SDK
+tracing with inputs and outputs hidden and `authfi_agent_id` in each run's metadata.
+
+The integration runs Claude Code as the agent itself; a token the agent holds for a person is not
+accepted (`NotSupportedError`), as Claude Code could only receive it as a fixed value.

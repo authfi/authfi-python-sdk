@@ -64,6 +64,10 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   approved only once the gateway has decided (`resolve()`).
 - `AsyncGateway.mcp_client_factory()`: HTTP clients for MCP libraries, which get a refused token
   as a JSON-RPC error at once instead of waiting out their session timeout.
+- `authfi.claude_agent.ClaudeAgentIntegration` (extra `claude-agent`): `options()` gives Claude Code
+  the agent's token through `python -m authfi token` as its `apiKeyHelper` (renewed, never in its
+  environment), the gateway's tools through an MCP server in your process, approvals through
+  `can_use_tool` with a permission mode that makes Claude Code ask it, and OpenTelemetry content off.
 
 ### Changed
 
