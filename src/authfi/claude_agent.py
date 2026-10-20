@@ -69,6 +69,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError("authfi.claude_agent needs the Claude Agent SDK: pip install 'authfi[claude-agent]'") from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
+from authfi._protocol.urls import origin_of
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
 from authfi.errors import ConfigurationError, GatewayTokenRefused, NotSupportedError
 from authfi.gateway import HOLD_MESSAGE, PendingApproval, ToolApprovalRequired, ToolRefused, token_refusal
@@ -348,15 +349,21 @@ class ClaudeAgentIntegration:
     # --- options ----------------------------------------------------------------------------------------
 
     def helper_env(self) -> dict[str, str]:
-        """What ``python -m authfi token`` needs to sign as this agent: names and a path, never the key."""
+        """What ``python -m authfi token`` needs to sign as this agent: names and a path, never the key.
+
+        The API origin is the one discovery has taught the project: :meth:`options` reads discovery first.
+        """
+        project = self.gateway.project
         key_path = cast(object, getattr(self.source.key, "path", None))
         env = {
-            "AUTHFI_ISSUER": self.gateway.project.issuer,
-            "AUTHFI_API_ORIGIN": self.gateway.project.api_origin,
+            "AUTHFI_ISSUER": project.issuer,
             "AUTHFI_AGENT_ID": self.agent_id,
             "AUTHFI_AGENT_KEY_FILE": str(key_path),
             "AUTHFI_AGENT_KID": self.source.key.kid,
         }
+        if project.api_origin != origin_of(project.issuer):
+            # A project on a custom domain serves its machine APIs elsewhere; the helper is told where.
+            env["AUTHFI_API_ORIGIN"] = project.api_origin
         if self.source.resource:
             env["AUTHFI_AGENT_RESOURCE"] = self.source.resource
         return env
@@ -371,6 +378,7 @@ class ClaudeAgentIntegration:
         tools that are not AuthFI's (by default they are refused). A credential in ``env`` is refused,
         and so is ``permission_mode="bypassPermissions"``, which would skip approvals.
         """
+        await self.gateway.project.resolve_api_origin()
         if claude_options.get("permission_mode") == "bypassPermissions":
             raise ConfigurationError(
                 "permission_mode bypassPermissions skips can_use_tool, and with it AuthFI approvals"
