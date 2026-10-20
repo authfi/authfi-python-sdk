@@ -62,9 +62,6 @@ class Secret:
     def __bool__(self) -> bool:
         return bool(self._value)
 
-    def __len__(self) -> int:
-        return len(self._value)
-
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Secret):
             return NotImplemented

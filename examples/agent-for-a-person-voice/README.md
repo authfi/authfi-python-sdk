@@ -8,7 +8,7 @@ A voice agent refunds an order for a caller, after the caller approves on their 
   on their own device, so a cloned voice on the line cannot approve something else.
 - **No code is ever read back.** The agent never sees or relays one.
 - **A decision is an answer.** A refusal raises `ConsentDenied`, a request that runs out
-  `ConsentExpired`; a wait that times out leaves the request open.
+  `ConsentExpired`; a wait that times out raises `WaitTimeout` and leaves the request open.
 - **The token acts for the caller.** Its subject is the caller and its actor the agent, so the
   orders API sees both, and it is never renewed: approving again is the caller's choice.
 

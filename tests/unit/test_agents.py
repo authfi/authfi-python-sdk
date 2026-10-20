@@ -25,6 +25,7 @@ from authfi import (
     OAuthError,
     Principal,
     Secret,
+    WaitTimeout,
 )
 from authfi.agents import AgentAuth, AsyncAgentAuth, DelegatedToken
 from tests.agent_platform import AGENT, CIBA, AgentPlatform
@@ -144,7 +145,7 @@ def test_the_agent_token_goes_only_to_authfi_unless_told_otherwise(agent: AgentA
     assert claims_of(api.token())["aud"] == "api_orders"
     with pytest.raises(ConfigurationError, match="send_to is required"):
         agent.for_resource("api_orders")
-    with pytest.raises(ConfigurationError, match="send_to is required"):
+    with pytest.raises(ConfigurationError, match=r"for_resource\('api_orders'"):
         af.agent(AGENT, key, resource="api_orders")
 
 
@@ -269,12 +270,26 @@ def test_the_wait_gives_up_at_its_timeout_and_the_request_stays_open(
 ) -> None:
     platform.ciba_answers = ["pending"] * 10
     request = agent.request_user_token("priya@acme.com", binding_message="Refund")
-    with pytest.raises(OAuthError) as caught:
+    with pytest.raises(WaitTimeout) as caught:
         agent.await_user_token(request, timeout=12)
-    assert caught.value.code == "authorization_pending"
+    assert caught.value.code == "wait_timeout"
+    assert caught.value.pending_id is None
+    assert not isinstance(caught.value, OAuthError)
     assert len(platform.ciba_polls) == 2
     platform.ciba_answers = ["ok"]
     assert agent.await_user_token(request).via == "ciba"
+
+
+def test_a_request_that_ran_out_is_consent_expired_not_a_timeout(
+    agent: AgentAuth, platform: AgentPlatform, clock: FakeClock
+) -> None:
+    """The request's own life ended before the caller's timeout did: the person can no longer answer it."""
+    platform.ciba_answers = ["pending"] * 100
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")  # lives 300 s
+    with pytest.raises(ConsentExpired) as caught:
+        agent.await_user_token(request, timeout=10_000)
+    assert caught.value.code == "expired_token"
+    assert len(platform.ciba_polls) < 100
 
 
 def test_a_ciba_token_is_never_renewed(agent: AgentAuth, platform: AgentPlatform, clock: FakeClock) -> None:
@@ -407,10 +422,18 @@ def test_waiting_for_an_approval(agent: AgentAuth, platform: AgentPlatform, cloc
     platform.approval_status = "approved"
     assert agent.wait_for_approval("apr-1").status == "approved"
     platform.approval_status = "pending"
-    with pytest.raises(OAuthError) as caught:
+    with pytest.raises(WaitTimeout) as caught:
         agent.wait_for_approval("apr-1", timeout=12)
-    assert caught.value.code == "authorization_pending"
+    assert caught.value.code == "wait_timeout"
+    assert caught.value.pending_id == "apr-1"
+    assert clock.sleeps == [3.0, 3.0, 3.0, 3.0]
+    clock.sleeps.clear()
+    with pytest.raises(WaitTimeout):
+        agent.wait_for_approval("apr-1", timeout=12, poll_interval=5)
     assert clock.sleeps == [5.0, 5.0]
+    for bad in (0, -1):
+        with pytest.raises(ConfigurationError, match="poll_interval"):
+            agent.wait_for_approval("apr-1", poll_interval=bad)
 
 
 def test_a_project_without_agent_configuration_offers_no_approvals(agent: AgentAuth, platform: AgentPlatform) -> None:

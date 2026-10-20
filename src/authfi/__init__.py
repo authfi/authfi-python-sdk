@@ -53,6 +53,7 @@ from authfi.errors import (
     StepUpRequired,
     TemporarilyUnavailable,
     TransportError,
+    WaitTimeout,
     WebhookVerificationError,
 )
 from authfi.gateway import (
@@ -169,6 +170,7 @@ __all__ = [
     "ToolOutcome",
     "TransactionToken",
     "TransportError",
+    "WaitTimeout",
     "WebhookVerificationError",
     "__version__",
     "assert_public_jwk",
