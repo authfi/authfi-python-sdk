@@ -182,3 +182,28 @@ def test_a_moved_seam_is_refused_at_import() -> None:
         _check_seam(Moved)
     _check_seam(ChatAnthropic)
     assert isinstance(AuthFIChatAnthropic.__dict__["_client"], cached_property)
+
+
+def test_importing_the_adapter_checks_the_seam_where_it_runs() -> None:
+    """The import itself must refuse a langchain-anthropic that moved ``_client``, not only the function."""
+    import os
+    import subprocess
+    import sys
+
+    code = os.linesep.join(
+        [
+            "import langchain_anthropic",
+            "del langchain_anthropic.ChatAnthropic._client",
+            "try:",
+            "    import authfi.langchain",
+            "except Exception as error:",
+            "    print(type(error).__name__, error)",
+            "else:",
+            "    print('IMPORTED')",
+        ]
+    )
+    ran = subprocess.run(  # noqa: S603 - this interpreter, on code written above
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert ran.stdout.startswith("IntegrationError"), ran.stdout + ran.stderr
+    assert "ChatAnthropic._client" in ran.stdout

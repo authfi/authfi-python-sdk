@@ -403,6 +403,12 @@ class AgentKey:
     def __repr__(self) -> str:
         return f"AgentKey(kid={self._kid!r}, alg={self._alg!r})"
 
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self
+
     def __reduce__(self) -> NoReturn:
         raise TypeError("An AgentKey cannot be pickled: the private key stays in the process that loaded it")
 

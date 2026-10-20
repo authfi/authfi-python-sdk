@@ -52,12 +52,23 @@ class Retry(enum.Enum):
     NEVER_AFTER_SEND = "never_after_send"
 
 
-@dataclass(frozen=True, slots=True)
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class Attempt:
-    """What is made fresh for each attempt: a client assertion, a DPoP proof."""
+    """What is made fresh for each attempt: a client assertion, a DPoP proof.
+
+    Its ``repr`` names the fields and headers, never their values.
+    """
 
     form: Mapping[str, str] = field(default_factory=dict[str, str])
     headers: Mapping[str, str] = field(default_factory=dict[str, str])
+    json_body: Mapping[str, Any] = field(default_factory=dict[str, Any])
+
+    def __repr__(self) -> str:
+        return f"Attempt(form={sorted(self.form)}, headers={sorted(self.headers)}, json={sorted(self.json_body)})"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -108,8 +119,8 @@ class HttpResponse:
         return [value for key, value in self.headers if key.lower() == lower]
 
     def json(self) -> Any:
-        """The body as JSON. Raises ``ValueError`` when it is not JSON."""
-        return json.loads(self.body.decode("utf-8"))
+        """The body as JSON. Raises ``ValueError`` when it is not JSON; ``NaN`` and ``Infinity`` are not JSON."""
+        return json.loads(self.body.decode("utf-8"), parse_constant=_reject_constant)
 
     def json_object(self) -> dict[str, Any] | None:
         """The body as a JSON object, or ``None`` when it is anything else."""

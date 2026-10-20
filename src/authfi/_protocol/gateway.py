@@ -5,7 +5,9 @@
 - A refused one comes back as a result with ``isError`` and ``_meta["io.authfi/refusal"]``.
 - A held one (a person must approve) comes back as a result with ``isError`` whose text is the
   gateway's hold message. It carries no structured ``_meta`` yet, so one parser, pinned to that
-  exact message, reads it; it goes when the gateway ships a structured hold.
+  exact message (``tests/fixtures/mcp/hold-result.json``), reads it; it goes when the gateway
+  ships a structured hold. Until then a tool that returns an error in the hold's words is read as a
+  hold: the gateway binds an approval to the tool and its arguments, which bounds what that can do.
 
 The hold's text tells a model to retry with ``_authfi_approval_id``. If a model saw it and retried,
 the approval would be spent before the adapter's own resume. So the text is never handed to a
@@ -16,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
@@ -29,10 +31,14 @@ __all__ = [
     "APPROVAL_ARGUMENT",
     "CLOUD_PATH",
     "HOLD_MESSAGE",
+    "MAX_CLOUD_SECONDS",
     "REFUSAL_META",
     "SCOPE_META",
     "CloudCredential",
+    "ToolAllowed",
+    "ToolApprovalRequired",
     "ToolOutcome",
+    "ToolRefused",
     "cloud_request",
     "parse_cloud",
     "read_result",
@@ -50,48 +56,76 @@ SCOPE_META = "io.authfi/scope"
 #: The tool annotation with the calling agent's advisory outlook for a tool.
 GOVERNANCE_ANNOTATION = "io.authfi/governance"
 #: What a model is told about a held call: the wait, never an instruction or an id.
-HOLD_MESSAGE = "This action is waiting for a person's approval."
+HOLD_MESSAGE = "This action is waiting for a person's approval in AuthFI."
 #: The gateway's cloud-credential door, under the model routes.
 CLOUD_PATH = "/mcp/v1/cloud/credentials"
 
-# The gateway's hold message (authfi-regional-mcp internal/http/mcp/dispatch.go, at 3617565):
-# "Waiting for approval %s (%s). A person must approve this action in the AuthFI console. ..."
-_HOLD = re.compile(r"^Waiting for approval ([A-Za-z0-9._:-]+) \(([a-z_]+)\)\. A person must approve this action")
+# The shape of the gateway's hold message, which tests/fixtures/mcp/hold-result.json holds verbatim:
+# "Waiting for approval <id> (<code>). A person must approve this action in the AuthFI console. ..."
+# Every AuthFI SDK reads it with this one pattern.
+_HOLD = re.compile(r"^Waiting for approval ([A-Za-z0-9_-]+) \(([a-z_]+)\)\. A person must approve this action")
 
-OutcomeKind = Literal["allowed", "refused", "approval_required"]
+#: The most seconds a cloud credential can be asked for: the platform's cap.
+MAX_CLOUD_SECONDS = 900
 
 
 @dataclass(frozen=True, slots=True)
-class ToolOutcome:
-    """What the gateway did with one tool call.
+class ToolAllowed:
+    """The gateway let the call through: ``result`` is the tool's own answer (its own error, if any)."""
 
-    ``kind`` is ``allowed`` (``result`` is the tool's own answer), ``refused`` (``code``,
-    ``error``, ``reason`` and ``required_scope`` say why) or ``approval_required`` (``approval_id``
-    names the approval a person must give).
+    result: Any = None
+    kind: Literal["allowed"] = field(default="allowed", init=False)
+
+    @property
+    def model_text(self) -> str:
+        """What a model may read about this outcome when the framework needs a tool answer."""
+        return _text_of(self.result)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRefused:
+    """The gateway refused the call.
+
+    ``code``, ``error``, ``reason`` and ``required_scope`` say why; ``result`` is the gateway's own
+    answer, which a framework hands the model as the tool's.
     """
 
-    kind: OutcomeKind
     result: Any = None
     code: str | None = None
     error: str | None = None
     reason: str | None = None
     required_scope: str | None = None
     approval_id: str | None = None
+    kind: Literal["refused"] = field(default="refused", init=False)
 
     @property
     def model_text(self) -> str:
         """What a model may read about this outcome when the framework needs a tool answer."""
-        if self.kind == "approval_required":
-            return HOLD_MESSAGE
-        if self.kind == "refused":
-            parts = [f"Refused by AuthFI ({self.code or self.error or 'refused'})"]
-            if self.reason:
-                parts.append(self.reason)
-            text = ": ".join(parts) + "."
-            if self.required_scope:
-                text += f" The call needs the scope {self.required_scope}."
-            return text
-        return _text_of(self.result)
+        parts = [f"Refused by AuthFI ({self.code or self.error or 'refused'})"]
+        if self.reason:
+            parts.append(self.reason)
+        text = ": ".join(parts) + "."
+        if self.required_scope:
+            text += f" The call needs the scope {self.required_scope}."
+        return text
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApprovalRequired:
+    """A person must approve the call first. ``approval_id`` names the approval to resume it with."""
+
+    approval_id: str
+    code: str
+    kind: Literal["approval_required"] = field(default="approval_required", init=False)
+
+    @property
+    def model_text(self) -> str:
+        """The wait, never the gateway's own text: that tells a model to retry with the approval id."""
+        return HOLD_MESSAGE
+
+
+#: What the gateway did with one tool call; ``match outcome:`` narrows to one of the three.
+ToolOutcome = ToolAllowed | ToolRefused | ToolApprovalRequired
 
 
 def _field(value: object, name: str) -> Any:
@@ -160,12 +194,12 @@ def read_result(result: object, *, is_error: bool | None = None) -> ToolOutcome:
     """
     error = _is_error(result) if is_error is None else is_error
     if not error:
-        return ToolOutcome("allowed", result=result)
+        return ToolAllowed(result)
     refusal = _meta(result).get(REFUSAL_META)
     if isinstance(refusal, Mapping):
         detail = cast(Mapping[str, Any], refusal)
-        return ToolOutcome(
-            "refused",
+        return ToolRefused(
+            result=result,
             code=_string(detail, "code"),
             error=_string(detail, "error"),
             reason=_string(detail, "reason"),
@@ -174,8 +208,8 @@ def read_result(result: object, *, is_error: bool | None = None) -> ToolOutcome:
         )
     hold = _HOLD.match(_text_of(result).strip())
     if hold:
-        return ToolOutcome("approval_required", approval_id=hold.group(1), code=hold.group(2))
-    return ToolOutcome("allowed", result=result)
+        return ToolApprovalRequired(hold.group(1), hold.group(2))
+    return ToolAllowed(result)
 
 
 def scope_of(tool: object) -> str | None:
@@ -248,8 +282,8 @@ def cloud_request(
     for name, value in (("account", account), ("role", role)):
         if not isinstance(cast(object, value), str) or not value.strip():
             raise ConfigurationError(f"cloud_credentials needs the {name}")
-    if not 0 < expires_in <= 43_200:
-        raise ConfigurationError("expires_in must be a positive number of seconds")
+    if not 0 < expires_in <= MAX_CLOUD_SECONDS:
+        raise ConfigurationError(f"expires_in must be 1 to {MAX_CLOUD_SECONDS} seconds")
     body: dict[str, Any] = {"account": account, "role": role, "duration_seconds": int(expires_in)}
     if session_policy:
         body["session_policy"] = dict(session_policy)
