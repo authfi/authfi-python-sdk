@@ -18,9 +18,10 @@ PAIRS: list[tuple[type, type]] = [
     (agents.DelegatedToken, agents.AsyncDelegatedToken),
     (authfi.TokenSource, authfi.AsyncTokenSource),
     (authfi.InMemoryTokenStore, authfi.AsyncInMemoryTokenStore),
+    (authfi.Gateway, authfi.AsyncGateway),
 ]
 
-# Names that differ on purpose: 0.1's blocking-only names, and the close/aclose pair.
+# Names that differ on purpose: 0.1's blocking-only names, the close/aclose pair, and asyncio-only names.
 LEGACY_OR_RENAMED = {
     "close",
     "aclose",
@@ -53,6 +54,8 @@ LEGACY_OR_RENAMED = {
     "can",
     "request_user_approval",
     "from_env",
+    # MCP clients run on asyncio only
+    "mcp_client_factory",
 }
 
 # Parameters only the blocking form has: 0.1's spellings.

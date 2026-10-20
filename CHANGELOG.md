@@ -44,6 +44,11 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - `AgentKey` for Ed25519, P-256 and RSA, signing through PyJWT; `write()` creates an owner-only
   file (POSIX mode or Windows DACL), and `from_file()` refuses one others can read.
 - The `authfi` command: `keygen`, `token` and `headers`.
+- `agent.gateway()`: the AuthFI gateways for any credential. `http_client()` (the token per
+  request, origin-pinned, no redirects, `X-Request-Id` and `traceparent`), `read_result()` into a
+  `ToolOutcome` (`allowed`, `refused`, `approval_required`), model base URLs, the grant a tool
+  needs, and `cloud_credentials()`. A held call's text never reaches a model; a model-written
+  approval id is removed.
 
 ### Changed
 
