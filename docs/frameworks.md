@@ -100,3 +100,8 @@ For your own graph, the pieces are public: `AuthFIState` (the messages and `auth
 `langgraph.approval_node`, `route_after_tools`, and the MCP tool interceptor
 `langgraph.interceptor`, which `langgraph.client()` installs. Use LangGraph's own `ToolNode` with
 the tools; the guarding is in the tools themselves.
+
+**What a checkpoint stores.** The graph state carries each held call's `args` (`Hold.args`), and a
+checkpointer persists them. Tool arguments can hold personal data, so treat the checkpoint store as
+holding it. It never holds a token or an approval secret: the approval id is in the state, and the
+token is renewed from the agent's key.
