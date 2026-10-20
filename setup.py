@@ -3,23 +3,23 @@ import re
 
 from setuptools import setup
 
-# ONE spelling of the version. authfi.py needs it at runtime (it goes in the
+# ONE spelling of the version. The package needs it at runtime (it goes in the
 # User-Agent, which AuthFI's Cloudflare edge requires), and a copy here would be
 # a second place to forget.
-with io.open("authfi.py", encoding="utf-8") as fh:
+with io.open("authfi/__init__.py", encoding="utf-8") as fh:
     VERSION = re.search(r'^__version__ = "([^"]+)"', fh.read(), re.M).group(1)
 
 setup(
     name="authfi",
     version=VERSION,
     description="AuthFI Python SDK — JWT validation, RBAC decorators, permission auto-sync, agent authentication",
-    py_modules=["authfi"],
+    packages=["authfi"],
     python_requires=">=3.8",
     install_requires=[
         "PyJWT[crypto]>=2.4.0",
         # Ed25519 signing for agent client assertions (private_key_jwt). This is
         # NOT a new install: PyJWT[crypto] above already pulls cryptography in for
-        # RS256 verification. It is declared because authfi.py imports it directly,
+        # RS256 verification. It is declared because authfi imports it directly,
         # and a direct import that relies on somebody else's extra breaks silently
         # the day that extra changes.
         "cryptography>=3.4.0",
@@ -28,6 +28,10 @@ setup(
         # AgentAuth.httpx_auth() and DelegatedToken.httpx_auth(). Optional: the
         # rest of the SDK, the async client included, does not use it.
         "httpx": ["httpx>=0.23"],
+        # The framework adapters, one extra each. They need Python 3.10 or later,
+        # as the frameworks do; the core SDK keeps Python 3.8.
+        # authfi.langchain: a Claude client whose token LangSmith never records.
+        "langchain": ["langchain-anthropic>=1.0", "langsmith>=0.4"],
     },
     author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",

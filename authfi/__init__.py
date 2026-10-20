@@ -1574,14 +1574,22 @@ async def _in_thread(fn, *args, **kwargs):
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
-def _bearer_auth(get_token):
-    """An ``httpx.Auth`` setting ``Authorization: Bearer`` from ``get_token()`` on every request."""
-    try:
-        import httpx
-    except ImportError as e:
-        raise AuthFIError(
-            "httpx_auth() needs httpx. Install with: pip install 'authfi[httpx]'", status=500
-        ) from e
+def _bearer_auth(get_token, aget_token=None, httpx_module=None):
+    """An ``httpx.Auth`` setting ``Authorization: Bearer`` from ``get_token()`` on every request.
+
+    ``httpx_module`` is the httpx package the client comes from: ``httpx`` by
+    default, or ``httpx2``, which MCP SDK v2 and the newer model SDKs use. An
+    Auth only works with clients of its own package. ``aget_token`` is awaited
+    by async clients when given; otherwise ``get_token`` runs in a worker thread.
+    """
+    httpx = httpx_module
+    if httpx is None:
+        try:
+            import httpx
+        except ImportError as e:
+            raise AuthFIError(
+                "httpx_auth() needs httpx. Install with: pip install 'authfi[httpx]'", status=500
+            ) from e
 
     class AuthFIBearerAuth(httpx.Auth):
         def sync_auth_flow(self, request):
@@ -1590,7 +1598,11 @@ def _bearer_auth(get_token):
 
         async def async_auth_flow(self, request):
             # Off the loop: getting the token may mean signing and minting a new one.
-            request.headers["Authorization"] = "Bearer " + await _in_thread(get_token)
+            if aget_token is not None:
+                token = await aget_token()
+            else:
+                token = await _in_thread(get_token)
+            request.headers["Authorization"] = "Bearer " + token
             yield request
 
     return AuthFIBearerAuth()

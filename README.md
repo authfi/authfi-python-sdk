@@ -216,6 +216,45 @@ client = httpx.AsyncClient(auth=agent.httpx_auth())     # the agent itself
 client = httpx.Client(auth=as_priya.httpx_auth())       # acting for Priya
 ```
 
+## Agent frameworks
+
+Each framework has an optional extra that gives an agent on AuthFI the safe defaults in a few
+lines: the token is passed where the framework's tracer does not record it, content capture is
+off unless you ask for it, and each call sends the framework's run or call id as `X-Request-Id`,
+so a call can be matched to its trace. The adapters need Python 3.10 or later, as the frameworks
+do.
+
+Every adapter takes the agent's credential as an `AgentAuth` (or `AsyncAgentAuth`), a
+`DelegatedToken` to act for a person, or a function returning the current token. The token is
+read for every call, so a long run outlives any one token. A fixed token string is refused: it
+stops working when it expires, and it is the value tracers copy.
+
+### LangChain
+
+```bash
+pip install 'authfi[langchain]'
+```
+
+```python
+from authfi import AgentAuth
+from authfi.langchain import AuthFIChatAnthropic, metadata_only_tracing
+
+metadata_only_tracing()        # LangSmith records runs without prompts and answers
+agent = AgentAuth.from_env()
+model = AuthFIChatAnthropic(agent=agent, model="claude-haiku-5-5")
+model.invoke("Hello")
+```
+
+`AuthFIChatAnthropic` is `ChatAnthropic` on your project's AI gateway (`<project>/mcp`). Do not
+pass the token in `default_headers` or `extra_headers`: LangSmith records both in every run, so
+each traced call would send the token to the tracing backend. `AuthFIChatAnthropic` holds the
+agent where LangChain does not serialize it and adds `Authorization: Bearer` to each request
+below the tracer. Each call also sends its LangChain run id as `X-Request-Id`, and the run's
+metadata names the agent (`authfi_agent_id`).
+
+`metadata_only_tracing(capture_content=False)` installs a LangSmith client with
+`hide_inputs` and `hide_outputs` set; pass `capture_content=True` to record content.
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)
@@ -226,6 +265,7 @@ client = httpx.Client(auth=as_priya.httpx_auth())       # acting for Priya
 - CIBA — an agent acting as a person who approved out of band
 - Token exchange (RFC 8693) — an agent acting for a person whose token it holds
 - Async client for asyncio agent frameworks, and `httpx` auth that refreshes the token
+- Framework adapters that keep the token out of traces and content capture off by default
 - Cloud credentials (GCP/AWS/Azure/OCI)
 - Cloud token exchange
 - Works with Flask, FastAPI, Django, any WSGI/ASGI framework
@@ -239,8 +279,10 @@ creds = auth.cloud_credentials(user_token, 'aws', role_arn='arn:aws:iam::123:rol
 ## Running Tests
 
 ```bash
-python -m unittest test_authfi -v
+python -m unittest -v
 ```
+
+Each adapter's tests skip when its framework is not installed; install the extra to run them.
 
 ## License
 
