@@ -23,6 +23,7 @@ from authfi import (
     NotSupportedError,
     OAuthError,
     Secret,
+    WaitTimeout,
     assert_public_jwk,
 )
 from authfi._protocol import agent as wire
@@ -77,7 +78,8 @@ def test_ciba_poll_names_the_resource() -> None:
         ClientAuth.none("agt"),
         auth_req_id=Secret("r"),
         interval=1,
-        deadline=100,
+        wait_deadline=100,
+        request_deadline=100,
         now=lambda: 0,
         resource="api_orders",
     )
@@ -106,9 +108,9 @@ def test_request_builders_refuse_empty_values() -> None:
     with pytest.raises(ConfigurationError):
         wire.transaction_token_request(ISSUER, "t", action=" ", resource=None, context=None)
     with pytest.raises(ConfigurationError):
-        wire.approval_request(ISSUER, agent_id="a", assertion="x", action="", context=None, expires_in=10)
+        wire.approval_request(ISSUER, agent_id="a", sign=str, audience=ISSUER, action="", context=None, expires_in=10)
     with pytest.raises(ConfigurationError):
-        wire.approval_request(ISSUER, agent_id="a", assertion="x", action="act", context=None, expires_in=0)
+        wire.approval_request(ISSUER, agent_id="a", sign=str, audience=ISSUER, action="act", context=None, expires_in=0)
     with pytest.raises(DiscoveryError):
         wire.read_approval_request(ISSUER + "/approvals", "a", "t")
     with pytest.raises(ConfigurationError):
@@ -279,8 +281,9 @@ async def test_async_edges(platform: AgentPlatform, key: AgentKey, clock: FakeCl
         with pytest.raises(ConfigurationError):
             await agent.exchange("raw")  # type: ignore[arg-type]
         platform.approval_status = "pending"
-        with pytest.raises(OAuthError):
+        with pytest.raises(WaitTimeout) as timed_out:
             await agent.wait_for_approval("apr-1", timeout=1)
+        assert timed_out.value.pending_id == "apr-1"
         del platform.agent_configuration["endpoints"]["approval"]
         del platform.agent_configuration["endpoints"]["request_approval"]
         agent2 = aaf.agent(AGENT, key)

@@ -18,7 +18,7 @@ import sys
 
 import httpx
 
-from authfi import AuthFI, ConsentDenied, ConsentExpired, OAuthError
+from authfi import AuthFI, ConsentDenied, ConsentExpired, WaitTimeout
 
 
 def refund(caller: str, order: str) -> None:
@@ -40,11 +40,9 @@ def refund(caller: str, order: str) -> None:
         except ConsentExpired:
             print("The request ran out before the caller decided.")
             return
-        except OAuthError as error:
-            if error.code == "authorization_pending":
-                print("Still waiting; ask the caller to check their phone.")
-                return
-            raise
+        except WaitTimeout:
+            print("Still waiting; ask the caller to check their phone.")
+            return
         print(f"Acting for {as_caller.subject} as {as_caller.actor}.")
         with httpx.Client(base_url=os.environ["ORDERS_API_ORIGIN"], auth=as_caller.httpx_auth()) as api:
             api.post(f"/orders/{order}/refund").raise_for_status()

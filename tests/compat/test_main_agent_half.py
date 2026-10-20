@@ -482,6 +482,10 @@ class TestAgentCIBA(unittest.TestCase):
             self.assertEqual(ctx.exception.error, code)
             self.assertEqual(net().call_count - before, 1)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason="intended break: a wait that times out is WaitTimeout, never the server's authorization_pending",
+    )
     def test_the_poll_gives_up_at_the_timeout(self) -> None:
         net().queue(*[_oauth_error("authorization_pending")] * 5)
         with self.assertRaises(AgentAuthError) as ctx:

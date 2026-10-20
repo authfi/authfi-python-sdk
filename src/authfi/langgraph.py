@@ -58,7 +58,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError("authfi.langgraph needs LangGraph: pip install 'authfi[langgraph]'") from exc
 
 from authfi._adapters import async_gateway_for
-from authfi.gateway import HOLD_MESSAGE, AsyncGateway, token_refusal
+from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolAllowed, ToolRefused, token_refusal
 from authfi.langchain import AuthFIChatAnthropic, LangChainIntegration
 from authfi.tokens import AsyncTokenSource
 
@@ -224,16 +224,16 @@ class LangGraphIntegration:
         if not isinstance(result, CallToolResult):
             return result  # another interceptor answered
         outcome = self.gateway.read_result(result)
-        if outcome.kind == "allowed":
+        if isinstance(outcome, ToolAllowed):
             return result
         tool_call_id = getattr(request.runtime, "tool_call_id", None) or (resuming and resuming.tool_call_id)
         logger = self.gateway.project.logger
-        if outcome.kind == "refused":
+        if isinstance(outcome, ToolRefused):
             logger.info("the gateway refused %s: %s", request.name, outcome.code or outcome.error)
             if not isinstance(tool_call_id, str):
                 return _error_result(outcome.model_text)
             return ToolMessage(outcome.model_text, tool_call_id=tool_call_id, name=request.name, status="error")
-        approval_id = cast(str, outcome.approval_id)
+        approval_id = outcome.approval_id
         logger.info("%s waits for approval %s", request.name, approval_id)
         if not isinstance(tool_call_id, str):
             return _error_result(HOLD_MESSAGE)

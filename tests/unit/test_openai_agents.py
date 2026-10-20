@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -362,3 +362,171 @@ def test_run_config_names_the_agent(integration: OpenAIAgentsIntegration) -> Non
     config = integration.run_config(trace_metadata={"case": "1"})
     assert config.trace_metadata == {"case": "1", "authfi_agent_id": AGENT}
     assert config.trace_include_sensitive_data is False
+
+
+# --- the processor is the net for a run started without run_config() -----------------------------------
+
+MARKER = "PRIVATE-CONTENT-4411"
+SECRET = "Bearer SECRET-TOKEN-4411"
+
+
+class _Answer:
+    id = "resp_42"
+
+    def __init__(self) -> None:
+        self.output = [MARKER]
+
+
+def _spans() -> list[Any]:
+    from agents.tracing.span_data import (
+        CustomSpanData,
+        FunctionSpanData,
+        GenerationSpanData,
+        ResponseSpanData,
+        SpeechGroupSpanData,
+        SpeechSpanData,
+        TranscriptionSpanData,
+    )
+
+    config = {
+        "temperature": 0.2,
+        "extra_headers": {"Authorization": SECRET},
+        "extra_args": {"note": SECRET},
+        "extra_query": {"q": SECRET},
+    }
+    return [
+        GenerationSpanData(
+            input=[{"content": MARKER}], output=[{"content": MARKER}], model="m", model_config=dict(config)
+        ),
+        FunctionSpanData(name="f", input=MARKER, output=MARKER),
+        ResponseSpanData(response=_Answer(), input=MARKER),  # type: ignore[arg-type]
+        CustomSpanData(name="c", data={"note": MARKER}),
+        SpeechSpanData(input=MARKER, output=MARKER, model="m", model_config=dict(config)),
+        SpeechGroupSpanData(input=MARKER),
+        TranscriptionSpanData(input=MARKER, output=MARKER, model="m", model_config=dict(config)),
+    ]
+
+
+class _Seen(Capture):
+    """Records the attributes of every span it is handed, as a processor reading them would see them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[str] = []
+
+    def on_span_end(self, span: Span[Any]) -> None:
+        data = span.span_data
+        names = cast(tuple[str, ...], type(data).__slots__)  # pyright: ignore[reportUnknownMemberType]
+        attributes = {name: getattr(data, name, None) for name in names}
+        self.seen.append(json.dumps(attributes, default=_describe))
+
+
+def _describe(value: object) -> str:
+    return f"<{type(value).__name__} {vars(value) if hasattr(value, '__dict__') else ''}>"
+
+
+class _Stub:
+    def __init__(self, data: Any) -> None:
+        self.span_data = data
+
+
+@pytest.mark.parametrize("capture_content", [False, True])
+def test_the_processor_removes_content_from_every_kind_of_span(capture_content: bool) -> None:
+    inner = _Seen()
+    processor = AuthFITraceProcessor(inner, capture_content=capture_content)
+    for data in _spans():
+        processor.on_span_end(_Stub(data))  # type: ignore[arg-type]
+    text = "\n".join(inner.seen)
+    assert len(inner.seen) == 7
+    assert (MARKER in text) is capture_content
+    assert SECRET not in text  # a header is never content, so it comes off either way
+    assert "SECRET-TOKEN" not in text
+    assert "temperature" in text  # the other settings are metadata, and stay
+
+
+def test_a_response_span_keeps_its_id_and_loses_its_answer() -> None:
+    from agents.tracing.span_data import ResponseSpanData
+
+    data = ResponseSpanData(response=_Answer(), input=MARKER)  # type: ignore[arg-type]
+    AuthFITraceProcessor(_Seen()).on_span_end(_Stub(data))  # type: ignore[arg-type]
+    assert data.response is None
+    assert data.input is None
+    assert data.export()["response_id"] == "resp_42"
+
+
+async def test_a_run_without_run_config_reaches_the_processor_without_content(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    capture = Capture()
+    integration.configure_tracing([capture])
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+    await Runner.run(_agent(integration, tools), PROMPT)  # the SDK's own default: content on
+    integration.configure_tracing()
+    exported = "\n".join(capture.exported)
+    assert AGENT not in exported  # no run_config(), so no metadata; the run was still recorded
+    assert "generation" in exported or "function" in exported
+    assert "ada@example.com" not in exported
+    for token in fake.minted:
+        assert token not in exported
+
+
+async def test_the_sdk_itself_records_no_token_in_a_generation_spans_model_config(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    """The token rides in ``extra_headers``; this fails if a later SDK starts recording that setting."""
+    from agents.tracing import set_trace_processors, set_tracing_disabled
+    from agents.tracing.span_data import GenerationSpanData
+
+    configs: list[str] = []
+
+    class Raw(_Seen):
+        def on_span_end(self, span: Span[Any]) -> None:
+            if isinstance(span.span_data, GenerationSpanData):
+                configs.append(json.dumps(span.span_data.model_config, default=str))
+
+    set_trace_processors([Raw()])
+    set_tracing_disabled(False)
+    try:
+        fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+        await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config())
+    finally:
+        integration.configure_tracing()
+    assert configs, "no generation span was recorded"
+    for token in fake.minted:
+        assert token not in "".join(configs)
+
+
+async def test_no_processors_means_no_tracing_even_for_one_added_afterwards(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    from agents.tracing import add_trace_processor, set_trace_processors
+
+    integration.configure_tracing()
+    late = Capture()
+    add_trace_processor(late)
+    try:
+        fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+        await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config())
+    finally:
+        set_trace_processors([])
+        integration.configure_tracing()
+    assert late.exported == []
+
+
+def test_configure_tracing_does_not_write_the_environment(
+    integration: OpenAIAgentsIntegration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    monkeypatch.delenv("OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA", raising=False)
+    integration.configure_tracing([Capture()], capture_content=True)
+    integration.configure_tracing()
+    assert "OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA" not in os.environ
+
+
+def test_there_is_one_pending_approval_vocabulary() -> None:
+    from authfi.gateway import PendingApproval as Base
+    from authfi.openai_agents import PendingApproval
+
+    assert issubclass(PendingApproval, Base)
+    assert [f for f in PendingApproval.__dataclass_fields__] == ["approval_id", "tool", "args", "item"]

@@ -41,7 +41,9 @@ It takes `ChatAnthropic`'s arguments, except those that carry a credential or an
 metadata names the agent (`authfi_agent_id`), so a trace shows which agent made each call.
 
 `configure_tracing(capture_content=False, **client_kwargs)` installs the LangSmith client that
-LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`.
+LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`. It is process-wide
+(`langsmith.configure`): an app that has its own LangSmith client should not call it, or should pass
+that client's settings in `client_kwargs`.
 
 ## LangGraph
 
@@ -80,7 +82,7 @@ reason and the scope the call needs, and the run carries on. **A refused token**
 revoked) raises `GatewayTokenRefused` and ends the run.
 
 **A held call** is recorded in the graph's state (`authfi_holds`) and the model reads only "This
-action is waiting for a person's approval." `approval_node` then calls `interrupt()` before
+action is waiting for a person's approval in AuthFI." `approval_node` then calls `interrupt()` before
 anything else, so LangGraph re-running it on resume repeats nothing. On resume it sends each held
 call again with its approval, and the gateway decides:
 
@@ -98,6 +100,11 @@ For your own graph, the pieces are public: `AuthFIState` (the messages and `auth
 `langgraph.approval_node`, `route_after_tools`, and the MCP tool interceptor
 `langgraph.interceptor`, which `langgraph.client()` installs. Use LangGraph's own `ToolNode` with
 the tools; the guarding is in the tools themselves.
+
+**What a checkpoint stores.** The graph state carries each held call's `args` (`Hold.args`), and a
+checkpointer persists them. Tool arguments can hold personal data, so treat the checkpoint store as
+holding it. It never holds a token or an approval secret: the approval id is in the state, and the
+token is renewed from the agent's key.
 
 ## OpenAI Agents SDK
 
@@ -131,8 +138,14 @@ async with openai_agents.mcp_server() as tools:
 prompts, answers and tool results unless told otherwise. `configure_tracing(processors=(),
 capture_content=False)` removes that exporter, sends spans only to the processors you name (each
 wrapped in `AuthFITraceProcessor`, which removes content before your processor sees a span), and
-makes every `RunConfig` default to no content. With no processors, tracing is off. `run_config()`
-names the agent in the trace's metadata (`authfi_agent_id`).
+turns tracing off when you name none. **It replaces every trace processor the application registered
+before it**, not only the SDK's: pass the ones you want to keep in `processors=`. Call it before the
+first run. The wrapper removes prompts, answers and tool inputs and outputs from generation,
+response, function, custom, speech and transcription spans, and the `extra_headers`, `extra_args`
+and `extra_query` settings from a span's model settings, so a run started without `run_config()`
+still reaches your processors without content. Names, timings, ids, usage and the other settings
+stay. `run_config()` names the agent in the trace's metadata (`authfi_agent_id`). The adapter does
+not write the process environment.
 
 **Models.** `model(name)` is Claude on the AI gateway through LiteLLM; `model(name, api="openai")` is
 the SDK's Chat Completions model, for a project with an OpenAI-compatible provider. The agent's
@@ -155,7 +168,7 @@ the gateway marks `may_require_approval` pauses the run as the SDK's own `ToolAp
 
 Call `resolve` again once the person has decided, then run again with `state`. Only the gateway's
 decision approves an item, one call at a time. A hold the gateway did not announce reaches the
-model as "This action is waiting for a person's approval.", and the next call to that tool pauses
+model as "This action is waiting for a person's approval in AuthFI.", and the next call to that tool pauses
 the run. The approval id never reaches the model.
 
 ## Claude Agent SDK

@@ -10,6 +10,7 @@ Refusal                       Answer
 ============================  =========================================================
 no credential                 401, ``Bearer`` (no ``error``), ``{"error":"unauthorized"}``
 any other token refusal       401, ``Bearer error="invalid_token"``, fixed description
+keys or discovery unreachable 503, ``Retry-After: 5``, ``{"error":"service_unavailable"}``
 missing scope                 403, ``Bearer error="insufficient_scope", scope="..."``
 missing permission or role    403, no challenge, ``{"error":"forbidden"}``
 authentication too weak       401, ``Bearer error="insufficient_user_authentication"``
@@ -26,14 +27,30 @@ from typing import Any, cast
 from authfi._protocol.ids import is_valid_request_id
 from authfi.errors import (
     ConfigurationError,
+    DiscoveryError,
     InsufficientAuthentication,
     InsufficientPermission,
     InsufficientScope,
     InvalidToken,
+    TemporarilyUnavailable,
+    TransportError,
 )
 from authfi.verify import AccessToken
 
-__all__ = ["INVALID_TOKEN_DESCRIPTION", "Refusal", "Requirements", "log_refusal", "refusal_for"]
+__all__ = [
+    "INVALID_TOKEN_DESCRIPTION",
+    "UNAVAILABLE",
+    "Refusal",
+    "Requirements",
+    "log_refusal",
+    "log_unavailable",
+    "refusal_for",
+    "unavailable_refusal",
+]
+
+#: What it means when the token could not be checked at all: the issuer's keys or discovery are
+#: unreachable. The caller's token may be fine, so this is a 503 to retry, not a 401.
+UNAVAILABLE = (TransportError, DiscoveryError, TemporarilyUnavailable)
 
 #: The one description every token refusal carries on the wire.
 INVALID_TOKEN_DESCRIPTION = "The access token is not valid."
@@ -154,12 +171,34 @@ def refusal_for(
     return Refusal(status, headers, body)
 
 
+def _rid(request_id: str | None) -> str:
+    return request_id if request_id and is_valid_request_id(request_id) else "-"
+
+
 def log_refusal(logger: logging.Logger, error: InvalidToken, method: str, path: str, request_id: str | None) -> None:
-    """Log a refusal with its precise code, which the wire answer does not carry."""
-    logger.info(
-        "refused %s %s: %s (request %s)",
+    """Log a refusal with its precise code, which the wire answer does not carry.
+
+    Info for a request that sent no token, warning for any other refusal (as the platform's kernel does).
+    """
+    level = logging.INFO if error.code == "token_missing" else logging.WARNING
+    logger.log(level, "refused %s %s: %s (request %s)", method, path, error.code, _rid(request_id))
+
+
+def unavailable_refusal(request_id: str | None = None) -> Refusal:
+    """The answer when the token could not be checked: 503, retry shortly."""
+    headers = {"Content-Type": "application/json", "Cache-Control": "no-store", "Retry-After": "5"}
+    if request_id and is_valid_request_id(request_id):
+        headers["X-Request-Id"] = request_id
+    return Refusal(503, headers, {"error": "service_unavailable"})
+
+
+def log_unavailable(logger: logging.Logger, error: Exception, method: str, path: str, request_id: str | None) -> None:
+    """Log that a request was not checked because the issuer's keys or discovery were unreachable."""
+    logger.error(
+        "could not check the token of %s %s: %s: %s (request %s)",
         method,
         path,
-        error.code,
-        request_id if request_id and is_valid_request_id(request_id) else "-",
+        type(error).__name__,
+        getattr(error, "code", "-"),
+        _rid(request_id),
     )

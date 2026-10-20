@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
 import threading
 from typing import Any
@@ -112,6 +113,7 @@ def test_a_forked_child_completes_a_call_with_a_lock_held_and_a_fetch_in_flight(
     af._metadata._lock.acquire()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - runs in the child; its exit code is the assertion
+        signal.alarm(10)  # a child that deadlocks dies by SIGALRM, so the parent's waitpid fails the test
         try:
             ok = af.metadata().issuer == platform.issuer
         except BaseException:

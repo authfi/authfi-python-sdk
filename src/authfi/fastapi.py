@@ -32,7 +32,15 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError("authfi.fastapi needs FastAPI: pip install 'authfi[fastapi]'") from exc
 
-from authfi._resource import Refusal, Requirements, log_refusal, refusal_for
+from authfi._resource import (
+    UNAVAILABLE,
+    Refusal,
+    Requirements,
+    log_refusal,
+    log_unavailable,
+    refusal_for,
+    unavailable_refusal,
+)
 from authfi.errors import ConfigurationError, InvalidToken
 from authfi.verify import AccessToken, AsyncMultiIssuerVerifier, AsyncTokenVerifier, MultiIssuerVerifier, TokenVerifier
 
@@ -140,6 +148,10 @@ class AuthFIBearer:
             )
         except InvalidToken as error:
             raise self._refuse(request, error) from None
+        except UNAVAILABLE as error:
+            rid = request.headers.get("x-request-id")
+            log_unavailable(self._verifier.logger, error, request.method, request.url.path, rid)
+            raise AuthFIRefusal(unavailable_refusal(rid)) from None
 
     def _refuse(self, request: Request, error: InvalidToken) -> AuthFIRefusal:
         rid = request.headers.get("x-request-id")

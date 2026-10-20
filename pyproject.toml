@@ -46,8 +46,6 @@ langgraph = [
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
-    "openai-agents[litellm]>=0.24,<0.25",
-    "claude-agent-sdk>=0.2.168,<0.3",
 ]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
 claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
@@ -68,11 +66,19 @@ packages = ["src/authfi"]
 include = ["src/authfi", "tests", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
 
 [dependency-groups]
-dev = [
+# What the adapters job installs beside one extra, at that extra's lowest and newest versions.
+test = [
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.25,<2",
-    "pytest-cov>=6,<8",
     "hypothesis>=6.120,<7",
+    "sentry-sdk>=2.20,<3",
+    "rich>=13.9,<15",
+]
+# The weekly mutation run (Linux only): a surviving mutant is a missing test.
+mutation = ["mutmut==3.8.0"]
+dev = [
+    { include-group = "test" },
+    "pytest-cov>=6,<8",
     "mypy>=1.15,<2",
     "pyright>=1.1.390,<2",
     "ruff>=0.9,<1",
@@ -104,6 +110,11 @@ filterwarnings = [
     # The fork-safety tests fork on purpose, after the adapter tests' local servers have started threads
     "ignore:This process .* is multi-threaded, use of fork:DeprecationWarning",
 ]
+
+[tool.mutmut]
+# Every module is copied so the package imports; the weekly job selects which mutants run.
+source_paths = ["src/authfi/"]
+pytest_add_cli_args_test_selection = ["tests/unit/"]
 
 [tool.coverage.run]
 branch = true

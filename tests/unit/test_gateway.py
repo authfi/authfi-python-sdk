@@ -317,7 +317,7 @@ def test_a_client_for_another_httpx_package(agent: AgentAuth) -> None:
     fake.Timeout = httpx.Timeout  # type: ignore[attr-defined]
     client = agent.gateway().http_client(fake)
     assert type(client._auth).__name__.endswith("httpx_fake")
-    assert agent.gateway().http_client(fake) is not client  # each gateway makes its own
+    assert agent.gateway().http_client(fake) is client  # one client per package, kept by the agent's one gateway
 
 
 # --- cloud credentials -----------------------------------------------------------------------------

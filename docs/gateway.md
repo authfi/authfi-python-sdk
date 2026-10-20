@@ -37,11 +37,15 @@ The token is never the SDK's `api_key` or a default header, which tracers record
 
 ```python
 outcome = gateway.read_result(call_tool_result)
-match outcome.kind:
-    case "allowed":            use(outcome.result)
-    case "refused":            tell_the_model(outcome.model_text)      # code, reason, required_scope
-    case "approval_required":  pause_until_a_person_decides(outcome.approval_id)
+match outcome:
+    case ToolAllowed(result=result):                   use(result)
+    case ToolRefused():                                tell_the_model(outcome.model_text)   # code, reason, required_scope, result
+    case ToolApprovalRequired(approval_id=approval):   pause_until_a_person_decides(approval)
 ```
+
+`ToolOutcome` is the union of those three frozen dataclasses (from `authfi` or `authfi.gateway`), so a
+type checker narrows each arm: `approval_id` is a `str` where a call is held, and exists nowhere
+else. A refusal keeps the gateway's own answer in `result`.
 
 A refused or held call is a tool result, not an exception, so a run carries on and the model reads
 why. Only the token itself being refused (HTTP 401) ends a run: no call can succeed with that token.
@@ -49,7 +53,7 @@ The framework adapters raise `GatewayTokenRefused` for it; with your own client,
 `authfi.gateway.token_refusal(error)` finds it in whatever the client raised.
 
 **A held call's approval never goes through the model.** Give the model `outcome.model_text` (for
-a hold, "This action is waiting for a person's approval."), keep `approval_id` yourself, and send
+a hold, "This action is waiting for a person's approval in AuthFI."), keep `approval_id` yourself, and send
 the call again with `gateway.with_approval(arguments, approval_id)` once the person has decided.
 Remove any approval id a model wrote with `gateway.strip_approval_argument(arguments)`.
 
@@ -68,7 +72,7 @@ if outcome.kind == "approval_required":
 credential = outcome.credential       # access_key_id, secret_access_key (a Secret), expires_at
 ```
 
-A refusal raises `APIError` with the gateway's code.
+A refusal raises `APIError` with the gateway's code. `expires_in` is 1 to 900 seconds, the most the platform issues.
 
 ## In asyncio code
 
