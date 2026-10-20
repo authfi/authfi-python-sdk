@@ -15,7 +15,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "PyJWT[crypto]>=2.10,<3",
     "cryptography>=44",
-    "typing_extensions>=4.12; python_version < '3.13'",
+    "typing_extensions>=4.12",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -98,6 +98,10 @@ warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
+module = ["tests.compat.*"]
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
 module = ["opentelemetry", "opentelemetry.*"]
 ignore_missing_imports = true
 
@@ -132,6 +136,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D", "S101", "ANN", "PT011", "PT018"]
+"tests/compat/test_main_*.py" = ["PT009", "PT027"]  # main's unittest style, kept as written
 "scripts/**" = ["S603", "S607"]
 "examples/**" = ["T201", "INP001"]
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -36,3 +37,13 @@ def af(platform: Platform, clock: FakeClock) -> Iterator[AuthFI]:
 async def aaf(platform: Platform, clock: FakeClock) -> AsyncIterator[AsyncAuthFI]:
     async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as project:
         yield project
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip the live suite unless it is pointed at a project."""
+    if os.environ.get("AUTHFI_LIVE_ISSUER"):
+        return
+    skip = pytest.mark.skip(reason="live: set AUTHFI_LIVE_ISSUER (and the client settings) to run")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip)

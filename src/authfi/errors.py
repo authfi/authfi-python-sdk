@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from typing_extensions import deprecated
+
 from authfi._codes import KnownCode
 
 __all__ = [
@@ -171,13 +173,19 @@ class OAuthError(AuthFIError):
         self,
         code: str,
         description: str | None = None,
-        *,
         status: int | None = None,
+        *,
         request_id: str | None = None,
     ) -> None:
         message = code if not description else f"{code}: {description}"
         super().__init__(message, status, code=code, request_id=request_id)
         self.description = description
+
+    @property
+    @deprecated("OAuthError.error is OAuthError.code", category=AuthFIDeprecationWarning)
+    def error(self) -> str:
+        """The OAuth error code. Deprecated: read :attr:`code`."""
+        return self.code
 
 
 class StepUpRequired(OAuthError):

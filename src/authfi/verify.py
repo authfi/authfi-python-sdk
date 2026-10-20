@@ -106,10 +106,8 @@ def _time(value: object) -> datetime | None:
     return None
 
 
-def _required(names: Sequence[str], what: str) -> tuple[str, ...]:
-    if isinstance(names, str):
-        raise ConfigurationError(f"{what} takes names as separate arguments or a sequence, not one string")
-    out = tuple(names)
+def _required(names: tuple[str, ...], what: str) -> tuple[str, ...]:
+    out = names
     if not out or not all(isinstance(n, str) and n for n in cast(tuple[object, ...], out)):
         raise ConfigurationError(f"{what} needs at least one name; an empty requirement would require nothing")
     return out

@@ -36,12 +36,21 @@ from authfi._resource import Refusal, Requirements, log_refusal, refusal_for
 from authfi.errors import ConfigurationError, InvalidToken
 from authfi.verify import AccessToken, AsyncMultiIssuerVerifier, AsyncTokenVerifier, MultiIssuerVerifier, TokenVerifier
 
-__all__ = ["AuthFIFlask", "AuthFIRefusalError"]
+__all__ = ["AuthFIFlask", "AuthFIRefusalError", "refusal_response"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 _G_KEY = "authfi_token"
+
+
+def refusal_response(refusal: Refusal) -> Response:
+    """The Flask response for ``refusal``."""
+    response = jsonify(refusal.body)
+    response.status_code = refusal.status
+    for name, value in refusal.headers.items():
+        response.headers[name] = value
+    return response
 
 
 class AuthFIRefusalError(Exception):
@@ -88,18 +97,11 @@ class AuthFIFlask:
         is answered the same way as one the guard raised, never as a 500.
         """
 
-        def answer(refusal: Refusal) -> Response:
-            response = jsonify(refusal.body)
-            response.status_code = refusal.status
-            for name, value in refusal.headers.items():
-                response.headers[name] = value
-            return response
-
         def refused(error: AuthFIRefusalError) -> Response:
-            return answer(error.refusal)
+            return refusal_response(error.refusal)
 
         def raised_in_view(error: InvalidToken) -> Response:
-            return answer(self._refuse(error).refusal)
+            return refusal_response(self._refuse(error).refusal)
 
         app.register_error_handler(AuthFIRefusalError, refused)
         app.register_error_handler(InvalidToken, raised_in_view)

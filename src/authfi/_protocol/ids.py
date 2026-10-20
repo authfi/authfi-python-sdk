@@ -27,7 +27,7 @@ __all__ = [
 ]
 
 #: The request ids the gateway keeps on its call record.
-REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TRACEPARENT = re.compile(r"^[0-9a-f]{2}-([0-9a-f]{32})-[0-9a-f]{16}-[0-9a-f]{2}$")
@@ -50,7 +50,7 @@ def request_id() -> str:
 
 def is_valid_request_id(value: str) -> bool:
     """``True`` when the gateway would keep ``value`` as a request id."""
-    return bool(REQUEST_ID_PATTERN.match(value))
+    return REQUEST_ID_PATTERN.fullmatch(value) is not None
 
 
 def idempotency_key() -> str:

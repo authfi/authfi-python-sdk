@@ -15,12 +15,14 @@ import threading
 import weakref
 from collections.abc import Mapping, Sequence
 from types import TracebackType
-from typing import Any, ClassVar, Literal, Self, TypedDict, Unpack, cast
+from typing import Any, ClassVar, Literal, Self, TypedDict, Unpack, cast, overload
 
 import httpx
+from typing_extensions import deprecated
 
 from authfi._cache import AsyncCache, SyncCache
 from authfi._clock import Clock, SystemClock
+from authfi._compat import LegacyAuthFIMixin, is_legacy_construction, legacy_project
 from authfi._log import get_logger
 from authfi._protocol.authz import CHECK_PATH, check_request, parse_check
 from authfi._protocol.discovery import ServerMetadata, metadata_flow, ttl_from_headers
@@ -28,7 +30,7 @@ from authfi._protocol.jwks import KeySet, PublicKey, jwks_flow
 from authfi._protocol.retry import RetryPolicy
 from authfi._protocol.urls import FIRST_PARTY_CLIENTS, is_under, origin_of, validate_issuer, validate_origin
 from authfi._transport import DEFAULT_TIMEOUT, AsyncTransport, SyncTransport, Timeout, user_agent
-from authfi.errors import ConfigurationError
+from authfi.errors import AuthFIDeprecationWarning, ConfigurationError
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
 from authfi.tokens import AsyncTokenSource, TokenSource
@@ -61,6 +63,7 @@ class _Project:
 
     issuer: str
     leeway: float
+    _jwks_ttl: float | None = None
     _api_origin: str | None
     _derived_api_origin: str | None
     _log: logging.Logger
@@ -191,7 +194,7 @@ def _register(instance: AuthFI | AsyncAuthFI) -> None:
         _instances.add(instance)
 
 
-class AuthFI(_Project):
+class AuthFI(LegacyAuthFIMixin, _Project):
     """An AuthFI project, for blocking code.
 
     Args:
@@ -208,9 +211,56 @@ class AuthFI(_Project):
         user_agent_suffix: appended to the ``User-Agent``.
         clock: for tests, a clock that advances on demand.
 
+    ``AuthFI(tenant, api_key, ...)``, the 0.1 form, still builds a project (the issuer is
+    ``https://<tenant>.authfi.io`` unless ``issuer=`` is given), with a deprecation warning.
     """
 
+    @overload
     def __init__(
+        self,
+        issuer: str,
+        *,
+        api_origin: str | None = None,
+        timeout: Timeout | float = DEFAULT_TIMEOUT,
+        retries: int = 2,
+        leeway: float = 60.0,
+        http_client: httpx.Client | None = None,
+        logger: logging.Logger | None = None,
+        user_agent_suffix: str | None = None,
+        clock: Clock | None = None,
+    ) -> None: ...
+
+    @overload
+    @deprecated("AuthFI(tenant, api_key, ...) is replaced by AuthFI(issuer)", category=AuthFIDeprecationWarning)
+    def __init__(
+        self,
+        tenant: str | None = None,
+        api_key: str | None = None,
+        api_url: str = "https://api.authfi.io",
+        application_id: str | None = None,
+        client_secret: str | None = None,
+        auto_sync: bool = True,
+        jwks_ttl: int = 300,
+        issuer: str | None = None,
+        base_domain: str = "authfi.io",
+        *,
+        audience: Sequence[str] | None = None,
+        timeout: Timeout | float = DEFAULT_TIMEOUT,
+        retries: int = 2,
+        leeway: float = 60.0,
+        http_client: httpx.Client | None = None,
+        logger: logging.Logger | None = None,
+        clock: Clock | None = None,
+    ) -> None: ...
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if is_legacy_construction(args, kwargs):
+            issuer, self._legacy, kwargs = legacy_project(args, kwargs)
+            self._jwks_ttl = float(self._legacy.jwks_ttl)
+            args = (issuer,)
+        self._init(*args, **kwargs)
+
+    def _init(
         self,
         issuer: str,
         *,
@@ -278,7 +328,7 @@ class AuthFI(_Project):
     def _key_set(self, *, refresh: bool = False) -> KeySet:
         def fetch() -> tuple[KeySet, float]:
             keys, cache_control = self._transport.run(jwks_flow(self.metadata().jwks_uri))
-            return keys, ttl_from_headers(cache_control)
+            return keys, self._jwks_ttl or ttl_from_headers(cache_control)
 
         return self._jwks.get("jwks", fetch, refresh=refresh)
 
