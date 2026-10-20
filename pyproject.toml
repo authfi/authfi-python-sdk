@@ -52,11 +52,17 @@ packages = ["src/authfi"]
 include = ["src/authfi", "tests", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
 
 [dependency-groups]
-dev = [
+# What the adapters job installs beside one extra, at that extra's lowest and newest versions.
+test = [
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.25,<2",
-    "pytest-cov>=6,<8",
     "hypothesis>=6.120,<7",
+    "sentry-sdk>=2.20,<3",
+    "rich>=13.9,<15",
+]
+dev = [
+    { include-group = "test" },
+    "pytest-cov>=6,<8",
     "mypy>=1.15,<2",
     "pyright>=1.1.390,<2",
     "ruff>=0.9,<1",
