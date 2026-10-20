@@ -19,6 +19,8 @@ PAIRS: list[tuple[type, type]] = [
     (authfi.TokenSource, authfi.AsyncTokenSource),
     (authfi.InMemoryTokenStore, authfi.AsyncInMemoryTokenStore),
     (authfi.Gateway, authfi.AsyncGateway),
+    (authfi.WebApp, authfi.AsyncWebApp),
+    (authfi.PersonSession, authfi.AsyncPersonSession),
 ]
 
 # Names that differ on purpose: 0.1's blocking-only names, the close/aclose pair, and asyncio-only names.

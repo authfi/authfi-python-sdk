@@ -73,6 +73,14 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   Google's mTLS client kept off it (checked against the tested ADK, loudly); refusals the model
   reads; held calls as ADK's tool confirmation; ADK span content off by default.
 - `AsyncGateway.token_refused`: the gateway's refusal of the token as an MCP client last saw it.
+- `af.web_app(...)`: people signing in to a server-rendered app. The code flow with PKCE S256,
+  `state` and `nonce`; the callback's `iss` required (RFC 9207); the pending sign-in encrypted
+  (AES-256-GCM under `state_key`, bound to the client and redirect URI, ten minutes); the ID token
+  verified (discovery's algorithm, `typ`, audience and `azp`, `nonce`, `at_hash`, `max_age`, `acr`);
+  `StepUpRequired` for a weaker sign-in than asked; single-flight `refresh`; `userinfo` checked
+  against the person who signed in; `sign_out` revoking the refresh token before ending the
+  session; `session()`, the person's token as a `TokenSource` shared through a `TokenStore`.
+  `AsyncWebApp` is its asyncio twin.
 
 ### Changed
 
