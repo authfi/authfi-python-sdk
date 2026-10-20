@@ -23,10 +23,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, cast, overload
 
 from typing_extensions import deprecated
 
@@ -62,7 +62,7 @@ from authfi.errors import (
     ConsentExpired,
     DiscoveryError,
     NotSupportedError,
-    OAuthError,
+    WaitTimeout,
 )
 from authfi.secret import Secret
 from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
@@ -82,7 +82,7 @@ __all__ = [
     "TransactionToken",
 ]
 
-_APPROVAL_POLL = 5.0
+_APPROVAL_POLL = 3.0
 _PENDING = "pending"
 
 
@@ -215,8 +215,23 @@ def _labels(raw: str, agent_id: str) -> tuple[Principal, Principal, frozenset[st
     return subject, actor, frozenset(scope.split()) if isinstance(scope, str) else frozenset()
 
 
+def _check_poll(poll_interval: float) -> None:
+    if not isinstance(cast(object, poll_interval), int | float) or poll_interval <= 0:
+        raise ConfigurationError("poll_interval must be a positive number of seconds")
+
+
+def _approval_wait_timeout(approval_id: str) -> WaitTimeout:
+    return WaitTimeout(
+        f"approval {approval_id} is still pending: the person had not decided in time, and it stays open",
+        pending_id=approval_id,
+    )
+
+
 def _secret_alive(secret: Secret, now: float) -> bool:
+    """``False`` only for a token whose ``exp`` has passed; one with no ``exp`` is the platform's to judge."""
     exp = label_claims(secret.reveal()).get("exp")
+    if exp is None:
+        return True
     return isinstance(exp, int | float) and not isinstance(exp, bool) and exp > now
 
 
@@ -232,6 +247,7 @@ class _AgentBase:
         resource: str | None,
         send_to: Sequence[str],
         refresh_skew: float,
+        legacy: bool = False,
     ) -> None:
         agent = str(agent_id or "").strip()
         if not agent:
@@ -246,12 +262,31 @@ class _AgentBase:
         self.agent_id = agent
         self.key = key
         self.resource = resource.strip() if resource else None
+        if not legacy:
+            self._refuse_customer_resource(project, send_to)
         self._destinations = Destinations(project, self.resource, send_to)
         self.refresh_skew = float(refresh_skew)
         self._project_ref = project
         self._auth = ClientAuth.private_key_jwt(agent, self._assertion)
         self._clock = project.clock
         self._log = project.logger
+
+    def _refuse_customer_resource(self, project: AuthFI | AsyncAuthFI, send_to: Sequence[str]) -> None:
+        """The agent's own token is for AuthFI; a customer API's token is ``for_resource(...)``.
+
+        The agent sends its own token to AuthFI's endpoints (the action gate, approvals, token
+        exchange), so a token minted for another API must never be the one it holds by default.
+        """
+        if self.resource is not None and not project.names_authfi(self.resource):
+            raise ConfigurationError(
+                f"resource {self.resource!r} is not AuthFI's own: use agent.for_resource({self.resource!r}, "
+                "send_to=[...]) for a customer API"
+            )
+        if send_to:
+            raise ConfigurationError(
+                "send_to is for a customer API's token: use agent.for_resource(resource, send_to=[...]). "
+                "The agent's own token goes only to AuthFI."
+            )
 
     def _assertion(self, audience: str) -> str:
         return client_assertion(self.key, self.agent_id, audience, now=self._clock.time())
@@ -276,6 +311,12 @@ class _AgentBase:
 
     def _check_destination_args(self, resource: str | None, send_to: Sequence[str]) -> Destinations:
         return Destinations(self._project_ref, resource, send_to)
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Self:
+        return self
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(agent_id={self.agent_id!r}, kid={self.key.kid!r})"
@@ -381,6 +422,12 @@ class DelegatedToken(TokenSource):
             f"expires_at={self.expires_at.isoformat()})"
         )
 
+    def __copy__(self) -> DelegatedToken:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> DelegatedToken:
+        return self
+
     def __reduce__(self) -> NoReturn:
         raise TypeError(
             "A DelegatedToken cannot be pickled: a checkpoint would store a person's token. Store the person's id "
@@ -400,7 +447,7 @@ class AsyncDelegatedToken(AsyncTokenSource):
         via: Literal["ciba", "exchange"],
         agent_id: str,
         destinations: Destinations,
-        renew: Callable[[], Any] | None,
+        renew: Callable[[], Awaitable[TokenResponse]] | None,
         refresh_skew: float,
         time: Callable[[], float],
     ) -> None:
@@ -456,6 +503,12 @@ class AsyncDelegatedToken(AsyncTokenSource):
             f"expires_at={self.expires_at.isoformat()})"
         )
 
+    def __copy__(self) -> AsyncDelegatedToken:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> AsyncDelegatedToken:
+        return self
+
     def __reduce__(self) -> NoReturn:
         raise TypeError("An AsyncDelegatedToken cannot be pickled: a checkpoint would store a person's token.")
 
@@ -498,7 +551,6 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         key: Signer,
         *,
         resource: str | None = None,
-        send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
     ) -> None: ...
 
@@ -522,7 +574,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         if is_legacy_agent(args, kwargs):
             project, agent_id, key, options = legacy_agent_arguments(args, kwargs)
-            self._init(project, agent_id, key, **options)
+            self._init(project, agent_id, key, legacy=True, **options)
         else:
             self._init(*args, **kwargs)
 
@@ -535,8 +587,11 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         resource: str | None = None,
         send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
+        legacy: bool = False,
     ) -> None:
-        super().__init__(project, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew)
+        super().__init__(
+            project, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew, legacy=legacy
+        )
         self.project = project
         self._tokens: SyncCache[_Minted] = SyncCache(project.clock, max_entries=32)
         self._endpoints: SyncCache[AgentEndpoints] = SyncCache(project.clock, max_entries=1)
@@ -557,6 +612,10 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
     def _own(self, resource: str | None, force: bool) -> _Minted:
         chosen = self._resource(resource)
         return self._tokens.get(chosen or "", lambda: self._mint(chosen), refresh=force)
+
+    def _authfi_bearer(self) -> str:
+        """The token for AuthFI's own endpoints: minted for AuthFI, whatever the default resource is."""
+        return self._tokens.get("", lambda: self._mint(None)).access_token.reveal()
 
     @overload
     def token(self, *, resource: str | None = None, force: bool = False) -> str: ...
@@ -649,8 +708,9 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         """Wait for the person's decision, then return the token that acts for them.
 
         Polls at the request's interval, waiting it before the first poll. ``timeout`` (seconds) is
-        how long to wait; the request stays open, and waiting on it again continues it. A refusal is
-        :class:`ConsentDenied`; an expired request :class:`ConsentExpired`.
+        how long to wait: when it passes, :class:`WaitTimeout` is raised and the request stays open,
+        so waiting on it again continues it. A refusal is :class:`ConsentDenied`; a request that ran
+        out is :class:`ConsentExpired`.
         """
         if not isinstance(request, CibaRequest) or audience is not None or sleep is not None:
             warnings.warn(
@@ -669,7 +729,8 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             self._auth,
             auth_req_id=request.auth_req_id,
             interval=request.interval,
-            deadline=min(self._clock.monotonic() + timeout, request.deadline),
+            wait_deadline=self._clock.monotonic() + timeout,
+            request_deadline=request.deadline,
             now=self._clock.monotonic,
             resource=chosen,
         )
@@ -728,7 +789,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             request = exchange_request(
                 metadata.token_endpoint,
                 subject_token=_subject_value(subject_token),
-                actor_token=self.token(),
+                actor_token=self._authfi_bearer(),
                 resource=chosen,
                 scope=scope,
             )
@@ -762,7 +823,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         following it.
         """
         request = transaction_token_request(
-            self.project.api_origin, self.token(), action=action, resource=resource, context=context
+            self.project.resolve_api_origin(), self._authfi_bearer(), action=action, resource=resource, context=context
         )
         token, txn, expires_in = parse_transaction_token(self._send(request))
         expires_at = datetime.fromtimestamp(self._clock.time() + expires_in, UTC)
@@ -772,7 +833,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         """The gate's decision on a frozen action: ``allow``, ``deny`` or ``approval_required``."""
         request = authorize_request(
             self._agent_endpoints().authorize,
-            self.project.api_origin,
+            self.project.resolve_api_origin(),
             agent_id=self.agent_id,
             transaction_token=txn.token,
             action=txn.action,
@@ -781,7 +842,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         )
         decision, approval_id, reason = parse_action_decision(self._send(request))
         self._log.info("the gate decided %s for agent %s: %s", txn.action, self.agent_id, decision)
-        return ActionDecision(cast(Any, decision), approval_id, reason)
+        return ActionDecision(decision, approval_id, reason)
 
     # --- approvals -----------------------------------------------------------------------------------
 
@@ -821,7 +882,8 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         request = approval_request(
             endpoint,
             agent_id=self.agent_id,
-            assertion=self._assertion(self.project.issuer),
+            sign=self._assertion,
+            audience=self.project.issuer,
             action=action,
             context=context,
             expires_in=expires_in,
@@ -837,22 +899,27 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             raise NotSupportedError(
                 "agent_approval_status", "This AuthFI project does not offer approval status to agents."
             )
-        response = self._send(read_approval_request(template, approval_id, self.token()))
+        response = self._send(read_approval_request(template, approval_id, self._authfi_bearer()))
         return Approval.of(parse_approval(response, reading=True))
 
-    def wait_for_approval(self, approval_id: str, *, timeout: float = 300.0) -> Approval:
-        """Poll :meth:`approval` until a person decides; returns it whatever they decided.
+    def wait_for_approval(
+        self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = _APPROVAL_POLL
+    ) -> Approval:
+        """Poll :meth:`approval` every ``poll_interval`` seconds until a person decides.
 
-        At ``timeout`` it raises ``authorization_pending``; the approval stays open.
+        Returns the approval whatever they decided (``approved``, ``denied`` or ``expired``). When
+        ``timeout`` passes first it raises :class:`WaitTimeout` carrying the approval's id; the
+        approval stays open, and waiting on it again continues.
         """
+        _check_poll(poll_interval)
         deadline = self._clock.monotonic() + timeout
         while True:
             current = self.approval(approval_id)
             if current.decided:
                 return current
-            if self._clock.monotonic() + _APPROVAL_POLL > deadline:
-                raise OAuthError("authorization_pending", f"approval {approval_id} is still pending")
-            self._clock.sleep(_APPROVAL_POLL)
+            if self._clock.monotonic() + poll_interval > deadline:
+                raise _approval_wait_timeout(approval_id)
+            self._clock.sleep(poll_interval)
 
 
 class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
@@ -865,10 +932,9 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         key: Signer,
         *,
         resource: str | None = None,
-        send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
     ) -> None:
-        super().__init__(project, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew)
+        super().__init__(project, agent_id, key, resource=resource, send_to=(), refresh_skew=refresh_skew)
         self.project = project
         self._tokens: AsyncCache[_Minted] = AsyncCache(project.clock, max_entries=32)
         self._endpoints: AsyncCache[AgentEndpoints] = AsyncCache(project.clock, max_entries=1)
@@ -887,6 +953,10 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
     async def _own(self, resource: str | None, force: bool) -> _Minted:
         chosen = self._resource(resource)
         return await self._tokens.get(chosen or "", lambda: self._mint(chosen), refresh=force)
+
+    async def _authfi_bearer(self) -> str:
+        """See :meth:`AgentAuth._authfi_bearer`."""
+        return (await self._tokens.get("", lambda: self._mint(None))).access_token.reveal()
 
     async def token(self, *, resource: str | None = None, force: bool = False) -> str:
         """See :meth:`AgentAuth.token`."""
@@ -943,7 +1013,8 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             self._auth,
             auth_req_id=request.auth_req_id,
             interval=request.interval,
-            deadline=min(self._clock.monotonic() + timeout, request.deadline),
+            wait_deadline=self._clock.monotonic() + timeout,
+            request_deadline=request.deadline,
             now=self._clock.monotonic,
             resource=chosen,
         )
@@ -1002,7 +1073,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             request = exchange_request(
                 metadata.token_endpoint,
                 subject_token=subject,
-                actor_token=await self.token(),
+                actor_token=await self._authfi_bearer(),
                 resource=chosen,
                 scope=scope,
             )
@@ -1029,7 +1100,11 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
     ) -> TransactionToken:
         """See :meth:`AgentAuth.transaction_token`."""
         request = transaction_token_request(
-            self.project.api_origin, await self.token(), action=action, resource=resource, context=context
+            await self.project.resolve_api_origin(),
+            await self._authfi_bearer(),
+            action=action,
+            resource=resource,
+            context=context,
         )
         token, txn, expires_in = parse_transaction_token(await self._send(request))
         expires_at = datetime.fromtimestamp(self._clock.time() + expires_in, UTC)
@@ -1039,7 +1114,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         """See :meth:`AgentAuth.authorize_action`."""
         request = authorize_request(
             (await self._agent_endpoints()).authorize,
-            self.project.api_origin,
+            await self.project.resolve_api_origin(),
             agent_id=self.agent_id,
             transaction_token=txn.token,
             action=txn.action,
@@ -1048,7 +1123,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         )
         decision, approval_id, reason = parse_action_decision(await self._send(request))
         self._log.info("the gate decided %s for agent %s: %s", txn.action, self.agent_id, decision)
-        return ActionDecision(cast(Any, decision), approval_id, reason)
+        return ActionDecision(decision, approval_id, reason)
 
     async def _agent_endpoints(self) -> AgentEndpoints:
         async def fetch() -> tuple[AgentEndpoints, float]:
@@ -1086,7 +1161,8 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         request = approval_request(
             endpoint,
             agent_id=self.agent_id,
-            assertion=self._assertion(self.project.issuer),
+            sign=self._assertion,
+            audience=self.project.issuer,
             action=action,
             context=context,
             expires_in=expires_in,
@@ -1102,19 +1178,22 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             raise NotSupportedError(
                 "agent_approval_status", "This AuthFI project does not offer approval status to agents."
             )
-        response = await self._send(read_approval_request(template, approval_id, await self.token()))
+        response = await self._send(read_approval_request(template, approval_id, await self._authfi_bearer()))
         return Approval.of(parse_approval(response, reading=True))
 
-    async def wait_for_approval(self, approval_id: str, *, timeout: float = 300.0) -> Approval:
+    async def wait_for_approval(
+        self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = _APPROVAL_POLL
+    ) -> Approval:
         """See :meth:`AgentAuth.wait_for_approval`. Cancel the task to stop waiting."""
+        _check_poll(poll_interval)
         deadline = self._clock.monotonic() + timeout
         while True:
             current = await self.approval(approval_id)
             if current.decided:
                 return current
-            if self._clock.monotonic() + _APPROVAL_POLL > deadline:
-                raise OAuthError("authorization_pending", f"approval {approval_id} is still pending")
-            await self._clock.asleep(_APPROVAL_POLL)
+            if self._clock.monotonic() + poll_interval > deadline:
+                raise _approval_wait_timeout(approval_id)
+            await self._clock.asleep(poll_interval)
 
 
 class _AsyncAgentResource(AsyncTokenSource):

@@ -65,9 +65,10 @@ class Attempt:
 
     form: Mapping[str, str] = field(default_factory=dict[str, str])
     headers: Mapping[str, str] = field(default_factory=dict[str, str])
+    json_body: Mapping[str, Any] = field(default_factory=dict[str, Any])
 
     def __repr__(self) -> str:
-        return f"Attempt(form={sorted(self.form)}, headers={sorted(self.headers)})"
+        return f"Attempt(form={sorted(self.form)}, headers={sorted(self.headers)}, json={sorted(self.json_body)})"
 
 
 @dataclass(frozen=True, slots=True, repr=False)

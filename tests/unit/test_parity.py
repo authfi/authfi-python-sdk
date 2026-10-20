@@ -58,6 +58,21 @@ LEGACY_OR_RENAMED = {
 # Parameters only the blocking form has: 0.1's spellings.
 LEGACY_PARAMETERS = {"audience", "sleep"}
 
+# Parameters the blocking form still takes by position because 0.1 did, and the asyncio form only by name.
+LEGACY_POSITIONAL = {("AgentAuth", "token", "force"), ("AgentAuth", "await_user_token", "timeout")}
+
+# Methods that build or describe and do no I/O: plain functions on both sides.
+PLAIN_ON_BOTH = {
+    "agent",
+    "agent_from_env",
+    "client_credentials",
+    "for_resource",
+    "httpx_auth",
+    "names_authfi",
+    "pinned",
+    "verifier",
+}
+
 
 def public(cls: type) -> set[str]:
     return {name for name in dir(cls) if not name.startswith("_")}
@@ -76,11 +91,21 @@ def test_the_pair_has_the_same_parameters_and_the_async_side_is_coroutines(sync:
             continue
         sync_fn = getattr(sync, name)
         async_fn = getattr(asyn, name)
-        sync_params = sorted(set(inspect.signature(sync_fn).parameters) - LEGACY_PARAMETERS)
-        async_params = sorted(set(inspect.signature(async_fn).parameters) - LEGACY_PARAMETERS)
-        assert sync_params == async_params, f"{sync.__name__}.{name}"
-        if inspect.iscoroutinefunction(async_fn):
-            assert not inspect.iscoroutinefunction(sync_fn), f"{sync.__name__}.{name} is a coroutine"
+        where = f"{sync.__name__}.{name}"
+        sync_params = inspect.signature(sync_fn).parameters
+        async_params = inspect.signature(async_fn).parameters
+        assert sorted(set(sync_params) - LEGACY_PARAMETERS) == sorted(set(async_params) - LEGACY_PARAMETERS), where
+        for param in sorted(set(async_params) - LEGACY_PARAMETERS):
+            left_param, right_param = sync_params[param], async_params[param]
+            assert (left_param.default is inspect.Parameter.empty) == (
+                right_param.default is inspect.Parameter.empty
+            ), f"{where}({param}): required on one side only"
+            if (sync.__name__, name, param) not in LEGACY_POSITIONAL:
+                assert left_param.kind == right_param.kind, f"{where}({param}): {left_param.kind} vs {right_param.kind}"
+        # The asyncio side does its I/O in coroutines; the blocking side never is one.
+        assert not inspect.iscoroutinefunction(sync_fn), f"{where} is a coroutine"
+        if name not in PLAIN_ON_BOTH:
+            assert inspect.iscoroutinefunction(async_fn), f"{where} is not a coroutine on the asyncio side"
 
 
 def test_from_env_exists_on_both_projects() -> None:

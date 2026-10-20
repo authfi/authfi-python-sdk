@@ -21,7 +21,7 @@ from authfi.secret import Secret
 
 if TYPE_CHECKING:
     from authfi._protocol.discovery import ServerMetadata
-    from authfi.agents.agent import CibaRequest
+    from authfi.agents.agent import AgentAuth, CibaRequest
     from authfi.client import AuthFI
 
 __all__ = ["LegacyAgentMixin", "is_legacy_agent", "key_from_env", "legacy_agent_arguments"]
@@ -134,7 +134,7 @@ class LegacyAgentMixin:
 
     @classmethod
     @deprecated("AgentAuth.from_env() is AuthFI.from_env().agent_from_env()", category=AuthFIDeprecationWarning)
-    def from_env(cls, **overrides: Any) -> Any:
+    def from_env(cls, **overrides: Any) -> AgentAuth:
         """0.1's environment form. ``AUTHFI_PLATFORM_URL`` and ``AUTHFI_AGENT_AUDIENCE`` are read as fallbacks."""
         from authfi.client import AuthFI
 

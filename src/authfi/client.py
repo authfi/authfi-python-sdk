@@ -412,15 +412,16 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         key: Signer,
         *,
         resource: str | None = None,
-        send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
     ) -> AgentAuth:
         """An AI agent of this project, authenticating with ``key`` (an :class:`~authfi.AgentKey`).
 
-        ``resource`` is what its own token is for: ``<issuer>/mcp`` (the AuthFI gateway) when absent.
-        For a customer's API, name the API's origin in ``send_to``.
+        ``resource`` is what its own token is for, and must be AuthFI's own: ``<issuer>/mcp`` (the
+        AuthFI gateway) when absent. For a customer's API, use ``agent.for_resource(resource,
+        send_to=[...])``: the agent sends its own token to AuthFI's endpoints, so it never holds a
+        token for another API by default.
         """
-        return AgentAuth(self, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew)
+        return AgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
 
     def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AgentAuth:
         """The agent the environment names.
@@ -456,6 +457,7 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
+        self._closables = [ref for ref in self._closables if ref() is not None]
         self._closables.append(weakref.ref(closable))
 
     def close(self) -> None:
@@ -600,11 +602,10 @@ class AsyncAuthFI(_Project):
         key: Signer,
         *,
         resource: str | None = None,
-        send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
     ) -> AsyncAgentAuth:
         """See :meth:`AuthFI.agent`."""
-        return AsyncAgentAuth(self, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew)
+        return AsyncAgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
 
     def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AsyncAgentAuth:
         """See :meth:`AuthFI.agent_from_env`."""
@@ -630,6 +631,7 @@ class AsyncAuthFI(_Project):
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
+        self._closables = [ref for ref in self._closables if ref() is not None]
         self._closables.append(weakref.ref(closable))
 
     async def aclose(self) -> None:

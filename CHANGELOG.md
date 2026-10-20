@@ -73,3 +73,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - CIBA and token exchange return a `DelegatedToken`, not the token response `dict`, which put a
   person's token in a printable value.
 - The single-module `authfi.py` layout. The names it exported are kept at the top level.
+- A wait that runs out its own `timeout` no longer raises `OAuthError` `authorization_pending`, the
+  server's word for "not decided yet": it raises `WaitTimeout` (`code == "wait_timeout"`), and a
+  CIBA request that really expired raises `ConsentExpired`. An intended break.
+- `send_to` on `af.agent()`, and a customer API's `resource` there: the agent sends its own token to
+  AuthFI's endpoints, so it holds only a token for AuthFI. Use `agent.for_resource(resource,
+  send_to=[...])` for a customer API.

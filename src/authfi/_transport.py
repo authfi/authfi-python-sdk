@@ -18,9 +18,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -98,6 +98,13 @@ def _form_of(request: HttpRequest, attempt: Attempt) -> dict[str, str] | None:
     return {**(request.form or {}), **attempt.form}
 
 
+def _json_of(request: HttpRequest, attempt: Attempt) -> Any:
+    if not attempt.json_body:
+        return request.json_body
+    base = cast(Mapping[str, Any], request.json_body or {})
+    return {**base, **attempt.json_body}
+
+
 def _failure_of(exc: httpx.TransportError) -> Failure:
     if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
         return Failure.NOT_SENT
@@ -164,7 +171,7 @@ class _Base:
             request.url,
             headers=self._headers(request, attempt, rid),
             data=_form_of(request, attempt),
-            json=request.json_body,
+            json=_json_of(request, attempt),
             timeout=self._httpx_timeout(deadline),
         )
 

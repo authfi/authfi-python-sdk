@@ -80,6 +80,7 @@ to support.
 | `OAuthError` | an OAuth endpoint refused; `.code` is its `error` |
 | `StepUpRequired` | the person must authenticate more strongly; `.acr_values` |
 | `ConsentDenied`, `ConsentExpired` | a person declined, or their consent ran out |
+| `WaitTimeout` | your own `timeout` for waiting on a person passed; what you waited on is still open |
 | `TemporarilyUnavailable` | the platform could not decide now and failed closed |
 | `APIError` | an AuthFI API refused; `.code` is its stable code |
 | `NotSupportedError` | the project does not offer this to this kind of client; `.feature` |

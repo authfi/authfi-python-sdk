@@ -53,6 +53,7 @@ from authfi.errors import (
     StepUpRequired,
     TemporarilyUnavailable,
     TransportError,
+    WaitTimeout,
     WebhookVerificationError,
 )
 from authfi.machine import AsyncClientCredentials, ClientCredentials
@@ -153,6 +154,7 @@ __all__ = [
     "TokenVerifier",
     "TransactionToken",
     "TransportError",
+    "WaitTimeout",
     "WebhookVerificationError",
     "__version__",
     "assert_public_jwk",

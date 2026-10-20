@@ -51,7 +51,10 @@ httpx.Client(auth=agent.httpx_auth())     # the current token on every request t
 ```
 
 The token is cached and renewed `refresh_skew` (60 s) before it expires; concurrent callers share
-one request. `resource=` asks for a token for another API, whose origin then goes in `send_to`:
+one request. The agent's own token is for AuthFI: `af.agent(..., resource=)` takes only AuthFI's own
+resources, because the agent sends this token to AuthFI's endpoints (the action gate, approvals,
+token exchange) and must never hold a token minted for another API by default. For a customer's API,
+make a token source for it, naming the origins it may go to:
 
 ```python
 orders = agent.for_resource("api_orders", send_to=["https://api.example.com"])
@@ -81,9 +84,9 @@ httpx.Client(auth=as_priya.httpx_auth())
 
 - `binding_message` is required: it is what the person reads before they approve.
 - The agent never sees or relays a code.
-- The wait polls at the interval the project asks for. It raises `ConsentDenied` if they say no,
-  `ConsentExpired` if the request runs out, and `OAuthError` `authorization_pending` at your
-  `timeout`; the request stays open, and waiting on it again continues it.
+- The wait polls at the interval the project asks for. It raises `ConsentDenied` if they say no and
+  `ConsentExpired` if the request runs out. At your own `timeout` it raises `WaitTimeout`
+  (`code == "wait_timeout"`); the request stays open, and waiting on it again continues it.
 - `agent.token_as_user(...)` does both steps.
 
 The token's `sub` is the person and `act.sub` the agent. It is never renewed: the person's
@@ -124,6 +127,10 @@ approval = agent.request_approval("refund order 4411", context={"amount": 120})
 approval = agent.wait_for_approval(approval.approval_id)
 if approval.status == "approved": ...
 ```
+
+`wait_for_approval(approval_id, timeout=300, poll_interval=3)` returns the approval whatever the
+person decided (`approved`, `denied` or `expired`). At your `timeout` it raises `WaitTimeout`, whose
+`pending_id` is the approval's id; the approval stays open, and waiting on it again continues.
 
 ## In asyncio code
 

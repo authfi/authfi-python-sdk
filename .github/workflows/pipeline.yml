@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync
-      - run: uv run pytest -p no:cacheprovider tests/unit/test_secret.py
+      - run: uv run pytest -p no:cacheprovider tests/unit/test_secret.py tests/unit/test_agent_keys.py
 
   # Each adapter against the lowest version of its framework its extra allows and the newest within the
   # range. A locked install tests only one version, so a lower bound is otherwise never installed.
