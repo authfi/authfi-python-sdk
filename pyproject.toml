@@ -48,9 +48,11 @@ langgraph = [
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
+    "google-adk>=2.12,<2.13",
 ]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
 claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
+adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,<2", "mcp>=1.30,<2"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -87,6 +89,7 @@ dev = [
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
+    "google-adk>=2.12,<2.13",
 ]
 
 [tool.pytest.ini_options]
@@ -103,6 +106,9 @@ filterwarnings = [
     "ignore:Use `streamable_http_client` instead:DeprecationWarning",
     # The fork-safety tests fork on purpose, after the adapter tests' local servers have started threads
     "ignore:This process .* is multi-threaded, use of fork:DeprecationWarning",
+    # google-adk 2.12 announces its own experimental features and renames on every use
+    'ignore:\[EXPERIMENTAL\] feature:UserWarning',
+    "ignore:MCPTool class is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]

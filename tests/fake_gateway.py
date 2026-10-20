@@ -53,6 +53,8 @@ class FakeGateway:
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self.model_script: list[list[dict[str, Any]]] = []
         self.revoked = False
+        #: Refuse the token at the MCP gateway only, so a model call still succeeds.
+        self.tools_revoked = False
         self._lock = threading.Lock()
         gateway = self
 
@@ -190,7 +192,7 @@ class FakeGateway:
                 {},
                 json.dumps({"access_token": token, "token_type": "Bearer", "expires_in": self.token_lifetime}).encode(),
             )
-        if not self._authorized(headers):
+        if not self._authorized(headers) or (self.tools_revoked and path == "/mcp"):
             return (
                 401,
                 {"WWW-Authenticate": 'Bearer error="invalid_token", error_description="revoked"'},
