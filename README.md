@@ -45,8 +45,8 @@ async def get_users(user=Depends(auth.require('read:users'))):
 
 ## Agent authentication (AuthFI Agent Profile)
 
-An AuthFI agent holds its **own** Ed25519 keypair. It authenticates by signing a short
-assertion (`private_key_jwt`, RFC 7523 §2.2) — the private half never leaves the process
+An AuthFI agent holds its **own** keypair: Ed25519 (EdDSA), P-256 (ES256) or RSA 2048 to
+4096 bits (PS256). It authenticates by signing a short assertion (`private_key_jwt`, RFC 7523 §2.2) — the private half never leaves the process
 and is never sent to AuthFI. There is no client secret to leak, because an agent
 registered with a public JWK is issued none.
 
@@ -55,11 +55,17 @@ registered with a public JWK is issued none.
 ```python
 from authfi import AgentKey
 
-key = AgentKey.generate("k1")
+key = AgentKey.generate("k1")            # Ed25519; or AgentKey.generate("k1", "ES256") / "PS256"
 
 open("/run/secrets/agent.key", "w").write(key.private_pem())   # chmod 600, never sent
-print(key.public_jwk())   # {"kty":"OKP","crv":"Ed25519","x":"...","kid":"k1"}
+print(key.public_jwk())   # {"kty":"OKP","crv":"Ed25519","x":"...","alg":"EdDSA","kid":"k1"}
 ```
+
+A key you already hold loads with `AgentKey.from_file(path, key_id=...)`: a PEM private key
+(PKCS#8, or the SEC1 and PKCS#1 forms) or a private JWK. The key type decides the algorithm:
+Ed25519 signs EdDSA, P-256 signs ES256 and RSA signs PS256 (never RS256). Any other curve or
+size, and a JWK labelled with an algorithm its type does not sign, is refused before anything
+is sent.
 
 Register the agent with that **public** JWK and its `kid`. If you build a JWK by hand,
 run it through `assert_public_jwk(jwk)` first: a `d` where a public key belongs means the
@@ -89,11 +95,14 @@ Or from the environment — `AgentAuth.from_env()`:
 | `AUTHFI_AGENT_KEY_FILE` | path to the private key — **preferred** |
 | `AUTHFI_AGENT_KID` | the registered `kid` |
 | `AUTHFI_AGENT_PRIVATE_KEY` | PEM inline — fallback, warns |
-| `AUTHFI_PLATFORM_URL` | your project's authfi.io address, for example `https://acme.authfi.io` |
+| `AUTHFI_PLATFORM_URL` | your project's authfi.io address, for example `https://acme.authfi.io` — **required** |
 | `AUTHFI_AGENT_AUDIENCE` | optional resource the token is for |
 
 Prefer the file. A private key in an environment variable is visible in `ps`, inherited by
 every child process and captured in crash dumps.
+
+The project address is required, as `platform_url` or `AUTHFI_PLATFORM_URL`, and has no
+default: an agent is registered in one project, and only that project can authenticate it.
 
 Endpoints are read from `/.well-known/agent-configuration`, not hard-coded — the token
 endpoint moves with the project's origin, and the assertion's `aud` is built from the same
@@ -137,7 +146,7 @@ The poll honours the server's `interval` and widens it on `slow_down`. `access_d
 - `@auth.require("read:users")` — decorator for Flask/FastAPI
 - `@auth.require_role("admin")` — role-based access
 - Permission auto-sync on `sync()`
-- Agent authentication — `private_key_jwt` with Ed25519, discovery-driven
+- Agent authentication — `private_key_jwt` with Ed25519, P-256 or RSA keys, discovery-driven
 - CIBA — an agent acting as a person who approved out of band
 - Cloud credentials (GCP/AWS/Azure/OCI)
 - Cloud token exchange
@@ -154,8 +163,6 @@ creds = auth.cloud_credentials(user_token, 'aws', role_arn='arn:aws:iam::123:rol
 ```bash
 python -m unittest test_authfi -v
 ```
-
-65 unit tests — all passing.
 
 ## License
 

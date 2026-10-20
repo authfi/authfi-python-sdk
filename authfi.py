@@ -30,7 +30,7 @@ Agent authentication (the AuthFI Agent Profile):
 
     from authfi import AgentAuth
 
-    agent = AgentAuth.from_env()
+    agent = AgentAuth.from_env()   # AUTHFI_PLATFORM_URL = your project's address
 
     if agent.can("send_email_external"):
         requests.post(url, headers=agent.auth_header(), json=payload)
@@ -49,6 +49,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 from urllib.error import HTTPError
 from threading import local
+from types import SimpleNamespace
 
 __version__ = "0.1.0"
 
@@ -442,11 +443,12 @@ def _b64encode(raw):
 # Agent authentication — the AuthFI Agent Profile
 # =============================================================================
 #
-# An AuthFI agent holds its OWN Ed25519 keypair. It authenticates by signing a
-# short assertion (RFC 7523 §2.2 private_key_jwt); the private half never leaves
-# the process and is never sent to AuthFI. That is the whole point, and the
-# difference between an agent credential and a bearer artifact the IETF
-# agent-auth draft's security considerations call an antipattern.
+# An AuthFI agent holds its OWN keypair: Ed25519 (EdDSA), P-256 (ES256) or RSA
+# 2048-4096 bits (PS256). It authenticates by signing a short assertion
+# (RFC 7523 §2.2 private_key_jwt); the private half never leaves the process and
+# is never sent to AuthFI. That is the whole point, and the difference between an
+# agent credential and a bearer artifact the IETF agent-auth draft's security
+# considerations call an antipattern.
 #
 # There is deliberately no second credential path here. The platform's discovery
 # document advertises "token_endpoint_auth_methods_supported": ["private_key_jwt"]
@@ -462,8 +464,19 @@ CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 #: The OpenID CIBA grant — an agent redeeming a person's out-of-band approval.
 CIBA_GRANT_TYPE = "urn:openid:params:grant-type:ciba"
 
-#: Where discovery lives when no platform URL is given.
-DEFAULT_PLATFORM_URL = "https://platform.authfi.io"
+#: The algorithm each accepted key type signs with. The KEY decides, as it does on
+#: the server: a P-256 key signs ES256 and an RSA key signs PS256, and a label that
+#: says otherwise is refused. RS256 is never used for an agent assertion.
+ALG_EDDSA, ALG_ES256, ALG_PS256 = "EdDSA", "ES256", "PS256"
+
+# The RSA modulus sizes the platform accepts for an agent key (NIST SP 800-57:
+# 2048 bits through 2030), and the one public exponent it accepts.
+_RSA_MIN_BITS, _RSA_MAX_BITS, _RSA_EXPONENT = 2048, 4096, 65537
+
+# The JWK members that only a PRIVATE key has (RFC 7518 §6.2.2 and §6.3.2).
+_PRIVATE_JWK_MEMBERS = ("d", "p", "q", "dp", "dq", "qi")
+
+_KEY_TYPES_TEXT = "Ed25519 (EdDSA), P-256 (ES256) or RSA 2048-4096 bits (PS256)"
 
 # How long an assertion may claim to live. Short by intent: an assertion is a
 # bearer credential for its lifetime, so the window in which a captured one is
@@ -489,38 +502,99 @@ class AgentAuthError(AuthFIError):
         self.description = description
 
 
+def _jwk_alg_label(jwk, implied):
+    """Refuse a JWK whose ``alg`` or ``use`` contradicts what the key is.
+
+    The server compares the label with the algorithm the key type implies and
+    refuses a mismatch (an RSA key labelled RS256), so a mislabelled key is
+    refused here, where the message can say what is wrong with it.
+    """
+    label = jwk.get("alg")
+    if label and label != implied:
+        raise AuthFIError(
+            "This %s key is labelled alg=%s, but a %s agent key signs %s. AuthFI agents "
+            "sign with %s; relabel the key or generate one of those."
+            % (jwk.get("kty"), label, jwk.get("kty"), implied, _KEY_TYPES_TEXT),
+            status=400,
+        )
+    use = jwk.get("use")
+    if use and use != "sig":
+        raise AuthFIError("This JWK is for use=%s; an agent key must be a signing key" % use,
+                          status=400)
+
+
+def _jwk_implied_alg(jwk):
+    """The algorithm a JWK's key type and curve imply, or a refusal naming what it is."""
+    kty, crv = jwk.get("kty"), jwk.get("crv")
+    if kty == "OKP" and crv == "Ed25519":
+        return ALG_EDDSA
+    if kty == "EC" and crv == "P-256":
+        return ALG_ES256
+    if kty == "RSA":
+        return ALG_PS256
+    raise AuthFIError(
+        "An agent key must be %s, but this JWK is %s/%s"
+        % (_KEY_TYPES_TEXT, kty, crv or "-"),
+        status=400,
+    )
+
+
 def assert_public_jwk(jwk):
     """Refuse a JWK that carries a private component, and return it otherwise.
 
     Call this before sending a JWK anywhere — registration, a config file, a
-    ticket. A key that has been sent is no longer secret, so a private ``d``
-    turning up where a public key belongs is not a formatting slip to strip and
-    carry on from: the key is burned and must be replaced. The server refuses it
-    for the same reason, and quietly using the public half would leave its owner
-    believing a secret they just leaked is still secret.
+    ticket. A key that has been sent is no longer secret, so a private member
+    (``d``, or RSA's ``p``, ``q``, ``dp``, ``dq``, ``qi``) turning up where a public
+    key belongs is not a formatting slip to strip and carry on from: the key is
+    burned and must be replaced. The server refuses it for the same reason, and
+    quietly using the public half would leave its owner believing a secret they
+    just leaked is still secret.
+
+    It also refuses a key the platform would refuse: anything but Ed25519, P-256
+    or RSA 2048-4096 bits with exponent 65537, and a key labelled with an
+    algorithm its type does not sign.
     """
     if not isinstance(jwk, dict):
-        raise AuthFIError("A JWK must be a dict (RFC 8037 OKP)", status=400)
-    if jwk.get("d"):
+        raise AuthFIError("A JWK must be a dict (RFC 7517)", status=400)
+    leaked = [m for m in _PRIVATE_JWK_MEMBERS if jwk.get(m)]
+    if leaked:
         raise AuthFIError(
-            "This JWK contains a private key component ('d') where a PUBLIC key "
+            "This JWK contains a private key component (%s) where a PUBLIC key "
             "belongs. Refusing to use or send it. Treat that key as burned — "
-            "generate a new one (AgentKey.generate) and register its public half.",
+            "generate a new one (AgentKey.generate) and register its public half."
+            % ", ".join("'%s'" % m for m in leaked),
             status=400,
         )
-    if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
-        raise AuthFIError(
-            "An agent key must be an Ed25519 OKP JWK, but this one is %s/%s"
-            % (jwk.get("kty"), jwk.get("crv")),
-            status=400,
-        )
-    if not jwk.get("x"):
-        raise AuthFIError("This JWK has no 'x' — there is no public key in it", status=400)
+    implied = _jwk_implied_alg(jwk)
+    _jwk_alg_label(jwk, implied)
+    required = {ALG_EDDSA: ("x",), ALG_ES256: ("x", "y"), ALG_PS256: ("n", "e")}[implied]
+    for member in required:
+        if not jwk.get(member):
+            raise AuthFIError(
+                "This JWK has no '%s' — there is no public key in it" % member, status=400
+            )
+    if implied == ALG_PS256:
+        _check_rsa(_b64int(jwk["n"]).bit_length(), _b64int(jwk["e"]))
     return jwk
 
 
-def _ed25519():
-    """Import the Ed25519 primitives, with an actionable error if absent.
+def _check_rsa(bits, exponent):
+    """Refuse an RSA key the platform would refuse: its size, or its exponent."""
+    if not _RSA_MIN_BITS <= bits <= _RSA_MAX_BITS:
+        raise AuthFIError(
+            "This RSA key is %d bits; an agent key must be %d to %d bits"
+            % (bits, _RSA_MIN_BITS, _RSA_MAX_BITS),
+            status=400,
+        )
+    if exponent != _RSA_EXPONENT:
+        raise AuthFIError(
+            "This RSA key's public exponent is %d; an agent key must use 65537" % exponent,
+            status=400,
+        )
+
+
+def _crypto():
+    """Import the signing primitives, with an actionable error if absent.
 
     ``cryptography`` is already in this SDK's dependency closure (PyJWT[crypto]
     pulls it in for RS256 verification), so this adds nothing to install. It is
@@ -528,21 +602,54 @@ def _ed25519():
     ``authfi`` must not fail on a machine that only uses part of the SDK.
     """
     try:
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PrivateKey,
-        )
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
     except ImportError as e:  # pragma: no cover - exercised only on a broken install
         raise AuthFIError(
-            "Agent authentication needs Ed25519 signing. "
+            "Agent authentication needs the cryptography package. "
             "Install with: pip install cryptography",
             status=500,
         ) from e
-    return serialization, Ed25519PrivateKey
+    return SimpleNamespace(
+        hashes=hashes, serialization=serialization, ec=ec, ed25519=ed25519,
+        padding=padding, rsa=rsa, decode_dss_signature=decode_dss_signature,
+    )
+
+
+def _alg_for_private_key(key):
+    """The algorithm ``key`` signs with, or a refusal naming what the key is."""
+    c = _crypto()
+    if isinstance(key, c.ed25519.Ed25519PrivateKey):
+        return ALG_EDDSA
+    if isinstance(key, c.ec.EllipticCurvePrivateKey):
+        if key.curve.name != "secp256r1":
+            raise AuthFIError(
+                "The agent key is on curve %s; an elliptic-curve agent key must be "
+                "P-256 (ES256). AuthFI agents sign with %s." % (key.curve.name, _KEY_TYPES_TEXT),
+                status=400,
+            )
+        return ALG_ES256
+    if isinstance(key, c.rsa.RSAPrivateKey):
+        _check_rsa(key.key_size, key.public_key().public_numbers().e)
+        return ALG_PS256
+    raise AuthFIError(
+        "The agent key is a %s key, but AuthFI agents sign with %s."
+        % (type(key).__name__, _KEY_TYPES_TEXT),
+        status=400,
+    )
+
+
+# The PEM blocks that hold an unencrypted private key: PKCS#8, and the SEC1 and
+# PKCS#1 forms `openssl ecparam -genkey` and older tools write.
+_PRIVATE_PEM_MARKERS = (b"BEGIN PRIVATE KEY", b"BEGIN EC PRIVATE KEY", b"BEGIN RSA PRIVATE KEY")
 
 
 class AgentKey:
-    """An agent's Ed25519 signing key, held in this process and never sent.
+    """An agent's signing key, held in this process and never sent.
+
+    Ed25519 signs EdDSA, P-256 signs ES256 and RSA (2048-4096 bits) signs PS256;
+    :attr:`alg` is the algorithm this key signs with, decided by the key type.
 
     The ``key_id`` is required, and required HERE rather than at the first token
     request: it is the ``kid`` the agent registered, and the server COMPARES it
@@ -559,6 +666,7 @@ class AgentKey:
                 "it. A key the verifier cannot name is not a credential.",
                 status=400,
             )
+        self.alg = _alg_for_private_key(private_key)
         self._key = private_key
         self.key_id = str(key_id).strip()
 
@@ -574,9 +682,8 @@ class AgentKey:
         most log-scraping tooling, which is why this is the documented path and
         ``AUTHFI_AGENT_PRIVATE_KEY`` is only the fallback.
 
-        Accepts either a PKCS#8 PEM (``-----BEGIN PRIVATE KEY-----``) or an
-        RFC 8037 OKP JWK, sniffed from the content. A JWK's own ``kid`` is used
-        when ``key_id`` is not given.
+        Accepts a PEM private key or a private JWK, sniffed from the content. A
+        JWK's own ``kid`` is used when ``key_id`` is not given.
         """
         with open(path, "rb") as fh:
             data = fh.read()
@@ -588,50 +695,44 @@ class AgentKey:
 
     @classmethod
     def from_pem(cls, pem, key_id):
-        """Load an Ed25519 private key from a PKCS#8 PEM."""
-        serialization, Ed25519PrivateKey = _ed25519()
+        """Load an unencrypted private key from PEM: PKCS#8, or SEC1 / PKCS#1."""
+        c = _crypto()
         raw = pem.encode("utf-8") if isinstance(pem, str) else pem
         head = raw.strip().splitlines()[0].decode("utf-8", "replace") if raw.strip() else ""
-        if b"BEGIN PRIVATE KEY" not in raw:
+        if not any(marker in raw for marker in _PRIVATE_PEM_MARKERS):
             # Name the thing that was actually handed over. Letting this fail
             # inside the crypto library produces an error that reads like a
             # platform fault rather than "you gave me the wrong file".
             hint = ("it is a %s" % head.replace("-", "").strip()) if head.startswith("-----BEGIN") \
                 else "it is not PEM at all"
             raise AuthFIError(
-                "The agent key must be an Ed25519 private key in PKCS#8 PEM form "
+                "The agent key must be a private key in PEM form "
                 "(-----BEGIN PRIVATE KEY-----), but %s. "
                 "Generate one with: openssl genpkey -algorithm ed25519" % hint,
                 status=400,
             )
         try:
-            key = serialization.load_pem_private_key(raw, password=None)
+            key = c.serialization.load_pem_private_key(raw, password=None)
         except Exception as e:
             raise AuthFIError(
                 "The agent key is not a usable private key: %s. "
                 "An encrypted key is not supported — decrypt it before mounting it." % e,
                 status=400,
             ) from e
-        if not isinstance(key, Ed25519PrivateKey):
-            raise AuthFIError(
-                "The agent key is a %s key, but AuthFI agents sign with Ed25519 "
-                "(discovery advertises EdDSA and nothing else)." % type(key).__name__,
-                status=400,
-            )
         return cls(key, key_id)
 
     @classmethod
     def from_jwk(cls, jwk, key_id=None):
-        """Load a private key from an RFC 8037 OKP JWK — the one shape where ``d`` belongs."""
-        serialization, Ed25519PrivateKey = _ed25519()
+        """Load a private key from a JWK — the one shape where ``d`` belongs.
+
+        OKP/Ed25519, EC/P-256 or RSA. An ``alg`` member, when present, must be
+        the algorithm the key type signs: an RSA key labelled RS256 is refused.
+        """
+        c = _crypto()
         if isinstance(jwk, (str, bytes)):
             jwk = json.loads(jwk)
-        if jwk.get("kty") != "OKP" or jwk.get("crv") != "Ed25519":
-            raise AuthFIError(
-                "An agent key JWK must be OKP/Ed25519, but this one is %s/%s"
-                % (jwk.get("kty"), jwk.get("crv")),
-                status=400,
-            )
+        implied = _jwk_implied_alg(jwk)
+        _jwk_alg_label(jwk, implied)
         if not jwk.get("d"):
             raise AuthFIError(
                 "This JWK has no 'd' — it is the PUBLIC half. Signing needs the "
@@ -639,49 +740,94 @@ class AgentKey:
                 status=400,
             )
         try:
-            key = Ed25519PrivateKey.from_private_bytes(_b64decode(jwk["d"]))
+            if implied == ALG_EDDSA:
+                key = c.ed25519.Ed25519PrivateKey.from_private_bytes(_b64decode(jwk["d"]))
+            elif implied == ALG_ES256:
+                key = c.ec.EllipticCurvePrivateNumbers(
+                    _b64int(jwk["d"]),
+                    c.ec.EllipticCurvePublicNumbers(
+                        _b64int(jwk["x"]), _b64int(jwk["y"]), c.ec.SECP256R1()
+                    ),
+                ).private_key()
+            else:
+                key = _rsa_private_from_jwk(c, jwk)
         except Exception as e:
-            raise AuthFIError("The JWK's 'd' is not a usable Ed25519 private key: %s" % e,
-                              status=400) from e
+            raise AuthFIError(
+                "This %s JWK is not a usable private key: %s" % (jwk.get("kty"), e),
+                status=400,
+            ) from e
         return cls(key, key_id or jwk.get("kid"))
 
     @classmethod
-    def generate(cls, key_id):
+    def generate(cls, key_id, alg=ALG_EDDSA):
         """Generate a fresh agent keypair, to register and then hold.
 
-        Pair with :meth:`public_jwk` (what you register) and :meth:`private_pem`
-        (what you write to a 0600 file and never send anywhere).
+        ``alg`` picks the key type: ``"EdDSA"`` (Ed25519, the default),
+        ``"ES256"`` (P-256) or ``"PS256"`` (RSA, 3072 bits). Pair with
+        :meth:`public_jwk` (what you register) and :meth:`private_pem` (what you
+        write to a 0600 file and never send anywhere).
         """
-        _serialization, Ed25519PrivateKey = _ed25519()
-        return cls(Ed25519PrivateKey.generate(), key_id)
+        c = _crypto()
+        if alg == ALG_EDDSA:
+            key = c.ed25519.Ed25519PrivateKey.generate()
+        elif alg == ALG_ES256:
+            key = c.ec.generate_private_key(c.ec.SECP256R1())
+        elif alg == ALG_PS256:
+            key = c.rsa.generate_private_key(public_exponent=_RSA_EXPONENT, key_size=3072)
+        else:
+            raise AuthFIError(
+                "alg must be EdDSA, ES256 or PS256, not %r" % (alg,), status=400
+            )
+        return cls(key, key_id)
 
     # --- Using ---
 
     def public_jwk(self):
         """The public JWK to register — and the ONLY half that ever leaves here."""
-        serialization, _ = _ed25519()
-        raw = self._key.public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw
-        )
+        c = _crypto()
+        pub = self._key.public_key()
+        if self.alg == ALG_EDDSA:
+            raw = pub.public_bytes(c.serialization.Encoding.Raw, c.serialization.PublicFormat.Raw)
+            jwk = {"kty": "OKP", "crv": "Ed25519", "x": _b64encode(raw)}
+        elif self.alg == ALG_ES256:
+            nums = pub.public_numbers()
+            jwk = {"kty": "EC", "crv": "P-256", "x": _int_b64(nums.x, 32), "y": _int_b64(nums.y, 32)}
+        else:
+            nums = pub.public_numbers()
+            jwk = {"kty": "RSA", "n": _int_b64(nums.n), "e": _int_b64(nums.e)}
+        jwk.update({"alg": self.alg, "kid": self.key_id})
         # Validated on the way out as well: this is the value a caller is about
         # to POST to /register, and the SDK must never be the thing that hands
         # them a private component to upload.
-        return assert_public_jwk(
-            {"kty": "OKP", "crv": "Ed25519", "x": _b64encode(raw), "kid": self.key_id}
-        )
+        return assert_public_jwk(jwk)
 
     def private_pem(self):
         """The PKCS#8 PEM, for writing to a protected file at bootstrap."""
-        serialization, _ = _ed25519()
+        c = _crypto()
         return self._key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
+            c.serialization.Encoding.PEM,
+            c.serialization.PrivateFormat.PKCS8,
+            c.serialization.NoEncryption(),
         ).decode("ascii")
 
     def sign(self, data):
-        """Raw Ed25519 signature over ``data``."""
-        return self._key.sign(data)
+        """The JWS signature over ``data`` (RFC 7518 §3), in this key's algorithm.
+
+        ES256 is the 64-byte R||S form JWS requires, not the DER the crypto
+        library returns. PS256 uses a salt as long as the SHA-256 digest
+        (RFC 7518 §3.5).
+        """
+        c = _crypto()
+        if self.alg == ALG_EDDSA:
+            return self._key.sign(data)
+        if self.alg == ALG_ES256:
+            r, s = c.decode_dss_signature(self._key.sign(data, c.ec.ECDSA(c.hashes.SHA256())))
+            return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        return self._key.sign(
+            data,
+            c.padding.PSS(mgf=c.padding.MGF1(c.hashes.SHA256()), salt_length=32),
+            c.hashes.SHA256(),
+        )
 
     def client_assertion(self, agent_id, audience, lifetime=_ASSERTION_LIFETIME):
         """Build and sign one RFC 7523 §2.2 client assertion.
@@ -701,7 +847,7 @@ class AgentKey:
             raise AuthFIError("audience is required to build a client assertion", status=400)
 
         now = int(time.time())
-        header = {"alg": "EdDSA", "typ": "JWT", "kid": self.key_id}
+        header = {"alg": self.alg, "typ": "JWT", "kid": self.key_id}
         claims = {
             "iss": agent_id,
             "sub": agent_id,
@@ -723,6 +869,54 @@ def _b64json(obj):
     return _b64encode(json.dumps(obj, separators=(",", ":")).encode("utf-8"))
 
 
+def _b64int(s):
+    """A base64url JWK integer member (RFC 7518 §2 Base64urlUInt) as an int."""
+    return int.from_bytes(_b64decode(s), "big")
+
+
+def _int_b64(n, length=None):
+    """An int as a base64url JWK member; ``length`` pads a fixed-size coordinate."""
+    size = length or max(1, (n.bit_length() + 7) // 8)
+    return _b64encode(n.to_bytes(size, "big"))
+
+
+def _rsa_private_from_jwk(c, jwk):
+    """An RSA private key from its JWK, recovering the primes when only n, e and d are given."""
+    n, e, d = _b64int(jwk["n"]), _b64int(jwk["e"]), _b64int(jwk["d"])
+    if all(jwk.get(m) for m in ("p", "q", "dp", "dq", "qi")):
+        p, q = _b64int(jwk["p"]), _b64int(jwk["q"])
+        dmp1, dmq1, iqmp = _b64int(jwk["dp"]), _b64int(jwk["dq"]), _b64int(jwk["qi"])
+    else:
+        p, q = c.rsa.rsa_recover_prime_factors(n, e, d)
+        dmp1, dmq1, iqmp = c.rsa.rsa_crt_dmp1(d, p), c.rsa.rsa_crt_dmq1(d, q), c.rsa.rsa_crt_iqmp(p, q)
+    return c.rsa.RSAPrivateNumbers(
+        p, q, d, dmp1, dmq1, iqmp, c.rsa.RSAPublicNumbers(e, n)
+    ).private_key()
+
+
+def _project_origin(platform_url):
+    """The project's origin from ``platform_url``, or a refusal saying what to pass.
+
+    Required, with no default: see :class:`AgentAuth`.
+    """
+    url = str(platform_url or "").strip().rstrip("/")
+    if not url:
+        raise AuthFIError(
+            "platform_url is required: pass your project's own address, for example "
+            "platform_url=\"https://acme.authfi.io\" (or set AUTHFI_PLATFORM_URL with "
+            "AgentAuth.from_env()). The agent is registered in that project, and no "
+            "other project can authenticate it.",
+            status=400,
+        )
+    if not url.startswith(("https://", "http://")):
+        raise AuthFIError(
+            "platform_url must be an address with its scheme, such as "
+            "https://acme.authfi.io, not %r" % (platform_url,),
+            status=400,
+        )
+    return url
+
+
 class AgentAuth:
     """Agent authentication against AuthFI, bootstrapped from discovery.
 
@@ -733,11 +927,17 @@ class AgentAuth:
         agent = AgentAuth(
             agent_id="agt_...",
             key=AgentKey.from_file("/run/secrets/agent.key", key_id="k1"),
+            platform_url="https://acme.authfi.io",   # your project's own address
             audience="https://api.acme.com",   # optional, RFC 8707 resource
         )
 
         if agent.can("send_email_external"):
             requests.post(url, headers=agent.auth_header(), json=body)
+
+    ``platform_url`` is required and has no default. An agent is registered in
+    ONE project, so the only address that can authenticate it is that project's
+    own (``https://<project>.authfi.io`` or its custom domain). A default would
+    send the agent's signed assertion to a project where it does not exist.
 
     Endpoints come from ``/.well-known/agent-configuration`` rather than being
     hard-coded: the token endpoint moves with the project's origin (a tenant
@@ -749,7 +949,7 @@ class AgentAuth:
         self,
         agent_id,
         key,
-        platform_url=DEFAULT_PLATFORM_URL,
+        platform_url=None,
         audience=None,
         token_endpoint=None,
         backchannel_endpoint=None,
@@ -768,7 +968,7 @@ class AgentAuth:
             )
         self.agent_id = str(agent_id).strip()
         self.key = key
-        self.platform_url = (platform_url or DEFAULT_PLATFORM_URL).rstrip("/")
+        self.platform_url = _project_origin(platform_url)
         self.audience = audience
         self.discovery_url = discovery_url or (
             self.platform_url + "/.well-known/agent-configuration"
@@ -797,7 +997,7 @@ class AgentAuth:
         ``AUTHFI_AGENT_KEY_FILE``       path to the private key — PREFERRED
         ``AUTHFI_AGENT_KID``            the registered ``kid``
         ``AUTHFI_AGENT_PRIVATE_KEY``    PEM inline — fallback, warns
-        ``AUTHFI_PLATFORM_URL``         defaults to https://platform.authfi.io
+        ``AUTHFI_PLATFORM_URL``         your project's address — REQUIRED
         ``AUTHFI_AGENT_AUDIENCE``       optional resource the token is for
         ==============================  ====================================
 
@@ -834,14 +1034,23 @@ class AgentAuth:
         else:
             raise AuthFIError(
                 "No agent key: set AUTHFI_AGENT_KEY_FILE to the path of the "
-                "agent's Ed25519 private key.",
+                "agent's private key.",
+                status=400,
+            )
+
+        platform_url = overrides.pop("platform_url", None) or os.environ.get("AUTHFI_PLATFORM_URL")
+        if not platform_url:
+            raise AuthFIError(
+                "AUTHFI_PLATFORM_URL is not set: set it to your project's own address, "
+                "for example https://acme.authfi.io. The agent is registered in that "
+                "project, and no other project can authenticate it.",
                 status=400,
             )
 
         kwargs = {
             "agent_id": agent_id,
             "key": key,
-            "platform_url": os.environ.get("AUTHFI_PLATFORM_URL", DEFAULT_PLATFORM_URL),
+            "platform_url": platform_url,
             "audience": os.environ.get("AUTHFI_AGENT_AUDIENCE"),
         }
         kwargs.update(overrides)
@@ -882,10 +1091,12 @@ class AgentAuth:
                 status=400,
             )
         algs = doc.get("token_endpoint_auth_signing_alg_values_supported") or doc.get("algorithms")
-        if algs and "EdDSA" not in algs:
+        if algs and self.key.alg not in algs:
+            # Said here, by name, rather than met as an opaque invalid_client.
             raise AuthFIError(
-                "This deployment does not accept EdDSA assertions (it advertises %s)."
-                % (", ".join(algs)),
+                "This agent's key signs %s, which this deployment does not accept "
+                "(it advertises %s). Use a key of an advertised type."
+                % (self.key.alg, ", ".join(algs)),
                 status=400,
             )
         self._discovery = doc

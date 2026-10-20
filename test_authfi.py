@@ -359,18 +359,21 @@ class TestB64Decode(unittest.TestCase):
 # Agent authentication
 # =============================================================================
 
+#: The project an agent is registered in. Every AgentAuth names it: there is no default.
+ORIGIN = "https://acme.authfi.io"
+
 DISCOVERY = {
-    "issuer": "https://platform.authfi.io",
+    "issuer": ORIGIN,
     "algorithms": ["EdDSA"],
     "grant_types_supported": ["client_credentials", CIBA_GRANT_TYPE],
     "token_endpoint_auth_methods_supported": ["private_key_jwt"],
     "token_endpoint_auth_signing_alg_values_supported": ["EdDSA"],
     "backchannel_authentication_endpoint":
-        "https://platform.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize",
+        ORIGIN + "/apis/regional/v1/ai/auth/backchannel-authorize",
     "endpoints": {
-        "token": "https://platform.authfi.io/apis/regional/v1/ai/auth/token",
+        "token": ORIGIN + "/apis/regional/v1/ai/auth/token",
         "backchannel_authorize":
-            "https://platform.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize",
+            ORIGIN + "/apis/regional/v1/ai/auth/backchannel-authorize",
     },
 }
 TOKEN_ENDPOINT = DISCOVERY["endpoints"]["token"]
@@ -433,17 +436,13 @@ class TestAgentKey(unittest.TestCase):
         self.assertIn("OPENSSH PRIVATE KEY", msg)
         self.assertIn("openssl genpkey -algorithm ed25519", msg)
 
-    def test_pem_refuses_a_non_ed25519_key(self):
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
+    def test_pem_refuses_a_key_type_the_platform_does_not_take(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
         with self.assertRaises(AuthFIError) as ctx:
-            AgentKey.from_pem(pem, "k1")
-        self.assertIn("Ed25519", str(ctx.exception))
+            AgentKey.from_pem(_pem(ec.generate_private_key(ec.SECP384R1())), "k1")
+        msg = str(ctx.exception)
+        self.assertIn("secp384r1", msg)
+        self.assertIn("P-256 (ES256)", msg)
 
     def test_jwk_round_trip_and_kid_from_the_jwk(self):
         key = AgentKey.generate("k1")
@@ -482,6 +481,152 @@ class TestAgentKey(unittest.TestCase):
                 AgentKey.from_file(empty, key_id="k1")
 
 
+def _pem(key, fmt="PKCS8"):
+    """A private key as unencrypted PEM: PKCS#8, or the type's own TraditionalOpenSSL form."""
+    from cryptography.hazmat.primitives import serialization
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        getattr(serialization.PrivateFormat, fmt),
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def _private_jwk(key):
+    """The private JWK of an AgentKey, built from its numbers the way another tool would write it."""
+    from authfi import _int_b64
+    jwk = dict(key.public_jwk())
+    nums = key._key.private_numbers()
+    if key.alg == "ES256":
+        jwk["d"] = _int_b64(nums.private_value, 32)
+    else:
+        jwk.update(d=_int_b64(nums.d), p=_int_b64(nums.p), q=_int_b64(nums.q),
+                   dp=_int_b64(nums.dmp1), dq=_int_b64(nums.dmq1), qi=_int_b64(nums.iqmp))
+    return jwk
+
+
+class TestAgentKeyTypes(unittest.TestCase):
+    """Ed25519, P-256 and RSA: the three key types the platform advertises and accepts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.keys = {alg: AgentKey.generate("k-" + alg, alg) for alg in ("EdDSA", "ES256", "PS256")}
+
+    def test_the_key_type_decides_the_algorithm(self):
+        shapes = {"EdDSA": ("OKP", "Ed25519"), "ES256": ("EC", "P-256"), "PS256": ("RSA", None)}
+        for alg, key in self.keys.items():
+            self.assertEqual(key.alg, alg)
+            jwk = key.public_jwk()
+            self.assertEqual((jwk["kty"], jwk.get("crv")), shapes[alg])
+            self.assertEqual(jwk["alg"], alg)
+            self.assertEqual(jwk["kid"], "k-" + alg)
+            for member in ("d", "p", "q", "dp", "dq", "qi"):
+                self.assertNotIn(member, jwk)
+        self.assertEqual(self.keys["PS256"]._key.key_size, 3072)
+        self.assertEqual(self.keys["PS256"].public_jwk()["e"], "AQAB")
+        # P-256 coordinates are fixed-width, even when the integer is shorter.
+        ec = self.keys["ES256"].public_jwk()
+        self.assertEqual((len(_b64decode(ec["x"])), len(_b64decode(ec["y"]))), (32, 32))
+
+    def test_the_assertion_verifies_under_an_independent_jose_implementation(self):
+        # PyJWT is a separate JOSE implementation: if it verifies the assertion
+        # with only the PUBLIC JWK, the signature encoding is right for that alg
+        # (ES256 as raw R||S, not DER; PS256 as RSASSA-PSS, not PKCS#1 v1.5).
+        import jwt
+        for alg, key in self.keys.items():
+            assertion = key.client_assertion("agt_123", TOKEN_ENDPOINT)
+            header = json.loads(_b64decode(assertion.split(".")[0]))
+            self.assertEqual(header["alg"], alg)
+            public = jwt.PyJWK(key.public_jwk(), algorithm=alg).key
+            claims = jwt.decode(assertion, public, algorithms=[alg], audience=TOKEN_ENDPOINT)
+            self.assertEqual(claims["sub"], "agt_123")
+            if alg == "ES256":
+                self.assertEqual(len(_b64decode(assertion.split(".")[2])), 64)
+
+    def test_a_tampered_assertion_does_not_verify_for_any_key_type(self):
+        import jwt
+        for alg, key in self.keys.items():
+            h, c, sig = key.client_assertion("agt_123", TOKEN_ENDPOINT).split(".")
+            forged = json.loads(_b64decode(c))
+            forged["sub"] = "agt_someone_else"
+            c2 = base64.urlsafe_b64encode(json.dumps(forged).encode()).rstrip(b"=").decode()
+            public = jwt.PyJWK(key.public_jwk(), algorithm=alg).key
+            with self.assertRaises(jwt.InvalidSignatureError):
+                jwt.decode("%s.%s.%s" % (h, c2, sig), public, algorithms=[alg], audience=TOKEN_ENDPOINT)
+
+    def test_pss_salt_is_the_digest_length(self):
+        # RFC 7518 §3.5. A verifier that pins the salt to 32 bytes accepts it.
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        key = self.keys["PS256"]
+        sig = key.sign(b"input")
+        key._key.public_key().verify(
+            sig, b"input", padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256()
+        )
+
+    def test_pem_round_trip_for_every_type(self):
+        for alg, key in self.keys.items():
+            reloaded = AgentKey.from_pem(key.private_pem(), key.key_id)
+            self.assertEqual(reloaded.alg, alg)
+            self.assertEqual(reloaded.public_jwk(), key.public_jwk())
+
+    def test_sec1_and_pkcs1_pem_load(self):
+        # What `openssl ecparam -genkey` and `openssl genrsa` write.
+        for alg, marker in (("ES256", "BEGIN EC PRIVATE KEY"), ("PS256", "BEGIN RSA PRIVATE KEY")):
+            pem = _pem(self.keys[alg]._key, "TraditionalOpenSSL")
+            self.assertIn(marker, pem)
+            self.assertEqual(AgentKey.from_pem(pem, "k1").public_jwk()["kty"],
+                             self.keys[alg].public_jwk()["kty"])
+
+    def test_private_jwk_round_trip_for_ec_and_rsa(self):
+        for alg in ("ES256", "PS256"):
+            key = self.keys[alg]
+            reloaded = AgentKey.from_jwk(_private_jwk(key))
+            self.assertEqual(reloaded.key_id, key.key_id)
+            self.assertEqual(reloaded.public_jwk(), key.public_jwk())
+
+    def test_an_rsa_jwk_with_only_n_e_d_loads(self):
+        jwk = _private_jwk(self.keys["PS256"])
+        for member in ("p", "q", "dp", "dq", "qi"):
+            jwk.pop(member)
+        self.assertEqual(AgentKey.from_jwk(jwk).public_jwk(), self.keys["PS256"].public_jwk())
+
+    def test_an_rsa_key_labelled_rs256_is_refused_locally(self):
+        jwk = dict(_private_jwk(self.keys["PS256"]), alg="RS256")
+        with self.assertRaises(AuthFIError) as ctx:
+            AgentKey.from_jwk(jwk)
+        msg = str(ctx.exception)
+        self.assertIn("alg=RS256", msg)
+        self.assertIn("signs PS256", msg)
+
+    def test_a_p384_key_is_refused_locally(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        with self.assertRaises(AuthFIError):
+            AgentKey(ec.generate_private_key(ec.SECP384R1()), "k1")
+        with self.assertRaises(AuthFIError) as ctx:
+            AgentKey.from_jwk({"kty": "EC", "crv": "P-384", "x": "AA", "y": "AA", "d": "AA"})
+        self.assertIn("EC/P-384", str(ctx.exception))
+
+    def test_an_ec_jwk_whose_d_is_not_its_point_is_refused(self):
+        jwk = _private_jwk(self.keys["ES256"])
+        jwk["d"] = _private_jwk(AgentKey.generate("k2", "ES256"))["d"]
+        with self.assertRaises(AuthFIError):
+            AgentKey.from_jwk(jwk)
+
+    def test_rsa_keys_the_platform_refuses_are_refused_locally(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        with self.assertRaises(AuthFIError) as ctx:
+            AgentKey(rsa.generate_private_key(public_exponent=65537, key_size=1024), "k1")
+        self.assertIn("1024 bits", str(ctx.exception))
+        with self.assertRaises(AuthFIError) as ctx:
+            AgentKey(rsa.generate_private_key(public_exponent=3, key_size=2048), "k1")
+        self.assertIn("65537", str(ctx.exception))
+
+    def test_generate_refuses_an_algorithm_it_cannot_make(self):
+        for alg in ("RS256", "ES384", None):
+            with self.assertRaises(AuthFIError):
+                AgentKey.generate("k1", alg)
+
+
 class TestPublicJWKRefusal(unittest.TestCase):
     def test_a_jwk_carrying_d_is_refused_as_burned(self):
         # Not stripped and carried on from: the key was sent, so it is gone.
@@ -493,11 +638,40 @@ class TestPublicJWKRefusal(unittest.TestCase):
 
     def test_wrong_curve_is_refused(self):
         with self.assertRaises(AuthFIError):
-            assert_public_jwk({"kty": "EC", "crv": "P-256", "x": "AA"})
+            assert_public_jwk({"kty": "EC", "crv": "P-384", "x": "AA", "y": "AA"})
+
+    def test_an_rsa_private_member_is_refused_as_burned_too(self):
+        jwk = dict(AgentKey.generate("k1", "PS256").public_jwk(), p="secret")
+        with self.assertRaises(AuthFIError) as ctx:
+            assert_public_jwk(jwk)
+        self.assertIn("'p'", str(ctx.exception))
+
+    def test_an_ec_key_without_y_has_no_public_key(self):
+        jwk = AgentKey.generate("k1", "ES256").public_jwk()
+        jwk.pop("y")
+        with self.assertRaises(AuthFIError) as ctx:
+            assert_public_jwk(jwk)
+        self.assertIn("'y'", str(ctx.exception))
+
+    def test_a_key_labelled_with_another_algorithm_is_refused(self):
+        jwk = dict(AgentKey.generate("k1", "PS256").public_jwk(), alg="RS256")
+        with self.assertRaises(AuthFIError) as ctx:
+            assert_public_jwk(jwk)
+        self.assertIn("RS256", str(ctx.exception))
+        self.assertIn("PS256", str(ctx.exception))
+
+    def test_an_rsa_key_outside_the_accepted_sizes_is_refused(self):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from authfi import _int_b64
+        small = rsa.generate_private_key(public_exponent=65537, key_size=1024).public_key()
+        with self.assertRaises(AuthFIError) as ctx:
+            assert_public_jwk({"kty": "RSA", "n": _int_b64(small.public_numbers().n), "e": "AQAB"})
+        self.assertIn("1024 bits", str(ctx.exception))
 
     def test_public_jwk_passes(self):
-        jwk = AgentKey.generate("k1").public_jwk()
-        self.assertIs(assert_public_jwk(jwk), jwk)
+        for alg in ("EdDSA", "ES256", "PS256"):
+            jwk = AgentKey.generate("k1", alg).public_jwk()
+            self.assertIs(assert_public_jwk(jwk), jwk)
 
 
 class TestClientAssertion(unittest.TestCase):
@@ -574,24 +748,40 @@ class TestAgentAuthConstruction(unittest.TestCase):
         # credential from the agent's stored record, so a client that offered a
         # fallback would be offering a downgrade.
         with self.assertRaises(AuthFIError) as ctx:
-            AgentAuth(agent_id="agt_1", key="a-client-secret")
+            AgentAuth(agent_id="agt_1", key="a-client-secret", platform_url=ORIGIN)
         self.assertIn("AgentKey", str(ctx.exception))
         self.assertNotIn("client_secret", AgentAuth.__init__.__code__.co_varnames)
 
     def test_requires_an_agent_id(self):
         with self.assertRaises(AuthFIError):
-            AgentAuth(agent_id="", key=AgentKey.generate("k1"))
+            AgentAuth(agent_id="", key=AgentKey.generate("k1"), platform_url=ORIGIN)
 
-    def test_discovery_url_defaults_to_the_platform(self):
-        a = AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"))
-        self.assertEqual(
-            a.discovery_url, "https://platform.authfi.io/.well-known/agent-configuration"
-        )
+    def test_the_project_address_is_required_and_has_no_default(self):
+        # A default sent the agent's signed assertion to platform.authfi.io, a
+        # project the agent is not registered in, where it was refused.
+        for missing in (None, "", "   "):
+            with self.assertRaises(AuthFIError) as ctx:
+                AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=missing)
+            self.assertIn("platform_url is required", str(ctx.exception))
+        with self.assertRaises(AuthFIError):
+            AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"))
+        import authfi
+        self.assertFalse(hasattr(authfi, "DEFAULT_PLATFORM_URL"))
+
+    def test_an_address_without_a_scheme_is_refused(self):
+        with self.assertRaises(AuthFIError) as ctx:
+            AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url="acme.authfi.io")
+        self.assertIn("https://acme.authfi.io", str(ctx.exception))
+
+    def test_discovery_is_read_from_the_project(self):
+        a = AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN + "/")
+        self.assertEqual(a.platform_url, ORIGIN)
+        self.assertEqual(a.discovery_url, ORIGIN + "/.well-known/agent-configuration")
 
 
 class TestAgentDiscovery(unittest.TestCase):
-    def _agent(self):
-        return AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"))
+    def _agent(self, alg="EdDSA"):
+        return AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1", alg), platform_url=ORIGIN)
 
     @patch("authfi.urlopen")
     def test_endpoints_come_from_discovery_and_are_fetched_once(self, mock_urlopen):
@@ -618,6 +808,18 @@ class TestAgentDiscovery(unittest.TestCase):
         self.assertIn("EdDSA", str(ctx.exception))
 
     @patch("authfi.urlopen")
+    def test_the_advertised_list_is_checked_for_the_keys_own_algorithm(self, mock_urlopen):
+        # The check used to be "EdDSA is advertised", whatever the key was.
+        doc = dict(DISCOVERY, token_endpoint_auth_signing_alg_values_supported=["EdDSA", "ES256"])
+        mock_urlopen.return_value = _response(doc)
+        self.assertEqual(self._agent("ES256").token_endpoint, TOKEN_ENDPOINT)
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent("PS256").token_endpoint
+        msg = str(ctx.exception)
+        self.assertIn("PS256", msg)
+        self.assertIn("EdDSA, ES256", msg)
+
+    @patch("authfi.urlopen")
     def test_no_ciba_says_so_rather_than_guessing_a_url(self, mock_urlopen):
         doc = dict(DISCOVERY)
         doc.pop("backchannel_authentication_endpoint")
@@ -629,7 +831,8 @@ class TestAgentDiscovery(unittest.TestCase):
 
     def test_an_explicit_token_endpoint_skips_discovery(self):
         a = AgentAuth(
-            agent_id="agt_1", key=AgentKey.generate("k1"), token_endpoint=TOKEN_ENDPOINT
+            agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN,
+            token_endpoint=TOKEN_ENDPOINT,
         )
         with patch("authfi.urlopen") as mock_urlopen:
             self.assertEqual(a.token_endpoint, TOKEN_ENDPOINT)
@@ -651,6 +854,7 @@ class TestAgentToken(unittest.TestCase):
         return AgentAuth(
             agent_id="agt_1",
             key=AgentKey.generate("k1"),
+            platform_url=ORIGIN,
             token_endpoint=TOKEN_ENDPOINT,
             **kw
         )
@@ -691,7 +895,7 @@ class TestAgentToken(unittest.TestCase):
     def test_discovery_names_this_client_too(self, mock_urlopen):
         from authfi import USER_AGENT
         mock_urlopen.return_value = _response(DISCOVERY)
-        AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1")).discovery()
+        AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN).discovery()
         self.assertEqual(
             mock_urlopen.call_args[0][0].get_header("User-agent"), USER_AGENT
         )
@@ -772,6 +976,7 @@ class TestAgentCIBA(unittest.TestCase):
         return AgentAuth(
             agent_id="agt_1",
             key=AgentKey.generate("k1"),
+            platform_url=ORIGIN,
             token_endpoint=TOKEN_ENDPOINT,
             backchannel_endpoint=DISCOVERY["backchannel_authentication_endpoint"],
         )
@@ -903,6 +1108,7 @@ class TestAgentFromEnv(unittest.TestCase):
             os.environ["AUTHFI_AGENT_ID"] = "agt_1"
             os.environ["AUTHFI_AGENT_KEY_FILE"] = path
             os.environ["AUTHFI_AGENT_KID"] = "k1"
+            os.environ["AUTHFI_PLATFORM_URL"] = ORIGIN
             os.environ["AUTHFI_AGENT_AUDIENCE"] = "https://api.acme.com"
             a = AgentAuth.from_env()
             self.assertEqual(a.agent_id, "agt_1")
@@ -915,6 +1121,7 @@ class TestAgentFromEnv(unittest.TestCase):
         os.environ["AUTHFI_AGENT_ID"] = "agt_1"
         os.environ["AUTHFI_AGENT_PRIVATE_KEY"] = AgentKey.generate("k1").private_pem()
         os.environ["AUTHFI_AGENT_KID"] = "k1"
+        os.environ["AUTHFI_PLATFORM_URL"] = ORIGIN
         with self.assertWarns(UserWarning):
             AgentAuth.from_env()
 
@@ -929,6 +1136,7 @@ class TestAgentFromEnv(unittest.TestCase):
             os.environ["AUTHFI_AGENT_KEY_FILE"] = path
             os.environ["AUTHFI_AGENT_PRIVATE_KEY"] = env_key.private_pem()
             os.environ["AUTHFI_AGENT_KID"] = "k1"
+            os.environ["AUTHFI_PLATFORM_URL"] = ORIGIN
             with self.assertWarns(UserWarning):
                 a = AgentAuth.from_env()
             self.assertEqual(a.key.public_jwk(), file_key.public_jwk())
@@ -942,6 +1150,22 @@ class TestAgentFromEnv(unittest.TestCase):
         with self.assertRaises(AuthFIError) as ctx:
             AgentAuth.from_env()
         self.assertIn("AUTHFI_AGENT_KEY_FILE", str(ctx.exception))
+
+    def test_the_project_address_is_required_from_the_environment_too(self):
+        os.environ["AUTHFI_AGENT_ID"] = "agt_1"
+        os.environ["AUTHFI_AGENT_PRIVATE_KEY"] = AgentKey.generate("k1").private_pem()
+        os.environ["AUTHFI_AGENT_KID"] = "k1"
+        with self.assertWarns(UserWarning):
+            with self.assertRaises(AuthFIError) as ctx:
+                AgentAuth.from_env()
+        self.assertIn("AUTHFI_PLATFORM_URL is not set", str(ctx.exception))
+        # An override counts as setting it.
+        with self.assertWarns(UserWarning):
+            a = AgentAuth.from_env(platform_url=ORIGIN)
+        self.assertEqual(a.platform_url, ORIGIN)
+        os.environ["AUTHFI_PLATFORM_URL"] = "https://other.authfi.io"
+        with self.assertWarns(UserWarning):
+            self.assertEqual(AgentAuth.from_env(platform_url=ORIGIN).platform_url, ORIGIN)
 
 
 if __name__ == "__main__":
