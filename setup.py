@@ -36,6 +36,9 @@ setup(
         # approvals through interrupt().
         "langgraph": ["langchain-anthropic>=1.0", "langsmith>=0.4", "langgraph>=1.0",
                       "langchain-mcp-adapters>=0.2", "httpx>=0.23"],
+        # authfi.openai_agents: tracing without the token or content, LiteLLM on
+        # the AI gateway, governed MCP tools and approvals.
+        "openai-agents": ["openai-agents[litellm]>=0.24", "httpx>=0.23"],
     },
     author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",

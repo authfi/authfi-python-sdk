@@ -294,6 +294,49 @@ Building your own graph: add `gateway.approval_node` as a node, route from your 
 `route_after_tools`, and use `AuthFIState` (or add its `authfi_holds` field to your state).
 A complete agent is in [examples/langgraph](examples/langgraph/agent.py).
 
+### OpenAI Agents SDK
+
+```bash
+pip install 'authfi[openai-agents]'
+```
+
+```python
+from agents import Agent, Runner
+from authfi import AgentAuth, AsyncAgentAuth
+from authfi.openai_agents import AuthFIMCPServer, AuthFIModel, configure_tracing, run_config
+
+configure_tracing()                       # first, before any run
+agent_auth = AsyncAgentAuth(AgentAuth.from_env())
+async with AuthFIMCPServer(agent_auth) as tools:
+    agent = Agent(name="research", model=AuthFIModel(agent_auth, "claude-haiku-5-5"), mcp_servers=[tools])
+    result = await Runner.run(agent, "Describe the wiki of pallets/flask", run_config=run_config(agent_auth))
+    while result.interruptions:           # a call waits for a person's approval
+        state = result.to_state()
+        for item in result.interruptions:
+            held = tools.approval_for(item)   # {"approval_id", "tool", "args"}
+            ...                               # once they have decided:
+            state.approve(item)
+        result = await Runner.run(agent, state, run_config=run_config(agent_auth))
+```
+
+- **Tracing.** The SDK's default exporter sends traces to OpenAI with the OpenAI key, and records
+  prompts, answers and tool results. `configure_tracing()` removes it and keeps content out of
+  spans. Pass your own processors (`configure_tracing([processor])`) to trace somewhere; each is
+  wrapped so prompts and tool inputs and outputs are removed before it sees a span.
+  `capture_content=True` keeps them. Never set the AuthFI token as `OPENAI_API_KEY` or with
+  `set_default_openai_key`: nothing here needs it.
+- **Model.** `AuthFIModel` is LiteLLM on your project's AI gateway, sending the current token as
+  `Authorization: Bearer` on each call and the trace id as `X-Request-Id`.
+- **Tools.** `AuthFIMCPServer` reaches your project's MCP gateway with the current token, offers
+  provider-legal names, leaves out `never_allowed` tools, and hands a refused call to the model
+  as the tool's error naming why. Each tool call sends its span id as `X-Request-Id`.
+- **Approvals.** The SDK decides approval before a call; the gateway decides when it arrives. A
+  held call is answered to the model as waiting, and its repeat pauses the run as a
+  `ToolApprovalItem`. Approve it once the person has decided: the call is sent with the approval
+  id and the gateway says whether it runs.
+
+A complete agent is in [examples/openai-agents](examples/openai-agents/agent.py).
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)
