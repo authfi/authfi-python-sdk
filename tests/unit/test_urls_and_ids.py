@@ -47,7 +47,9 @@ def test_an_issuer_is_refused_naming_the_fix(value: str, says: str) -> None:
 
 def test_loopback() -> None:
     assert is_loopback("localhost")
-    assert is_loopback("127.0.0.5")
+    assert is_loopback("127.0.0.1")
+    assert not is_loopback("127.0.0.5")
+    assert not is_loopback("127.255.255.254")
     assert is_loopback("[::1]")
     assert not is_loopback("10.0.0.1")
     assert not is_loopback("localhost.example.com")

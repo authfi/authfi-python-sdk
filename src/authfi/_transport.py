@@ -92,6 +92,12 @@ def _check_scheme(url: str) -> None:
     raise ConfigurationError(f"refusing to send a request to {origin_of(url)}: only https, or http to loopback")
 
 
+def _form_of(request: HttpRequest, attempt: Attempt) -> dict[str, str] | None:
+    if request.form is None and not attempt.form:
+        return None
+    return {**(request.form or {}), **attempt.form}
+
+
 def _failure_of(exc: httpx.TransportError) -> Failure:
     if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
         return Failure.NOT_SENT
@@ -150,13 +156,14 @@ class _Base:
     def _build(
         self, client: httpx.Client | httpx.AsyncClient, request: HttpRequest, rid: str, deadline: float
     ) -> httpx.Request:
+        # No local here names the form or the headers: an error reporter that captures frame locals
+        # would record the client secret, refresh token and assertion they carry.
         attempt = request.per_attempt() if request.per_attempt is not None else Attempt()
-        form = {**(request.form or {}), **attempt.form} if (request.form is not None or attempt.form) else None
         return client.build_request(
             request.method,
             request.url,
             headers=self._headers(request, attempt, rid),
-            data=form,
+            data=_form_of(request, attempt),
             json=request.json_body,
             timeout=self._httpx_timeout(deadline),
         )
@@ -217,6 +224,23 @@ class _Base:
                 request_id=rid,
             )
         return self._diagnose(sent, response)
+
+    @staticmethod
+    def _read_timeout(request: HttpRequest, rid: str) -> TransportError:
+        return TransportError(
+            f"{request.what} at {origin_of(request.url)} did not finish its answer within the deadline",
+            code="timeout",
+            request_id=rid,
+        )
+
+    @staticmethod
+    def _undecodable(request: HttpRequest, rid: str, exc: httpx.DecodingError) -> TransportError:
+        return TransportError(
+            f"{request.what} at {origin_of(request.url)} answered a body that could not be decoded: "
+            f"{type(exc).__name__}",
+            code="response_invalid",
+            request_id=rid,
+        )
 
     @staticmethod
     def _too_large(request: HttpRequest, rid: str) -> TransportError:
@@ -282,7 +306,7 @@ class SyncTransport(_Base):
                 attempt += 1
                 continue
             try:
-                body = self._read(raw, request, rid)
+                body = self._read(raw, request, rid, deadline)
             finally:
                 raw.close()
             response = self._answer(sent, raw, body, rid)
@@ -295,7 +319,7 @@ class SyncTransport(_Base):
             self.clock.sleep(delay)
             attempt += 1
 
-    def _read(self, raw: httpx.Response, request: HttpRequest, rid: str) -> bytes:
+    def _read(self, raw: httpx.Response, request: HttpRequest, rid: str, deadline: float) -> bytes:
         declared = raw.headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > request.max_bytes:
             raise self._too_large(request, rid)
@@ -307,6 +331,10 @@ class SyncTransport(_Base):
                 if size > request.max_bytes:
                     raise self._too_large(request, rid)
                 chunks.append(chunk)
+                if self.clock.monotonic() >= deadline:
+                    raise self._read_timeout(request, rid)
+        except httpx.DecodingError as exc:
+            raise self._undecodable(request, rid, exc) from exc
         except httpx.TransportError as exc:
             raise _transport_error(exc, request, rid, False) from exc
         return b"".join(chunks)
@@ -402,7 +430,7 @@ class AsyncTransport(_Base):
                 attempt += 1
                 continue
             try:
-                body = await self._read(raw, request, rid)
+                body = await self._read(raw, request, rid, deadline)
             finally:
                 await raw.aclose()
             response = self._answer(sent, raw, body, rid)
@@ -413,18 +441,25 @@ class AsyncTransport(_Base):
             await self.clock.asleep(delay)
             attempt += 1
 
-    async def _read(self, raw: httpx.Response, request: HttpRequest, rid: str) -> bytes:
+    async def _read(self, raw: httpx.Response, request: HttpRequest, rid: str, deadline: float) -> bytes:
         declared = raw.headers.get("content-length")
         if declared is not None and declared.isdigit() and int(declared) > request.max_bytes:
             raise self._too_large(request, rid)
         chunks: list[bytes] = []
         size = 0
         try:
-            async for chunk in raw.aiter_bytes():
-                size += len(chunk)
-                if size > request.max_bytes:
-                    raise self._too_large(request, rid)
-                chunks.append(chunk)
+            async with asyncio.timeout(max(0.0, deadline - self.clock.monotonic())):
+                async for chunk in raw.aiter_bytes():
+                    size += len(chunk)
+                    if size > request.max_bytes:
+                        raise self._too_large(request, rid)
+                    chunks.append(chunk)
+                    if self.clock.monotonic() >= deadline:
+                        raise self._read_timeout(request, rid)
+        except TimeoutError as exc:
+            raise self._read_timeout(request, rid) from exc
+        except httpx.DecodingError as exc:
+            raise self._undecodable(request, rid, exc) from exc
         except httpx.TransportError as exc:
             raise _transport_error(exc, request, rid, False) from exc
         return b"".join(chunks)

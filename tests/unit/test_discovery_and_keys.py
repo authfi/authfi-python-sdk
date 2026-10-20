@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-from jwt.algorithms import RSAAlgorithm
+from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
 
 from authfi import AsyncAuthFI, AuthFI, DiscoveryError
 from authfi._protocol.discovery import parse_metadata, ttl_from_headers
@@ -152,6 +152,36 @@ def test_the_api_origin_comes_from_discovery_for_a_custom_domain(clock: FakeCloc
     assert pinned.api_origin == "https://api.acme.com"
 
 
+def test_resolve_api_origin_reads_discovery_first_and_a_pinned_origin_needs_none(clock: FakeClock) -> None:
+    platform = Platform(issuer="https://login.acme.com")
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    af = AuthFI(platform.issuer, http_client=platform.client(), clock=clock)
+    assert af.api_origin == "https://login.acme.com"
+    assert af.resolve_api_origin() == "https://acme.authfi.io"
+
+    pinned_platform = Platform(issuer="https://login.acme.com")
+    pinned = AuthFI(
+        pinned_platform.issuer,
+        api_origin="https://api.acme.com",
+        http_client=pinned_platform.client(),
+        clock=clock,
+    )
+    assert pinned.resolve_api_origin() == "https://api.acme.com"
+    assert not pinned_platform.requests
+
+
+async def test_resolve_api_origin_reads_discovery_first_async(clock: FakeClock) -> None:
+    platform = Platform(issuer="https://login.acme.com")
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as af:
+        assert af.api_origin == "https://login.acme.com"
+        assert await af.resolve_api_origin() == "https://acme.authfi.io"
+
+
 def jwks_with(*extra: dict[str, Any]) -> dict[str, Any]:
     return {"keys": [*shared_keys().jwks()["keys"], *extra]}
 
@@ -177,6 +207,18 @@ def test_unusable_keys_are_left_out() -> None:
     assert len(keys) == 3
 
 
+def test_a_published_private_key_is_refused_not_used(caplog: pytest.LogCaptureFixture) -> None:
+    """A key set that leaks a private key must not be trusted, even though the key would verify."""
+    keys = shared_keys()
+    private_rsa = dict(json.loads(RSAAlgorithm.to_jwk(keys.rsa_key)), kid="leaked-rsa", alg="RS256", use="sig")
+    private_ed = dict(json.loads(OKPAlgorithm.to_jwk(keys.ed_key)), kid="leaked-ed", alg="EdDSA", use="sig")
+    private_ec = dict(json.loads(ECAlgorithm.to_jwk(keys.ec_key)), kid="leaked-ec", alg="ES256", use="sig")
+    with caplog.at_level("ERROR", logger="authfi"):
+        loaded = parse_jwks({"keys": [private_rsa, private_ed, private_ec, keys.jwk("RS256")]}, "test")
+    assert set(loaded.keys) == {"rsa-1"}
+    assert "private member" in caplog.text
+
+
 def test_the_live_key_set_has_an_okp_and_an_rsa_key() -> None:
     keys = parse_jwks(fixture_json("platform-beta/jwks.json"), "platform-beta")
     assert {k.alg for k in keys.keys.values()} == {"EdDSA", "RS256"}
@@ -199,6 +241,37 @@ def test_an_unknown_kid_refetches_once_per_30_seconds(af: AuthFI, platform: Plat
     clock.advance(31)
     af._key("still-nope")
     assert len(platform.calls("GET", "/.well-known/jwks.json")) == 3
+
+
+def test_a_failing_key_set_is_not_hit_once_per_forged_token(platform: Platform, clock: FakeClock) -> None:
+    """The 30 s limit counts attempts: a key set that answers 500 gets one, not one per token."""
+    af = AuthFI(platform.issuer, http_client=platform.client(), clock=clock, retries=0)
+    assert af._key("rsa-1") is not None
+    clock.advance(31)
+    platform.route("GET", "/.well-known/jwks.json", json_response({"error": "down"}, status=500))
+    before = len(platform.calls("GET", "/.well-known/jwks.json"))
+    with pytest.raises(DiscoveryError):
+        af._key("invented-0")
+    for n in range(1, 6):
+        assert af._key(f"invented-{n}") is None
+    assert len(platform.calls("GET", "/.well-known/jwks.json")) == before + 1
+    clock.advance(31)
+    with pytest.raises(DiscoveryError):
+        af._key("invented-later")
+    assert len(platform.calls("GET", "/.well-known/jwks.json")) == before + 2
+
+
+async def test_a_failing_key_set_is_not_hit_once_per_forged_token_async(platform: Platform, clock: FakeClock) -> None:
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock, retries=0) as af:
+        assert await af._key("rsa-1") is not None
+        clock.advance(31)
+        platform.route("GET", "/.well-known/jwks.json", json_response({"error": "down"}, status=500))
+        before = len(platform.calls("GET", "/.well-known/jwks.json"))
+        with pytest.raises(DiscoveryError):
+            await af._key("invented-0")
+        for n in range(1, 6):
+            assert await af._key(f"invented-{n}") is None
+        assert len(platform.calls("GET", "/.well-known/jwks.json")) == before + 1
 
 
 def test_a_rotated_key_is_found_by_the_refetch(af: AuthFI, platform: Platform, clock: FakeClock) -> None:

@@ -16,6 +16,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   repeating a request is safe; a refusal is never retried.
 - `X-Request-Id`, `traceparent` and a named `User-Agent` on every request; the platform's
   request id on every error.
+- `resolve_api_origin()` on both clients, for building a machine-API URL on a project with a custom domain.
 - Typed errors with stable codes (`AuthFIError.code`), including the platform's token refusal
   codes, generated from the AuthFI kernel.
 - `Secret`, which does not print, pickle or serialise a credential.
