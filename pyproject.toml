@@ -73,6 +73,8 @@ dev = [
     "ruff>=0.9,<1",
     "fastapi>=0.115,<1",
     "flask>=3.0,<4",
+    "anthropic>=1.0,<2",
+    "openai>=3.0,<4",
 ]
 
 [tool.pytest.ini_options]

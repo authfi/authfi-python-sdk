@@ -64,6 +64,7 @@ from authfi.errors import (
     NotSupportedError,
     WaitTimeout,
 )
+from authfi.gateway import AsyncGateway, Gateway
 from authfi.secret import Secret
 from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
 from authfi.verify import Principal
@@ -357,7 +358,7 @@ class DelegatedToken(TokenSource):
     It does not print its token and does not pickle: a checkpoint stores an id, never a token.
     """
 
-    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "subject", "via")
+    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "project", "subject", "via")
 
     def __init__(
         self,
@@ -369,7 +370,10 @@ class DelegatedToken(TokenSource):
         renew: Callable[[], TokenResponse] | None,
         refresh_skew: float,
         time: Callable[[], float],
+        project: Any = None,
     ) -> None:
+        #: The project that issued the token: what the gateway helpers and adapters attach to.
+        self.project = project
         self.via: Literal["ciba", "exchange"] = via
         self._renew = renew
         self._skew = refresh_skew
@@ -438,7 +442,7 @@ class DelegatedToken(TokenSource):
 class AsyncDelegatedToken(AsyncTokenSource):
     """See :class:`DelegatedToken`; for asyncio code."""
 
-    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "subject", "via")
+    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "project", "subject", "via")
 
     def __init__(
         self,
@@ -450,7 +454,10 @@ class AsyncDelegatedToken(AsyncTokenSource):
         renew: Callable[[], Awaitable[TokenResponse]] | None,
         refresh_skew: float,
         time: Callable[[], float],
+        project: Any = None,
     ) -> None:
+        #: The project that issued the token: what the gateway helpers and adapters attach to.
+        self.project = project
         self.via: Literal["ciba", "exchange"] = via
         self._renew = renew
         self._skew = refresh_skew
@@ -595,6 +602,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         self.project = project
         self._tokens: SyncCache[_Minted] = SyncCache(project.clock, max_entries=32)
         self._endpoints: SyncCache[AgentEndpoints] = SyncCache(project.clock, max_entries=1)
+        self._gateway = Gateway(project, self)
 
     def _send(self, request: HttpRequest) -> HttpResponse:
         return self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
@@ -744,6 +752,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             renew=None,
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
+            project=self.project,
         )
 
     def token_as_user(
@@ -803,9 +812,20 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             renew=mint,
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
+            project=self.project,
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
+
+    # --- the gateways --------------------------------------------------------------------------------
+
+    def gateway(self) -> Gateway:
+        """The AuthFI gateways (MCP tools, models, cloud credentials) with this agent's own token.
+
+        One per agent: every call returns the same object, so its HTTP clients are made once and
+        closed with the project.
+        """
+        return self._gateway
 
     # --- the action gate -----------------------------------------------------------------------------
 
@@ -938,6 +958,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         self.project = project
         self._tokens: AsyncCache[_Minted] = AsyncCache(project.clock, max_entries=32)
         self._endpoints: AsyncCache[AgentEndpoints] = AsyncCache(project.clock, max_entries=1)
+        self._gateway = AsyncGateway(project, self)
 
     async def _send(self, request: HttpRequest) -> HttpResponse:
         return await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
@@ -1028,6 +1049,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             renew=None,
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
+            project=self.project,
         )
 
     async def token_as_user(
@@ -1087,9 +1109,14 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             renew=mint,
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
+            project=self.project,
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
+
+    def gateway(self) -> AsyncGateway:
+        """See :meth:`AgentAuth.gateway`."""
+        return self._gateway
 
     async def transaction_token(
         self,

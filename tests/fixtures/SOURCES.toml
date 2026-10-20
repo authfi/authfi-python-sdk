@@ -21,3 +21,18 @@ commit = "agent-identity 33a69ec"
 observed = "GET https://platform-beta.authfi.io/.well-known/oauth-protected-resource, 2026-10-20"
 file = "authfi-regional-mcp resource metadata (RFC 9728)"
 commit = "mcp 3617565"
+
+["mcp/refusal-result.json"]
+observed = "the shape refusal() builds for a refused tools/call (code, error, reason, required_scope in _meta)"
+file = "authfi-regional-mcp internal/http/mcp/dispatch.go refusal()"
+commit = "mcp 3617565"
+
+["mcp/hold-result.json"]
+observed = "the text the gateway answers for a held tools/call (DecisionApprovalRequired)"
+file = "authfi-regional-mcp internal/http/mcp/dispatch.go, the approval_required case (lines 108-121)"
+commit = "mcp 3617565"
+
+["mcp/tools-list.json"]
+observed = "a tools/list entry with the governance annotation and the scope _meta"
+file = "authfi-regional-mcp internal/http/mcp/controller.go mcpTool, metaScopeKey"
+commit = "mcp 3617565"

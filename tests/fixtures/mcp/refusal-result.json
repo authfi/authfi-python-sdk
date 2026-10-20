@@ -1,0 +1,17 @@
+{
+  "content": [
+    {
+      "text": "Refused (insufficient_scope, ETOOL003): no grant lets this agent call deepwiki__ask_question. The call needs the scope mcp:deepwiki.ask_question.",
+      "type": "text"
+    }
+  ],
+  "isError": true,
+  "_meta": {
+    "io.authfi/refusal": {
+      "code": "ETOOL003",
+      "error": "insufficient_scope",
+      "reason": "no grant lets this agent call deepwiki__ask_question",
+      "required_scope": "mcp:deepwiki.ask_question"
+    }
+  }
+}

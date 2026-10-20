@@ -1,0 +1,9 @@
+{
+  "content": [
+    {
+      "text": "Waiting for approval 7f1c2a9e-5d1b-4f3a-9a77-2b0c8e1d4f00 (approval_required). A person must approve this action in the AuthFI console. Retry this call with an argument \"_authfi_approval_id\": \"7f1c2a9e-5d1b-4f3a-9a77-2b0c8e1d4f00\" once it is approved.",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}

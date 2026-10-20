@@ -56,6 +56,18 @@ from authfi.errors import (
     WaitTimeout,
     WebhookVerificationError,
 )
+from authfi.gateway import (
+    APPROVAL_ARGUMENT,
+    HOLD_MESSAGE,
+    AsyncGateway,
+    CloudCredential,
+    CloudCredentialOutcome,
+    Gateway,
+    ToolAllowed,
+    ToolApprovalRequired,
+    ToolOutcome,
+    ToolRefused,
+)
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
 from authfi.tokens import (
@@ -99,8 +111,10 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "APPROVAL_ARGUMENT",
     "CIBA_GRANT_TYPE",
     "CLIENT_ASSERTION_TYPE",
+    "HOLD_MESSAGE",
     "USER_AGENT",
     "APIError",
     "AccessToken",
@@ -112,6 +126,7 @@ __all__ = [
     "AsyncAuthFI",
     "AsyncClientCredentials",
     "AsyncDelegatedToken",
+    "AsyncGateway",
     "AsyncInMemoryTokenStore",
     "AsyncMultiIssuerVerifier",
     "AsyncTokenSource",
@@ -125,11 +140,14 @@ __all__ = [
     "CheckResult",
     "CibaRequest",
     "ClientCredentials",
+    "CloudCredential",
+    "CloudCredentialOutcome",
     "ConfigurationError",
     "ConsentDenied",
     "ConsentExpired",
     "DelegatedToken",
     "DiscoveryError",
+    "Gateway",
     "GatewayTokenRefused",
     "InMemoryTokenStore",
     "InsufficientAuthentication",
@@ -152,6 +170,10 @@ __all__ = [
     "TokenSource",
     "TokenStore",
     "TokenVerifier",
+    "ToolAllowed",
+    "ToolApprovalRequired",
+    "ToolOutcome",
+    "ToolRefused",
     "TransactionToken",
     "TransportError",
     "WaitTimeout",

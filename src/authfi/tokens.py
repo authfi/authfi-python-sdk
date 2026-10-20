@@ -18,7 +18,8 @@ import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, ClassVar, Literal, NoReturn, Protocol, runtime_checkable
+from types import ModuleType
+from typing import Any, ClassVar, Literal, NoReturn, Protocol, overload, runtime_checkable
 
 import httpx
 
@@ -124,9 +125,21 @@ class TokenSource(abc.ABC):
         check_destination(url, self.send_to)
         return {"Authorization": "Bearer " + self.token()}
 
-    def httpx_auth(self) -> httpx.Auth:
-        """An ``httpx.Auth`` for ``httpx.Client``: a current credential on every request, origin-checked."""
-        return _SyncSourceAuth(self)
+    @overload
+    def httpx_auth(self) -> httpx.Auth: ...
+
+    @overload
+    def httpx_auth(self, module: ModuleType) -> Any: ...
+
+    def httpx_auth(self, module: ModuleType | None = None) -> Any:
+        """An ``httpx.Auth`` for ``httpx.Client``: a current credential on every request, origin-checked.
+
+        ``module`` is the httpx package the client comes from: ``httpx`` by default, or ``httpx2``,
+        which newer provider SDKs (``anthropic``, ``openai``) are built on.
+        """
+        if module is None or module is httpx:
+            return _SyncSourceAuth(self)
+        return _auth_class(module, blocking=True)(self)
 
 
 class AsyncTokenSource(abc.ABC):
@@ -150,9 +163,20 @@ class AsyncTokenSource(abc.ABC):
         check_destination(url, self.send_to)
         return {"Authorization": "Bearer " + await self.token()}
 
-    def httpx_auth(self) -> httpx.Auth:
-        """An ``httpx.Auth`` for ``httpx.AsyncClient``: a current credential on every request, origin-checked."""
-        return _AsyncSourceAuth(self)
+    @overload
+    def httpx_auth(self) -> httpx.Auth: ...
+
+    @overload
+    def httpx_auth(self, module: ModuleType) -> Any: ...
+
+    def httpx_auth(self, module: ModuleType | None = None) -> Any:
+        """An ``httpx.Auth`` for ``httpx.AsyncClient``: a current credential on every request, origin-checked.
+
+        ``module`` is as in :meth:`TokenSource.httpx_auth`.
+        """
+        if module is None or module is httpx:
+            return _AsyncSourceAuth(self)
+        return _auth_class(module, blocking=False)(self)
 
 
 class _SyncSourceAuth(httpx.Auth):
@@ -189,6 +213,25 @@ class _AsyncSourceAuth(httpx.Auth):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self._source!r})"
+
+
+_auth_classes: dict[tuple[str, bool], type] = {}
+
+
+def _auth_class(module: ModuleType, *, blocking: bool) -> type:
+    """The auth class for another httpx package (httpx2): the same flows on that package's ``Auth``."""
+    key = (module.__name__, blocking)
+    if key not in _auth_classes:
+        base: type = getattr(module, "Auth")  # noqa: B009 - the package is chosen at run time
+        source_class = _SyncSourceAuth if blocking else _AsyncSourceAuth
+        namespace = {
+            "__init__": source_class.__init__,
+            "sync_auth_flow": source_class.sync_auth_flow,
+            "async_auth_flow": source_class.async_auth_flow,
+            "__repr__": source_class.__repr__,
+        }
+        _auth_classes[key] = type(f"{source_class.__name__}_{module.__name__}", (base,), namespace)
+    return _auth_classes[key]
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
