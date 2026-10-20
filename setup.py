@@ -42,6 +42,9 @@ setup(
         # authfi.claude_agent: approvals through can_use_tool, the `authfi token`
         # and `authfi headers` helpers, content logging off.
         "claude-agent": ["claude-agent-sdk>=0.2"],
+        # authfi.adk: the model credential, the MCP toolset, approvals through
+        # tool confirmation, telemetry without content.
+        "adk": ["google-adk>=2.0", "litellm>=1.70", "httpx>=0.23"],
     },
     entry_points={"console_scripts": ["authfi = authfi.cli:main"]},
     author="AuthFI",

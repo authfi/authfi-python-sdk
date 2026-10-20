@@ -380,6 +380,44 @@ async with AuthFIClaudeClient(options, agent=agent) as client:
 
 A complete agent is in [examples/claude-agent-sdk](examples/claude-agent-sdk/agent.py).
 
+### Google ADK
+
+```bash
+pip install 'authfi[adk]'
+```
+
+```python
+from authfi import AgentAuth, AsyncAgentAuth
+from authfi.adk import AuthFIADK, configure_telemetry
+
+agent_auth = AsyncAgentAuth(AgentAuth.from_env())
+configure_telemetry(agent_auth)           # first: no content in spans, the agent id on the resource
+authfi = AuthFIADK(agent_auth)
+agent = authfi.agent(name="research", instruction="...", model="claude-haiku-5-5")
+
+# Run it with an ADK Runner. A held call arrives as ADK's tool confirmation:
+for held in authfi.held_approvals(events):    # {"approval_id", "tool", "args", "call"}
+    ...                                       # once the person has decided:
+    message = authfi.answer(held, confirmed=True)   # send it as the next message
+```
+
+- **Model credential.** `LiteLlm` sends its key as `x-api-key` and will not send without one. The
+  model gets a placeholder key, and a `before_model_callback` sets `Authorization: Bearer` with the
+  current token on each call, and the invocation id as `X-Request-Id`.
+- **Tools.** `McpToolset` on your project's MCP gateway, with an HTTP client that sends the current
+  token on every request, so a tool list fetched outside a run is authenticated too. ADK's Google
+  mTLS client is kept off this connection, so no Google credential is sent to it. Tools the gateway
+  marks `never_allowed` are left out, and the tool list is cached for a minute.
+- **Refusals** reach the model as `{"error": "<why>"}`.
+- **Approvals.** A held call becomes ADK's tool confirmation, with the approval id as payload; the
+  confirmed call is sent with the id and the gateway decides. ADK asks once per call, so answer
+  only once the person has decided. A call confirmed too early is answered to the model as still
+  waiting, and its repeat asks again under the same approval.
+- **Telemetry.** `configure_telemetry(agent, capture_content=False)` turns ADK's content capture in
+  spans off and adds `authfi.agent_id` to the OpenTelemetry resource.
+
+A complete agent is in [examples/google-adk](examples/google-adk/agent.py).
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)
