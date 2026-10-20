@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
 from authfi import ConfigurationError, TransportError
+from authfi._clock import SystemClock
 from authfi._protocol.http import Attempt, HttpRequest, Retry
 from authfi._protocol.ids import is_valid_request_id
+from authfi._protocol.oauth import ClientAuth, client_credentials_request
 from authfi._protocol.retry import RetryPolicy, parse_retry_after
 from authfi._transport import AsyncTransport, SyncTransport, Timeout, user_agent
 from authfi._version import __version__
@@ -197,6 +201,23 @@ def test_every_attempt_gets_its_own_fresh_credential(clock: FakeClock) -> None:
     ]
 
 
+def test_a_client_assertion_is_signed_afresh_for_every_attempt_of_a_token_request(clock: FakeClock) -> None:
+    """A retried token request must not replay its assertion: the server records each ``jti`` once."""
+    count = 0
+
+    def sign(_audience: str) -> str:
+        nonlocal count
+        count += 1
+        return f"assertion-{count}"
+
+    auth = ClientAuth.private_key_jwt("agt_1", sign)
+    server = Server(status(503), failures=1)
+    response = transport(server, clock).send(client_credentials_request(URL, auth))
+    assert response.status == 200
+    assertions = [parse_qs(r.content.decode())["client_assertion"] for r in server.requests]
+    assert assertions == [["assertion-1"], ["assertion-2"]]
+
+
 def test_the_user_agent_names_the_sdk(clock: FakeClock) -> None:
     server = Server(status(200), failures=0)
     transport(server, clock).send(request(Retry.SAFE))
@@ -240,6 +261,103 @@ def test_an_oversized_answer_is_refused(clock: FakeClock) -> None:
 
     with pytest.raises(TransportError):
         transport(Server(streamed, failures=1), clock).send(HttpRequest("GET", URL, what="x", max_bytes=1024))
+
+
+async def _one(chunk: bytes) -> AsyncIterator[bytes]:
+    yield chunk
+
+
+def _async_transport(
+    server: Callable[[httpx.Request], httpx.Response], clock: object, timeout: Timeout
+) -> AsyncTransport:
+    return AsyncTransport(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        timeout=timeout,
+        policy=RetryPolicy(retries=0),
+        agent=user_agent(),
+        logger=logging.getLogger("authfi"),
+        clock=clock,  # type: ignore[arg-type]
+    )
+
+
+def test_a_body_dripped_past_the_total_deadline_is_refused(clock: FakeClock) -> None:
+    """A server that sends one byte a second cannot hold the call past ``Timeout.total``."""
+    sent = 0
+
+    def drip() -> Iterator[bytes]:
+        nonlocal sent
+        for _ in range(270):
+            sent += 1
+            clock.advance(1.0)
+            yield b"x"
+
+    server = Server(lambda _r: httpx.Response(200, content=drip()), failures=1)
+    t = SyncTransport(
+        client=httpx.Client(transport=httpx.MockTransport(server)),
+        timeout=Timeout(total=5.0),
+        policy=RetryPolicy(retries=0),
+        agent=user_agent(),
+        logger=logging.getLogger("authfi"),
+        clock=clock,
+    )
+    with pytest.raises(TransportError) as caught:
+        t.send(HttpRequest("GET", URL, what="the token endpoint"))
+    assert caught.value.code == "timeout"
+    assert not caught.value.retryable
+    assert sent <= 6
+
+
+async def test_an_async_body_dripped_past_the_total_deadline_is_refused(clock: FakeClock) -> None:
+    sent = 0
+
+    async def drip() -> AsyncIterator[bytes]:
+        nonlocal sent
+        for _ in range(270):
+            sent += 1
+            clock.advance(1.0)
+            yield b"x"
+
+    server = Server(lambda _r: httpx.Response(200, content=drip()), failures=1)
+    t = _async_transport(server, clock, Timeout(total=5.0))
+    with pytest.raises(TransportError) as caught:
+        await t.send(HttpRequest("GET", URL, what="the token endpoint"))
+    assert caught.value.code == "timeout"
+    assert sent <= 6
+
+
+async def test_an_async_body_that_stops_arriving_is_cut_at_the_deadline() -> None:
+    """No chunk arrives to check the clock on: the event loop's own timer ends the wait."""
+
+    async def stalls() -> AsyncIterator[bytes]:
+        yield b"x"
+        await asyncio.sleep(30)
+        yield b"y"  # pragma: no cover
+
+    server = Server(lambda _r: httpx.Response(200, content=stalls()), failures=1)
+    t = _async_transport(server, SystemClock(), Timeout(connect=1.0, read=1.0, total=0.3))
+    with pytest.raises(TransportError) as caught:
+        await t.send(HttpRequest("GET", URL, what="the token endpoint"))
+    assert caught.value.code == "timeout"
+
+
+def test_a_body_that_cannot_be_decoded_is_a_transport_error_not_an_httpx_one(clock: FakeClock) -> None:
+    def bad_gzip(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=iter([b"this is not gzip"]))
+
+    with pytest.raises(TransportError) as caught:
+        transport(Server(bad_gzip, failures=1), clock).send(HttpRequest("GET", URL, what="the token endpoint"))
+    assert caught.value.code == "response_invalid"
+    assert not caught.value.retryable
+
+
+async def test_an_async_body_that_cannot_be_decoded_is_a_transport_error(clock: FakeClock) -> None:
+    def bad_gzip(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=_one(b"this is not gzip"))
+
+    t = _async_transport(Server(bad_gzip, failures=1), clock, Timeout())
+    with pytest.raises(TransportError) as caught:
+        await t.send(HttpRequest("GET", URL, what="the token endpoint"))
+    assert caught.value.code == "response_invalid"
 
 
 def test_timeouts_are_passed_per_phase_and_capped_by_the_deadline(clock: FakeClock) -> None:

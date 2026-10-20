@@ -23,17 +23,18 @@ __all__ = [
 ]
 
 _LOOPBACK_NAMES = frozenset({"localhost"})
+_LOOPBACK_ADDRESSES = frozenset({ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")})
 
 
 def is_loopback(host: str | None) -> bool:
-    """``True`` for ``localhost``, ``127.0.0.0/8`` and ``::1``."""
+    """``True`` for exactly ``localhost``, ``127.0.0.1`` and ``::1``."""
     if not host:
         return False
     name = host.strip("[]").lower()
     if name in _LOOPBACK_NAMES:
         return True
     try:
-        return ipaddress.ip_address(name).is_loopback
+        return ipaddress.ip_address(name) in _LOOPBACK_ADDRESSES
     except ValueError:
         return False
 

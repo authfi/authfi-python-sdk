@@ -58,6 +58,7 @@ class _Project:
     leeway: float
     _api_origin: str | None
     _derived_api_origin: str | None
+    _last_kid_refetch: float | None
     _log: logging.Logger
     _clock: Clock
 
@@ -76,6 +77,7 @@ class _Project:
         self.issuer = validate_issuer(issuer)
         self._api_origin = validate_origin(api_origin, "api_origin") if api_origin else None
         self._derived_api_origin = None
+        self._last_kid_refetch = None
         given_retries = cast(object, retries)
         if not isinstance(given_retries, int) or isinstance(given_retries, bool) or not 0 <= given_retries <= 5:
             raise ConfigurationError(f"retries must be an integer from 0 to 5, not {given_retries!r}")
@@ -92,7 +94,8 @@ class _Project:
         """Where the project's machine APIs are served.
 
         The configured ``api_origin``; else, once discovery is read, the origin of its CIBA endpoint
-        (the slug host, for a project on a custom domain); else the issuer's origin.
+        (the slug host, for a project on a custom domain); else the issuer's origin. Before discovery
+        is read this is the issuer's origin: use :meth:`AuthFI.resolve_api_origin` to build a URL.
         """
         return self._api_origin or self._derived_api_origin or origin_of(self.issuer)
 
@@ -112,6 +115,20 @@ class _Project:
     def logger(self) -> logging.Logger:
         """The logger every area of this project logs to."""
         return self._log
+
+    def _refetch_due(self, fetched: float | None) -> bool:
+        """Whether an unknown ``kid`` may refetch the key set now, and note that it did.
+
+        At most one refetch per :data:`KID_REFETCH_INTERVAL`, counted from the last attempt, successful
+        or not (``fetched`` is when the cached set was last stored): a key set that answers 500 must
+        not be hit once per forged token.
+        """
+        now = self._clock.monotonic()
+        last = [t for t in (fetched, self._last_kid_refetch) if t is not None]
+        if last and now - max(last) < KID_REFETCH_INTERVAL:
+            return False
+        self._last_kid_refetch = now
+        return True
 
     def _learn(self, metadata: ServerMetadata) -> None:
         endpoint = metadata.backchannel_authentication_endpoint
@@ -231,14 +248,24 @@ class AuthFI(_Project):
         self._learn(metadata)
         return metadata
 
+    def resolve_api_origin(self) -> str:
+        """Where the project's machine APIs are served, after reading discovery if it is needed.
+
+        :attr:`api_origin` alone is the issuer's origin until discovery has been read, which is
+        the wrong host for a project on a custom domain. Call this before building the URL of any
+        machine API. A configured ``api_origin`` needs no discovery.
+        """
+        if self._api_origin is None:
+            self.metadata()
+        return self.api_origin
+
     def _key(self, kid: str) -> PublicKey | None:
         """The published key named ``kid``. An unknown kid refetches the set, at most once per 30 s."""
         keys = self._key_set()
         key = keys.get(kid)
         if key is not None:
             return key
-        fetched = self._jwks.fetched_at("jwks")
-        if fetched is not None and self._clock.monotonic() - fetched < KID_REFETCH_INTERVAL:
+        if not self._refetch_due(self._jwks.fetched_at("jwks")):
             return None
         return self._key_set(refresh=True).get(kid)
 
@@ -337,13 +364,18 @@ class AsyncAuthFI(_Project):
         self._learn(metadata)
         return metadata
 
+    async def resolve_api_origin(self) -> str:
+        """See :meth:`AuthFI.resolve_api_origin`."""
+        if self._api_origin is None:
+            await self.metadata()
+        return self.api_origin
+
     async def _key(self, kid: str) -> PublicKey | None:
         keys = await self._key_set()
         key = keys.get(kid)
         if key is not None:
             return key
-        fetched = self._jwks.fetched_at("jwks")
-        if fetched is not None and self._clock.monotonic() - fetched < KID_REFETCH_INTERVAL:
+        if not self._refetch_due(self._jwks.fetched_at("jwks")):
             return None
         return (await self._key_set(refresh=True)).get(kid)
 

@@ -19,7 +19,7 @@ af = AuthFI(
 | Argument | What it is |
 |---|---|
 | `issuer` | Your project's address: `https://<slug>.authfi.io`, or its custom domain. Required. `http` is accepted for `localhost`, `127.0.0.1` and `::1` only. |
-| `api_origin` | Where the project's machine APIs are served. Set it when the issuer is a custom domain; otherwise it is read from discovery. |
+| `api_origin` | Where the project's machine APIs are served. Set it when the issuer is a custom domain; otherwise it is read from discovery. Until discovery has been read, `api_origin` is the issuer's origin: `af.resolve_api_origin()` (`await` it on `AsyncAuthFI`) reads discovery first, and is what to call before building a machine-API URL. |
 | `timeout` | A `Timeout`, or a number of seconds for the whole call. |
 | `retries` | How many times a failed request may be sent again, 0 to 5. |
 | `leeway` | Clock skew allowed when checking token times, 0 to 300 seconds. |
@@ -53,7 +53,7 @@ the set does not hold causes one fetch of the set, at most once every 30 seconds
 
 Every request the SDK makes:
 
-- has a connect timeout, a read timeout, and a deadline for the whole call, retries included;
+- has a connect timeout, a read timeout, and a deadline for the whole call, retries included, reading the answer's body too (a server that sends one byte a second is cut at the deadline with a `timeout` error);
 - follows no redirect, and reads at most 1 MiB of an answer (256 KiB of a discovery document);
 - sends a `User-Agent` naming the SDK, an `X-Request-Id` (the same on every retry of one call)
   and a W3C `traceparent` (from OpenTelemetry when `opentelemetry-api` is installed).
