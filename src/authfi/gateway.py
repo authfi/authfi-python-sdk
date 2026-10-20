@@ -25,9 +25,13 @@ import httpx
 
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
+    CLOUD_PATH,
     HOLD_MESSAGE,
     CloudCredential,
+    ToolAllowed,
+    ToolApprovalRequired,
     ToolOutcome,
+    ToolRefused,
     cloud_request,
     governance_of,
     parse_cloud,
@@ -47,11 +51,16 @@ if TYPE_CHECKING:
 __all__ = [
     "APPROVAL_ARGUMENT",
     "HOLD_MESSAGE",
+    "TOKEN_REFUSED_MESSAGE",
     "AsyncGateway",
     "CloudCredential",
     "CloudCredentialOutcome",
     "Gateway",
+    "PendingApproval",
+    "ToolAllowed",
+    "ToolApprovalRequired",
     "ToolOutcome",
+    "ToolRefused",
     "token_refusal",
 ]
 
@@ -59,7 +68,23 @@ ModelApi = Literal["anthropic", "openai"]
 
 #: The JSON-RPC error an MCP client gets when the gateway refuses the token (see ``mcp_client_factory``).
 TOKEN_REFUSED_RPC_CODE = -32001
+#: Its message, which a framework that hands every MCP failure to the model as text carries along.
+TOKEN_REFUSED_MESSAGE = "The AuthFI gateway refused this credential"
 _REFUSAL_DATA = "authfi_refusal"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingApproval:
+    """A tool call the gateway holds until a person approves it: the one vocabulary every adapter uses.
+
+    ``approval_id`` names the approval to resume the call with, ``tool`` is the gateway's tool name
+    (``<server>__<tool>``) and ``args`` the call's arguments. An adapter subclasses it to add what its
+    framework needs to find the call again.
+    """
+
+    approval_id: str
+    tool: str
+    args: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +180,7 @@ class _RefusalAsJsonRpc:
         await response.aclose()
         error = {
             "code": TOKEN_REFUSED_RPC_CODE,
-            "message": "The AuthFI gateway refused this credential",
+            "message": TOKEN_REFUSED_MESSAGE,
             "data": {_REFUSAL_DATA: "gateway_token_refused", "url": str(request.url), "www_authenticate": challenge},
         }
         return self._package.Response(
@@ -305,9 +330,10 @@ class Gateway(_GatewayBase):
         once a person has decided. A refusal raises :class:`~authfi.APIError` with the gateway's
         code. The platform caps ``expires_in``.
         """
-        url = self.project.api_origin + "/mcp/v1/cloud/credentials"
+        api_origin = self.project.resolve_api_origin()
+        url = api_origin + CLOUD_PATH
         request = cloud_request(
-            self.project.api_origin,
+            api_origin,
             self.source.headers("POST", url),
             account=account,
             role=role,
@@ -425,9 +451,10 @@ class AsyncGateway(_GatewayBase):
         approval_id: str | None = None,
     ) -> CloudCredentialOutcome:
         """See :meth:`Gateway.cloud_credentials`."""
-        url = self.project.api_origin + "/mcp/v1/cloud/credentials"
+        api_origin = await self.project.resolve_api_origin()
+        url = api_origin + CLOUD_PATH
         request = cloud_request(
-            self.project.api_origin,
+            api_origin,
             await self.source.headers("POST", url),
             account=account,
             role=role,

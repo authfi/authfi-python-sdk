@@ -40,6 +40,7 @@ __all__ = [
     "StepUpRequired",
     "TemporarilyUnavailable",
     "TransportError",
+    "WaitTimeout",
     "WebhookVerificationError",
 ]
 
@@ -223,6 +224,25 @@ class ConsentDenied(OAuthError):
 
 class ConsentExpired(OAuthError):
     """The person's consent ran out: the CIBA request expired, or a delegated token outlived it."""
+
+
+class WaitTimeout(AuthFIError):
+    """The caller's own ``timeout`` ran out while waiting for a person; the request is still open.
+
+    This is the SDK's answer, never the server's: ``authorization_pending`` is the server saying the
+    person has not decided yet, and a request that really ran out is :class:`ConsentExpired`.
+
+    Attributes:
+        pending_id: what is still open and can be waited on again, when it has an id of its own
+            (an approval's); ``None`` for a CIBA request, which is the handle the caller holds.
+
+    """
+
+    pending_id: str | None
+
+    def __init__(self, message: str, *, pending_id: str | None = None) -> None:
+        super().__init__(message, None, code="wait_timeout")
+        self.pending_id = pending_id
 
 
 class TemporarilyUnavailable(OAuthError):

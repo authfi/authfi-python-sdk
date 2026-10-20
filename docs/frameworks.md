@@ -41,7 +41,9 @@ It takes `ChatAnthropic`'s arguments, except those that carry a credential or an
 metadata names the agent (`authfi_agent_id`), so a trace shows which agent made each call.
 
 `configure_tracing(capture_content=False, **client_kwargs)` installs the LangSmith client that
-LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`.
+LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`. It is process-wide
+(`langsmith.configure`): an app that has its own LangSmith client should not call it, or should pass
+that client's settings in `client_kwargs`.
 
 ## LangGraph
 
@@ -80,7 +82,7 @@ reason and the scope the call needs, and the run carries on. **A refused token**
 revoked) raises `GatewayTokenRefused` and ends the run.
 
 **A held call** is recorded in the graph's state (`authfi_holds`) and the model reads only "This
-action is waiting for a person's approval." `approval_node` then calls `interrupt()` before
+action is waiting for a person's approval in AuthFI." `approval_node` then calls `interrupt()` before
 anything else, so LangGraph re-running it on resume repeats nothing. On resume it sends each held
 call again with its approval, and the gateway decides:
 
@@ -98,6 +100,11 @@ For your own graph, the pieces are public: `AuthFIState` (the messages and `auth
 `langgraph.approval_node`, `route_after_tools`, and the MCP tool interceptor
 `langgraph.interceptor`, which `langgraph.client()` installs. Use LangGraph's own `ToolNode` with
 the tools; the guarding is in the tools themselves.
+
+**What a checkpoint stores.** The graph state carries each held call's `args` (`Hold.args`), and a
+checkpointer persists them. Tool arguments can hold personal data, so treat the checkpoint store as
+holding it. It never holds a token or an approval secret: the approval id is in the state, and the
+token is renewed from the agent's key.
 
 ## OpenAI Agents SDK
 
@@ -131,8 +138,14 @@ async with openai_agents.mcp_server() as tools:
 prompts, answers and tool results unless told otherwise. `configure_tracing(processors=(),
 capture_content=False)` removes that exporter, sends spans only to the processors you name (each
 wrapped in `AuthFITraceProcessor`, which removes content before your processor sees a span), and
-makes every `RunConfig` default to no content. With no processors, tracing is off. `run_config()`
-names the agent in the trace's metadata (`authfi_agent_id`).
+turns tracing off when you name none. **It replaces every trace processor the application registered
+before it**, not only the SDK's: pass the ones you want to keep in `processors=`. Call it before the
+first run. The wrapper removes prompts, answers and tool inputs and outputs from generation,
+response, function, custom, speech and transcription spans, and the `extra_headers`, `extra_args`
+and `extra_query` settings from a span's model settings, so a run started without `run_config()`
+still reaches your processors without content. Names, timings, ids, usage and the other settings
+stay. `run_config()` names the agent in the trace's metadata (`authfi_agent_id`). The adapter does
+not write the process environment.
 
 **Models.** `model(name)` is Claude on the AI gateway through LiteLLM; `model(name, api="openai")` is
 the SDK's Chat Completions model, for a project with an OpenAI-compatible provider. The agent's
@@ -155,7 +168,7 @@ the gateway marks `may_require_approval` pauses the run as the SDK's own `ToolAp
 
 Call `resolve` again once the person has decided, then run again with `state`. Only the gateway's
 decision approves an item, one call at a time. A hold the gateway did not announce reaches the
-model as "This action is waiting for a person's approval.", and the next call to that tool pauses
+model as "This action is waiting for a person's approval in AuthFI.", and the next call to that tool pauses
 the run. The approval id never reaches the model.
 
 ## Claude Agent SDK
@@ -185,7 +198,11 @@ async with ClaudeSDKClient(options) as client:
 gateway with that token, running it again every four minutes. The helper signs as the agent with
 the agent's key file, so the agent's key must be loaded from a file (`AgentKey.from_file` or
 `AUTHFI_AGENT_KEY_FILE`). Claude Code's options and environment hold the file's path, never the key
-or a token; an `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` passed in `env` is refused.
+or a token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
+switch content on: `ANTHROPIC_BASE_URL`, every `AUTHFI_*` and `OTEL_LOG_*` name, the other variables
+the integration sets, and `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Claude Code starts with this
+process's environment as well, so the options blank those two (and `AUTHFI_AGENT_PRIVATE_KEY`) in
+the environment they give it, and log that they were set here.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code
@@ -203,10 +220,15 @@ gateway's tools to the permission flow, so `can_use_tool` always runs for them;
 | holds it for approval | `wait_for_decision(pending)` is awaited, then the call is sent again with the approval, and the gateway decides |
 
 Without `wait_for_decision`, a held call is refused for now with "This action is waiting for a
-person's approval."; the same call made after the person decides goes with the approval. The
+person's approval in AuthFI."; the same call made after the person decides goes with the approval. The
 approval id never reaches the model, and one the model writes is removed. `can_use_tool` never
 grants a lasting permission. Tools that are not AuthFI's are refused, unless you pass your own
 `can_use_tool` to `options()`, which then decides them.
+
+The integration remembers the answer to a call for up to two minutes (`MEMORY_SECONDS`), from
+`can_use_tool` until Claude Code runs the tool. A call Claude Code never ran is then forgotten, and
+`claude.reset()` forgets every one at once: call it when a run ends, so the next run, with the same
+tool and arguments, is sent afresh.
 
 **A refused token** stops the run (`can_use_tool` interrupts it), and
 `claude.token_refused` holds the `GatewayTokenRefused`.
@@ -262,10 +284,12 @@ is tested with (`google-adk` 2.12, pinned by the extra), and raises `Integration
 
 **Refusals** reach the model as `{"error": "<why>"}`. ADK turns every MCP failure into text for the
 model; when the gateway refused the token itself, the tool callback raises `GatewayTokenRefused`
-instead, ending the run.
+instead, ending the run. The callback reads the refusal from that call's own response, so tool
+calls ADK runs in parallel cannot clear or inherit one another's.
 
 **Approvals.** A held call becomes ADK's tool confirmation: `held_approvals(events)` lists them, and
-`answer(pending, confirmed=...)` is the message that answers one. Send it once the person has
+`answer(pending, confirmed=...)` is the message that answers one. A pending approval is
+`authfi.gateway.PendingApproval` (`approval_id`, `tool`, `args`) with ADK's `call_id`. Send it once the person has
 decided in AuthFI: the call is then sent with the approval, and the gateway decides. ADK confirms a
 call once, so a call confirmed before the person decided reaches the model as still waiting, and
 the same call made again goes under the same approval and asks again; no second approval is

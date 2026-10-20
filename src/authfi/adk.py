@@ -58,8 +58,16 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError("authfi.adk needs Google ADK: pip install 'authfi[adk]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
-from authfi.errors import ConfigurationError, IntegrationError
-from authfi.gateway import HOLD_MESSAGE, AsyncGateway, token_refusal
+from authfi.errors import ConfigurationError, GatewayTokenRefused, IntegrationError
+from authfi.gateway import (
+    HOLD_MESSAGE,
+    TOKEN_REFUSED_MESSAGE,
+    AsyncGateway,
+    ToolApprovalRequired,
+    ToolRefused,
+    token_refusal,
+)
+from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
@@ -81,12 +89,9 @@ MEMORY = 10_000
 
 
 @dataclass(frozen=True, slots=True)
-class PendingApproval:
-    """A call the gateway holds until a person approves it, from ADK's confirmation request."""
+class PendingApproval(BasePendingApproval):
+    """A call the gateway holds until a person approves it; ``call_id`` is ADK's confirmation request."""
 
-    approval_id: str
-    tool: str
-    args: dict[str, Any]
     call_id: str
 
 
@@ -246,23 +251,25 @@ class ADKIntegration:
         """Turn a refusal into the tool's error and a hold into ADK's tool confirmation.
 
         ADK hands every MCP failure to the model as text; when the failure was the gateway refusing
-        the token, this raises :class:`~authfi.GatewayTokenRefused` instead, ending the run.
+        the token, this raises :class:`~authfi.GatewayTokenRefused` instead, ending the run. The
+        refusal is read from this call's own response, never from state the gateway shares between
+        calls, which ADK may run in parallel.
         """
-        refused = self.gateway.token_refused
-        if refused is not None and "error" in tool_response:
-            raise refused
+        error = tool_response.get("error")
+        if isinstance(error, str) and TOKEN_REFUSED_MESSAGE in error:
+            raise GatewayTokenRefused(self.gateway.mcp_url, None)
         clean = self.gateway.strip_approval_argument(args)
         key = _key(tool.name, clean)
         outcome = self.gateway.read_result(tool_response)
         logger = self.gateway.project.logger
-        if outcome.kind == "allowed":
+        if not isinstance(outcome, ToolApprovalRequired | ToolRefused):
             self._held.pop(key, None)
             return None
-        if outcome.kind == "refused":
+        if isinstance(outcome, ToolRefused):
             self._held.pop(key, None)
             logger.info("the gateway refused %s: %s", tool.name, outcome.code or outcome.error)
             return {"error": outcome.model_text}
-        approval_id = cast(str, outcome.approval_id)
+        approval_id = outcome.approval_id
         self._remember(key, approval_id)
         logger.info("%s waits for approval %s", tool.name, approval_id)
         if tool_context.tool_confirmation is None:

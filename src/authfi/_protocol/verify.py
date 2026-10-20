@@ -175,7 +175,7 @@ def check_claims(claims: Mapping[str, Any], config: VerifyConfig, now: float, *,
     exp = _number(claims, "exp")
     if exp is None:
         raise InvalidToken("token_claims_invalid", "exp is missing")
-    if now > exp + config.leeway:
+    if now >= exp + config.leeway:
         raise InvalidToken("token_expired", "the token has expired")
     nbf = _number(claims, "nbf")
     if nbf is not None and nbf > now + config.leeway:
@@ -193,11 +193,11 @@ def check_claims(claims: Mapping[str, Any], config: VerifyConfig, now: float, *,
         raise InvalidToken("token_no_tenant", "the token names no tenant")
     if config.expected_tenant_id is not None and tenant != config.expected_tenant_id:
         raise InvalidToken("token_tenant_not_issuers", "tenant_id is not the tenant this issuer is pinned to")
+    if bearer and ("cnf" in claims or "authfi_mandate" in claims):
+        raise InvalidToken("token_dpop_proof_required", "a sender-constrained token presented as Bearer")
     act = claims.get("act")
     if act is not None:
         if not isinstance(act, dict) or not isinstance(cast(dict[str, Any], act).get("sub"), str):
             raise InvalidToken("token_claims_invalid", "act is not an actor claim")
         if "act" in cast(dict[str, Any], act):
             raise InvalidToken("token_act_chain_unsupported", "a chain of actors is not accepted")
-    if bearer and ("cnf" in claims or "authfi_mandate" in claims):
-        raise InvalidToken("token_dpop_proof_required", "a sender-constrained token presented as Bearer")

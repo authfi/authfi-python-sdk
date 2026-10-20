@@ -39,6 +39,19 @@ def test_the_old_form_builds_the_project_from_the_tenant(platform: Platform, clo
         AuthFI(api_key="x")
 
 
+def test_audience_beside_an_issuer_is_not_taken_for_the_old_form() -> None:
+    """It once built the issuer ``https://https//acme.authfi.io.authfi.io`` and failed on the first call."""
+    with pytest.raises(ConfigurationError, match=r"af\.verifier\(audience="):
+        AuthFI("https://acme.authfi.io", audience=AUD)
+    with pytest.raises(ConfigurationError, match=r"af\.verifier\(audience="):
+        AuthFI(issuer="https://acme.authfi.io", audience=AUD)
+    # With tenant= or api_key=, or two positional arguments, it is main's form and still works.
+    with pytest.warns(AuthFIDeprecationWarning):
+        assert AuthFI("acme", "sk_live_x", audience=AUD).issuer == "https://acme.authfi.io"
+    with pytest.warns(AuthFIDeprecationWarning):
+        assert AuthFI(tenant="acme", audience=AUD).issuer == "https://acme.authfi.io"
+
+
 def test_old_attributes_warn_and_new_projects_do_not_have_them(platform: Platform, clock: FakeClock) -> None:
     af = legacy(platform, clock, application_id="app", client_secret="s3cret", jwks_ttl=120)
     with pytest.warns(AuthFIDeprecationWarning):

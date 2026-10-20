@@ -18,7 +18,7 @@ from authfi import AccessToken, AsyncAuthFI, AuthFI, ConfigurationError
 from authfi._resource import INVALID_TOKEN_DESCRIPTION, Requirements
 from authfi.fastapi import AuthFIBearer
 from authfi.flask import AuthFIFlask
-from tests.support import TENANT, FakeClock, Platform
+from tests.support import TENANT, FakeClock, Platform, json_response
 
 AUD = ["api_orders"]
 
@@ -29,6 +29,8 @@ class Answer:
     challenge: str | None
     body: dict[str, Any]
     request_id: str | None
+    cache_control: str | None = None
+    retry_after: str | None = None
 
 
 Call = Callable[[dict[str, str]], Answer]
@@ -50,7 +52,14 @@ def fastapi_app(platform: Platform, clock: FakeClock, rules: dict[str, Any], **o
         def call(headers: dict[str, str]) -> Answer:
             r = cast(httpx.Client, client).get("/r", headers=headers)
             body = cast(dict[str, Any], r.json())
-            return Answer(r.status_code, r.headers.get("www-authenticate"), body, r.headers.get("x-request-id"))
+            return Answer(
+                r.status_code,
+                r.headers.get("www-authenticate"),
+                body,
+                r.headers.get("x-request-id"),
+                r.headers.get("cache-control"),
+                r.headers.get("retry-after"),
+            )
 
         yield call
 
@@ -71,7 +80,14 @@ def flask_app(platform: Platform, clock: FakeClock, rules: dict[str, Any], **opt
     def call(headers: dict[str, str]) -> Answer:
         r = client.get("/r", headers=headers)
         body = cast(dict[str, Any], r.get_json())
-        return Answer(r.status_code, r.headers.get("WWW-Authenticate"), body, r.headers.get("X-Request-Id"))
+        return Answer(
+            r.status_code,
+            r.headers.get("WWW-Authenticate"),
+            body,
+            r.headers.get("X-Request-Id"),
+            r.headers.get("Cache-Control"),
+            r.headers.get("Retry-After"),
+        )
 
     yield call
 
@@ -84,8 +100,20 @@ def framework(request: pytest.FixtureRequest) -> str:
     return str(request.param)
 
 
+_LIVE: list[Iterator[Call]] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_apps() -> Iterator[None]:
+    """Keep each app's test client open for the whole test, then close it."""
+    yield
+    while _LIVE:
+        _LIVE.pop().close()  # type: ignore[attr-defined]
+
+
 def make(framework: str, platform: Platform, clock: FakeClock, rules: dict[str, Any], **options: Any) -> Call:
     gen = FRAMEWORKS[framework](platform, clock, rules, **options)
+    _LIVE.append(gen)
     return next(gen)
 
 
@@ -166,10 +194,74 @@ def test_every_refusal_is_the_same_opaque_answer_in_every_adapter(
     assert fastapi_answer.body == {"error": "invalid_token", "error_description": INVALID_TOKEN_DESCRIPTION}
     assert fastapi_answer.challenge == f'Bearer error="invalid_token", error_description="{INVALID_TOKEN_DESCRIPTION}"'
     assert code not in str(fastapi_answer)
-    logged = [r.getMessage() for r in caplog.records if r.getMessage().startswith("refused")]
+    logged = [r.getMessage() for r in caplog.records if r.getMessage().startswith("refused GET")]
     assert len(logged) == 2
     assert all(code in line for line in logged)
     assert all(token not in line for line in logged)
+
+
+def test_every_answer_to_a_refused_request_is_marked_no_store(
+    framework: str, platform: Platform, clock: FakeClock
+) -> None:
+    call = make(framework, platform, clock, {"permissions": ["a"]})
+    assert call({}).cache_control == "no-store"
+    assert call({"Authorization": "Bearer junk"}).cache_control == "no-store"
+    assert call({"Authorization": "Bearer " + platform.access_token(permissions=["b"])}).cache_control == "no-store"
+    assert call({"Authorization": "Bearer " + platform.access_token(permissions=["a"])}).cache_control != "no-store"
+
+
+def unreachable_jwks(platform: Platform) -> None:
+    platform.route("GET", "/.well-known/jwks.json", json_response({"error": "down"}, status=500))
+
+
+def unreachable_discovery(platform: Platform) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    platform.route("GET", "/.well-known/openid-configuration", refuse)
+
+
+@pytest.mark.parametrize("outage", [unreachable_jwks, unreachable_discovery], ids=["key set", "discovery"])
+def test_a_token_that_cannot_be_checked_is_a_503_to_retry_not_a_500(
+    outage: Callable[[Platform], None],
+    platform: Platform,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    outage(platform)
+    token = platform.access_token()
+    answers: dict[str, Answer] = {}
+    with caplog.at_level(logging.INFO, logger="authfi"):
+        for name in FRAMEWORKS:
+            answers[name] = make(name, platform, clock, {"permissions": ["a"]})(
+                {"Authorization": "Bearer " + token, "X-Request-Id": "trace-123"}
+            )
+    assert answers["fastapi"] == answers["flask"]
+    answer = answers["fastapi"]
+    assert answer.status == 503
+    assert answer.body == {"error": "service_unavailable"}
+    assert answer.retry_after == "5"
+    assert answer.cache_control == "no-store"
+    assert answer.challenge is None
+    assert answer.request_id == "trace-123"
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "could not check" in r.getMessage()]
+    assert len(errors) == 2
+    assert all("trace-123" in r.getMessage() and token not in r.getMessage() for r in errors)
+
+
+def test_a_missing_token_is_logged_at_info_and_any_other_refusal_at_warning(
+    framework: str, platform: Platform, clock: FakeClock, caplog: pytest.LogCaptureFixture
+) -> None:
+    call = make(framework, platform, clock, {"permissions": ["a"]})
+    with caplog.at_level(logging.DEBUG, logger="authfi"):
+        call({})
+        call({"Authorization": "Bearer junk"})
+    levels = {
+        r.getMessage().split(": ")[1].split(" ")[0]: r.levelno
+        for r in caplog.records
+        if r.getMessage().startswith("refused GET")
+    }
+    assert levels == {"token_missing": logging.INFO, "token_malformed": logging.WARNING}
 
 
 def test_no_credential_is_a_challenge_without_an_error(framework: str, platform: Platform, clock: FakeClock) -> None:

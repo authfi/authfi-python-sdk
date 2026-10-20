@@ -13,7 +13,17 @@ from typing import Any
 
 import pytest
 
-from authfi import AgentKey, APIError, AsyncAuthFI, AuthFI, ConsentDenied, NotSupportedError, OAuthError, Secret
+from authfi import (
+    AgentKey,
+    APIError,
+    AsyncAuthFI,
+    AuthFI,
+    ConsentDenied,
+    NotSupportedError,
+    OAuthError,
+    Secret,
+    ToolRefused,
+)
 from authfi.agents import AgentAuth
 from tests.live.console import ISSUER, RUN, Cleanups, console_token, eventually, gql, needs_console
 
@@ -101,7 +111,8 @@ def test_the_gateway_answers_an_ungranted_call_as_a_refusal(agent: AgentAuth) ->
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tools[0]["name"], "arguments": {}}}
     )
     outcome = gateway.read_result(answer.get("result"))
-    print(f"  tools/call {tools[0]['name']}: {outcome.kind} ({outcome.error}, {outcome.code})")
+    detail = (outcome.error, outcome.code) if isinstance(outcome, ToolRefused) else None
+    print(f"  tools/call {tools[0]['name']}: {outcome.kind} {detail}")
     assert outcome.kind != "allowed"
 
 

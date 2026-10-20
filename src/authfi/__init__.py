@@ -56,6 +56,7 @@ from authfi.errors import (
     StepUpRequired,
     TemporarilyUnavailable,
     TransportError,
+    WaitTimeout,
     WebhookVerificationError,
 )
 from authfi.gateway import (
@@ -65,7 +66,10 @@ from authfi.gateway import (
     CloudCredential,
     CloudCredentialOutcome,
     Gateway,
+    ToolAllowed,
+    ToolApprovalRequired,
     ToolOutcome,
+    ToolRefused,
 )
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
@@ -188,10 +192,14 @@ __all__ = [
     "TokenSource",
     "TokenStore",
     "TokenVerifier",
+    "ToolAllowed",
+    "ToolApprovalRequired",
     "ToolOutcome",
+    "ToolRefused",
     "TransactionToken",
     "TransportError",
     "UserInfo",
+    "WaitTimeout",
     "WebApp",
     "WebhookVerificationError",
     "__version__",

@@ -282,6 +282,12 @@ class TokenSet:
         refresh = "yes" if self.refresh_token else "no"
         return f"TokenSet(expires_at={self.expires_at.isoformat()}, scope={sorted(self.scope)!r}, refresh={refresh})"
 
+    def __copy__(self) -> TokenSet:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> TokenSet:
+        return self
+
     def __reduce__(self) -> NoReturn:
         raise TypeError("A TokenSet cannot be pickled: store a session id, and keep the tokens in a TokenStore.")
 

@@ -24,9 +24,10 @@ from authfi import (
     GatewayTokenRefused,
     NotSupportedError,
 )
-from authfi.claude_agent import CONTENT_SWITCHES, ClaudeAgentIntegration, PendingApproval
+from authfi.claude_agent import CONTENT_SWITCHES, MEMORY_SECONDS, ClaudeAgentIntegration, PendingApproval
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
+from tests.support import FakeClock
 
 AGENT = "agt_claude1"
 CONTEXT = ToolPermissionContext(tool_use_id="toolu_1")
@@ -284,3 +285,127 @@ def test_tracing_records_the_agent_and_not_content(
     finally:
         langsmith.configure(client=None)
     assert seen == {"metadata": {"case": "1", "authfi_agent_id": AGENT}, "project_name": "p"}
+
+
+# --- the caller cannot redirect the agent's token, and the parent's credentials do not reach Claude Code ---
+
+
+@pytest.mark.parametrize(
+    ("name", "match"),
+    [
+        ("ANTHROPIC_BASE_URL", "another host"),
+        ("OTEL_LOG_USER_PROMPTS", "capture_content"),
+        ("OTEL_LOG_RAW_API_BODIES", "capture_content"),
+        ("AUTHFI_ISSUER", "set by the integration"),
+        ("AUTHFI_AGENT_KEY_FILE", "set by the integration"),
+        ("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "set by the integration"),
+        ("ANTHROPIC_AUTH_TOKEN", "fixed credential"),
+    ],
+)
+async def test_the_callers_env_cannot_override_what_the_integration_sets(
+    claude: ClaudeAgentIntegration, name: str, match: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=match):
+        await claude.options(model="claude-haiku-5-5", env={name: "https://elsewhere.example"})
+    with pytest.raises(ConfigurationError, match=match):
+        await claude.options(model="claude-haiku-5-5", settings={"env": {name: "x"}})
+
+
+async def test_the_callers_other_env_is_kept_and_the_integrations_wins(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", env={"HTTPS_PROXY": "http://proxy.example:3128"})
+    env = dict(options.env)
+    assert env["HTTPS_PROXY"] == "http://proxy.example:3128"
+    assert env["ANTHROPIC_BASE_URL"] == fake.issuer + "/mcp"
+
+
+async def test_credentials_in_this_processes_environment_do_not_reach_claude_code(
+    claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import os
+
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY"):
+        monkeypatch.setenv(name, "sk-inherited")
+    with caplog.at_level("WARNING", logger="authfi"):
+        options = await claude.options(model="claude-haiku-5-5")
+    env = dict(options.env)
+    assert [env[n] for n in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY")] == ["", "", ""]
+    # What the SDK starts Claude Code with: the parent's environment, then these options.
+    child = {**os.environ, **env}
+    assert "sk-inherited" not in child.values()
+    assert "ANTHROPIC_API_KEY" in caplog.text and "sk-inherited" not in caplog.text
+
+
+async def test_without_inherited_credentials_nothing_is_logged(
+    claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    with caplog.at_level("WARNING", logger="authfi"):
+        options = await claude.options(model="claude-haiku-5-5")
+    assert dict(options.env)["ANTHROPIC_API_KEY"] == ""
+    assert "is set in this process" not in caplog.text
+
+
+# --- a decided call is served to the run that made it, once, soon ----------------------------------------
+
+
+@pytest.fixture
+async def timed(fake: FakeGateway, key_file: Path) -> AsyncIterator[tuple[ClaudeAgentIntegration, FakeClock]]:
+    clock = FakeClock()
+    async with AsyncAuthFI(fake.issuer, clock=clock) as project:
+        yield ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1"))), clock
+
+
+async def test_an_answer_nobody_collected_is_not_served_to_a_later_call(
+    fake: FakeGateway, timed: tuple[ClaudeAgentIntegration, FakeClock]
+) -> None:
+    claude, clock = timed
+    assert isinstance(await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT), PermissionResultAllow)
+    clock.advance(MEMORY_SECONDS + 1)  # Claude Code never ran the call: a hook denied it, the run stopped
+    await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)
+    answer = await _handler(claude, ALLOWED)(ARGS)
+    assert answer["is_error"] is False
+    assert len(fake.tool_calls) == 2  # the second call was sent afresh, not answered from the first
+
+
+async def test_an_answer_is_served_within_its_time(
+    fake: FakeGateway, timed: tuple[ClaudeAgentIntegration, FakeClock]
+) -> None:
+    claude, clock = timed
+    await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)
+    clock.advance(MEMORY_SECONDS - 1)
+    await _handler(claude, ALLOWED)(ARGS)
+    assert len(fake.tool_calls) == 1
+
+
+async def test_two_runs_with_the_same_call_each_execute(
+    fake: FakeGateway, timed: tuple[ClaudeAgentIntegration, FakeClock]
+) -> None:
+    claude, _ = timed
+    await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)  # run one, which ends before the handler runs
+    claude.reset()
+    await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)  # run two
+    await _handler(claude, ALLOWED)(ARGS)
+    assert len(fake.tool_calls) == 2
+
+
+async def test_a_held_call_is_forgotten_after_its_time_too(
+    fake: FakeGateway, timed: tuple[ClaudeAgentIntegration, FakeClock]
+) -> None:
+    claude, clock = timed
+    first = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+    assert isinstance(first, PermissionResultDeny)
+    clock.advance(MEMORY_SECONDS + 1)
+    fake_requests = len(fake.tool_calls)
+    again = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+    assert isinstance(again, PermissionResultDeny)
+    sent_with_old_approval = [args for _, args in fake.tool_calls[fake_requests:] if APPROVAL_ARGUMENT in args]
+    assert sent_with_old_approval == []
+
+
+def test_the_pending_approval_is_the_one_every_adapter_uses() -> None:
+    from authfi.gateway import PendingApproval as Base
+
+    assert PendingApproval is Base

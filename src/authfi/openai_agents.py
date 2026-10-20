@@ -56,7 +56,15 @@ try:
     from agents.mcp import MCPServerStreamableHttp
     from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
     from agents.tracing import TracingProcessor, set_trace_processors, set_tracing_disabled
-    from agents.tracing.span_data import FunctionSpanData, GenerationSpanData, ResponseSpanData
+    from agents.tracing.span_data import (
+        CustomSpanData,
+        FunctionSpanData,
+        GenerationSpanData,
+        ResponseSpanData,
+        SpeechGroupSpanData,
+        SpeechSpanData,
+        TranscriptionSpanData,
+    )
     from agents.tracing.spans import Span
     from agents.tracing.traces import Trace
     from mcp.types import CallToolResult, TextContent
@@ -67,7 +75,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
 from authfi.errors import ConfigurationError
-from authfi.gateway import HOLD_MESSAGE, AsyncGateway, token_refusal
+from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolApprovalRequired, ToolRefused, token_refusal
+from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
@@ -135,17 +144,18 @@ class OpenAIAgentsIntegration:
     ) -> list[TracingProcessor]:
         """Trace without the token and, unless ``capture_content``, without content. Call it before the first run.
 
-        The SDK's default exporter (to OpenAI, with the OpenAI key) is removed. ``processors`` replace
-        it, each wrapped in :class:`AuthFITraceProcessor`; with none, tracing is off. Every
-        ``RunConfig`` made afterwards defaults ``trace_include_sensitive_data`` to ``capture_content``.
-        Turning content on is the tenant's policy decision.
+        This replaces every trace processor the application registered before it, not only the SDK's
+        default exporter (to OpenAI, with the OpenAI key). ``processors`` take their place, each
+        wrapped in :class:`AuthFITraceProcessor`: to keep one the application already has, pass it
+        here. With none, tracing is off. A run made without :meth:`run_config` still reaches the
+        processors without content, because the wrapper removes it; ``capture_content`` turns it on,
+        which is the tenant's policy decision.
         """
         if (os.environ.get("OPENAI_API_KEY") or "").startswith("eyJ"):
             self.gateway.project.logger.warning(
                 "OPENAI_API_KEY holds a JWT; if it is an AuthFI token, unset it: the gateway models do not need "
                 "it, and an exporter that sends to OpenAI sends it"
             )
-        os.environ["OPENAI_AGENTS_TRACE_INCLUDE_SENSITIVE_DATA"] = "true" if capture_content else "false"
         wrapped: list[TracingProcessor] = [
             p if isinstance(p, AuthFITraceProcessor) else AuthFITraceProcessor(p, capture_content=capture_content)
             for p in processors
@@ -155,11 +165,24 @@ class OpenAIAgentsIntegration:
         return wrapped
 
 
+#: Settings that can carry a credential or a user's data, dropped from a span's ``model_config``.
+_MODEL_CONFIG_SECRETS = ("extra_headers", "extra_args", "extra_query")
+
+
+def _without_secrets(model_config: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if model_config is None:
+        return None
+    return {k: v for k, v in model_config.items() if k not in _MODEL_CONFIG_SECRETS}
+
+
 class AuthFITraceProcessor(TracingProcessor):
     """Hands spans to another processor without their content, unless ``capture_content``.
 
-    Prompts, answers and tool inputs and outputs are removed from generation, response and function
-    spans before ``inner`` sees them. Names, timings, ids, usage and the trace's metadata are kept.
+    Prompts, answers and tool inputs and outputs are removed from generation, response, function,
+    custom, speech and transcription spans before ``inner`` sees them, and so are the model settings
+    that can hold a header or a query (``extra_headers``, ``extra_args``, ``extra_query``), which this
+    adapter puts the token in. Names, timings, ids, usage, the other settings and the trace's metadata
+    are kept.
     """
 
     def __init__(self, inner: TracingProcessor, *, capture_content: bool = False) -> None:
@@ -180,14 +203,34 @@ class AuthFITraceProcessor(TracingProcessor):
 
     @override
     def on_span_end(self, span: Span[Any]) -> None:
+        data = span.span_data
+        if isinstance(data, GenerationSpanData | SpeechSpanData | TranscriptionSpanData):
+            # A header is never content, so these come off whether content is captured or not.
+            data.model_config = _without_secrets(data.model_config)
         if not self.capture_content:
-            data = span.span_data
-            if isinstance(data, GenerationSpanData | FunctionSpanData):
-                data.input = None
-                data.output = None
-            elif isinstance(data, ResponseSpanData):
-                data.input = None
+            self._scrub(data)
         self.inner.on_span_end(span)
+
+    @staticmethod
+    def _scrub(data: object) -> None:
+        if isinstance(data, GenerationSpanData):
+            data.input = None
+            data.output = None
+        elif isinstance(data, FunctionSpanData):
+            data.input = None
+            data.output = None
+        elif isinstance(data, ResponseSpanData):
+            if data.response is not None:  # keep the id, which the span exports, and drop the answer
+                data._response_id = data.response.id  # pyright: ignore[reportPrivateUsage]
+            data.response = None
+            data.input = None
+        elif isinstance(data, CustomSpanData):
+            data.data = {}
+        elif isinstance(data, SpeechSpanData | TranscriptionSpanData):
+            data.input = None
+            data.output = None
+        elif isinstance(data, SpeechGroupSpanData):
+            data.input = None
 
     @override
     def shutdown(self) -> None:
@@ -246,12 +289,9 @@ class AuthFIModel(LitellmModel):
 
 
 @dataclass(frozen=True, slots=True)
-class PendingApproval:
-    """A paused tool call whose approval a person has not decided yet."""
+class PendingApproval(BasePendingApproval):
+    """A paused tool call whose approval a person has not decided yet; ``item`` is the SDK's own."""
 
-    approval_id: str
-    tool: str
-    args: dict[str, Any]
     item: ToolApprovalItem
 
 
@@ -341,10 +381,10 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
                 raise refused from error
             raise
         outcome = self.gateway.read_result(result)
-        if outcome.kind == "approval_required":
+        if isinstance(outcome, ToolApprovalRequired):
             self.gateway.project.logger.info("%s waits for approval %s", tool, outcome.approval_id)
-            return _Held(cast(str, outcome.approval_id))
-        if outcome.kind == "refused":
+            return _Held(outcome.approval_id)
+        if isinstance(outcome, ToolRefused):
             self.gateway.project.logger.info("the gateway refused %s: %s", tool, outcome.code or outcome.error)
             return _Decided(_text_result(outcome.model_text))
         return _Decided(result)
