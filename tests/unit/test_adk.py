@@ -293,3 +293,81 @@ async def test_your_callbacks_run_after_these(adk: ADKIntegration) -> None:
     agent = adk.agent(name="a", instruction="i", model="m", before_tool_callback=mine, after_tool_callback=[mine])
     assert agent.before_tool_callback == [adk.before_tool_callback, mine]
     assert agent.after_tool_callback == [adk.after_tool_callback, mine]
+
+
+async def test_with_google_credentials_present_the_gateway_still_gets_the_agents_token(
+    fake: FakeGateway, adk: ADKIntegration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With Application Default Credentials ADK swaps in Google's mTLS client, which sends no AuthFI token."""
+    import google.auth
+    import httpx
+    from google.adk.tools.mcp_tool import mcp_session_manager as manager
+
+    through_google: list[httpx.Request] = []
+
+    class GoogleTransport(httpx.AsyncBaseTransport):
+        def __init__(self, auth_session: Any) -> None:
+            pass
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            through_google.append(request)
+            return httpx.Response(500, request=request)
+
+    class MtlsSession:
+        is_mtls = True
+
+        def __init__(self, credentials: Any) -> None:
+            pass
+
+        async def configure_mtls_channel(self) -> None:
+            pass
+
+    def default_credentials(**_: Any) -> tuple[object, str]:
+        return object(), "a-project"
+
+    def refreshable(*_: Any, **__: Any) -> object:
+        return object()
+
+    monkeypatch.setattr(google.auth, "default", default_credentials)
+    monkeypatch.setattr(manager, "_AIO_SUPPORTED", True)
+    monkeypatch.setattr(manager, "AsyncAuthorizedSession", MtlsSession)
+    monkeypatch.setattr(manager, "_RefreshableAsyncCredentials", refreshable)
+    monkeypatch.setattr(manager, "_GoogleAuthAsyncTransport", GoogleTransport)
+    monkeypatch.setenv("GOOGLE_API_USE_CLIENT_CERTIFICATE", "true")
+
+    tools = await adk.toolset().get_tools()
+
+    assert len(tools) == 3
+    assert through_google == []  # nothing went through Google's client
+    listed = [r for r in fake.requests if r["path"].endswith("/mcp")]
+    assert listed
+    assert all(r["headers"]["authorization"].startswith("Bearer tok-minted-") for r in listed)
+
+
+REFUSED = "MCP tool execution failed: The AuthFI gateway refused this credential"
+
+
+async def test_a_refused_token_is_read_from_the_calls_own_response_not_from_shared_state(
+    adk: ADKIntegration,
+) -> None:
+    """ADK may run tool calls in parallel: call B's success clears the gateway's field before A's callback runs."""
+    adk.gateway.token_refused = None  # what a parallel success leaves behind
+    tool = SimpleNamespace(name=ALLOWED)
+    context = SimpleNamespace(tool_confirmation=None)
+    with pytest.raises(GatewayTokenRefused):
+        await adk.after_tool_callback(tool, dict(ARGS), context, {"error": REFUSED})  # type: ignore[arg-type]
+
+
+async def test_an_unrelated_tool_error_does_not_raise_a_stale_refusal(adk: ADKIntegration) -> None:
+    adk.gateway.token_refused = GatewayTokenRefused(adk.gateway.mcp_url, None)  # left by another call
+    tool = SimpleNamespace(name=ALLOWED)
+    context = SimpleNamespace(tool_confirmation=None)
+    assert await adk.after_tool_callback(tool, dict(ARGS), context, {"error": "repo not found"}) is None  # type: ignore[arg-type]
+
+
+def test_the_pending_approval_extends_the_one_vocabulary() -> None:
+    from authfi.adk import PendingApproval
+    from authfi.gateway import PendingApproval as Base
+
+    assert issubclass(PendingApproval, Base)
+    assert list(PendingApproval.__dataclass_fields__) == ["approval_id", "tool", "args", "call_id"]

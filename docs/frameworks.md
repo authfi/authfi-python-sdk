@@ -284,10 +284,12 @@ is tested with (`google-adk` 2.12, pinned by the extra), and raises `Integration
 
 **Refusals** reach the model as `{"error": "<why>"}`. ADK turns every MCP failure into text for the
 model; when the gateway refused the token itself, the tool callback raises `GatewayTokenRefused`
-instead, ending the run.
+instead, ending the run. The callback reads the refusal from that call's own response, so tool
+calls ADK runs in parallel cannot clear or inherit one another's.
 
 **Approvals.** A held call becomes ADK's tool confirmation: `held_approvals(events)` lists them, and
-`answer(pending, confirmed=...)` is the message that answers one. Send it once the person has
+`answer(pending, confirmed=...)` is the message that answers one. A pending approval is
+`authfi.gateway.PendingApproval` (`approval_id`, `tool`, `args`) with ADK's `call_id`. Send it once the person has
 decided in AuthFI: the call is then sent with the approval, and the gateway decides. ADK confirms a
 call once, so a call confirmed before the person decided reaches the model as still waiting, and
 the same call made again goes under the same approval and asks again; no second approval is
