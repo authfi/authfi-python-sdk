@@ -409,11 +409,10 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         :class:`Secret` you hold). Use it for per-object decisions, for a fresh answer, and for a
         token an agent holds for a person, which carries no ``permissions``.
         """
-        url = self.api_origin + CHECK_PATH
+        api_origin = self.resolve_api_origin()
+        url = api_origin + CHECK_PATH
         headers = _authorization(credential, "POST", url)
-        request = check_request(
-            self.api_origin, headers, subject=subject, relation=relation, obj=object, context=context
-        )
+        request = check_request(api_origin, headers, subject=subject, relation=relation, obj=object, context=context)
         allowed, held, reason = parse_check(self._transport.send(request))
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
@@ -566,11 +565,10 @@ class AsyncAuthFI(_Project):
         context: Mapping[str, Any] | None = None,
     ) -> CheckResult:
         """See :meth:`AuthFI.check`."""
-        url = self.api_origin + CHECK_PATH
+        api_origin = await self.resolve_api_origin()
+        url = api_origin + CHECK_PATH
         headers = await _async_authorization(credential, "POST", url)
-        request = check_request(
-            self.api_origin, headers, subject=subject, relation=relation, obj=object, context=context
-        )
+        request = check_request(api_origin, headers, subject=subject, relation=relation, obj=object, context=context)
         allowed, held, reason = parse_check(await self._transport.send(request))
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
