@@ -18,7 +18,7 @@ import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import ClassVar, Literal, NoReturn, Protocol, runtime_checkable
+from typing import Any, ClassVar, Literal, NoReturn, Protocol, runtime_checkable
 
 import httpx
 
@@ -238,6 +238,12 @@ class TokenSet:
     def __repr__(self) -> str:
         refresh = "yes" if self.refresh_token else "no"
         return f"TokenSet(expires_at={self.expires_at.isoformat()}, scope={sorted(self.scope)!r}, refresh={refresh})"
+
+    def __copy__(self) -> TokenSet:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> TokenSet:
+        return self
 
     def __reduce__(self) -> NoReturn:
         raise TypeError("A TokenSet cannot be pickled: store a session id, and keep the tokens in a TokenStore.")
