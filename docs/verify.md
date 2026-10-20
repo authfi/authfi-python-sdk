@@ -30,7 +30,7 @@ AuthFI's own audiences are refused when the verifier is built: the issuer, any U
 as `<issuer>/mcp`, the audience of tokens meant for the AuthFI gateway), and AuthFI's own
 applications. Accepting one would let a token meant for AuthFI be replayed at your API.
 
-`expected_tenant_id` pins the tenant tokens must name. Set it.
+`expected_tenant_id` pins the tenant tokens must name. Set it. An empty value is a `ConfigurationError`, never "no pin": leave the argument out for that.
 
 ## What is checked
 
@@ -42,7 +42,7 @@ applications. Accepting one would let a token meant for AuthFI be replayed at yo
 | `kid` names a published key of that algorithm | `token_key_unknown` |
 | The signature | `token_signature_invalid` |
 | `iss` is the project's issuer exactly | `token_issuer_not_accepted` |
-| `exp` is present and not past (with the leeway) | `token_claims_invalid`, `token_expired` |
+| `exp` is present and not reached (a token is expired from `exp` plus the leeway) | `token_claims_invalid`, `token_expired` |
 | `nbf` and `iat` are not in the future | `token_claims_invalid` |
 | `aud` holds one of your audiences | `token_audience_mismatch` |
 | `sub` and `tenant_id` are present; `tenant_id` is the pinned tenant | `token_claims_invalid`, `token_no_tenant`, `token_tenant_not_issuers` |
@@ -69,7 +69,9 @@ the caller (see below).
 | `claims` | Every claim, read-only |
 
 Compare `principal`, never `sub` strings: tokens of different kinds write the same party
-differently.
+differently. A typed `agent:` or `app:` subject keeps its own kind (`agent` or `machine`) even
+when the token names an actor; only a person's subject with an actor is `delegated`. `scopes`
+reads the `scope` claim and `client_id` the `client_id` claim; `scp` and `azp` are not read.
 
 ## Authorization
 
@@ -145,8 +147,9 @@ requirement".
 | A missing scope | 403, `Bearer error="insufficient_scope", scope="..."` |
 | A missing permission or role | 403, `{"error":"forbidden"}` |
 | Authentication too weak or old | 401, `Bearer error="insufficient_user_authentication", acr_values="...", max_age=...` |
+| The project's keys or discovery cannot be reached | 503, `Retry-After: 5`, `{"error":"service_unavailable"}`; the cause is logged at error |
 
-The precise code is logged on the `authfi` logger and is not sent: a caller cannot tell a wrong
+Every answer carries `Cache-Control: no-store`. The precise code is logged on the `authfi` logger (a warning, or info when no token was sent) and is not sent: a caller cannot tell a wrong
 key from a wrong audience. For an internal API whose callers may see why,
 `expose_refusal_code=True` adds `"code"` to the body. A refusal raised inside a route
 (`token.require_acr(...)`) is answered the same way.

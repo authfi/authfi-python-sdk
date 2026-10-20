@@ -152,15 +152,19 @@ class AccessToken:
         act = claims.get("act")
         actor_sub = cast(Mapping[str, Any], act).get("sub") if isinstance(act, dict) else None
         actor = _parse_party(actor_sub, "app") if isinstance(actor_sub, str) else None
+        typed = sub.startswith(("user:", "app:", "agent:"))
         principal: Principal
         kind: TokenKind
-        if sub.startswith(("user:", "app:", "agent:")) and actor is not None:
-            principal, kind = _parse_party(sub, "user"), "delegated"
-        elif actor is not None:
-            principal, kind = Principal("user", sub), "delegated"
-        elif sub.startswith(("agt_", "agent:")):
+        if sub.startswith("user:") or (actor is not None and not typed):
+            principal = _parse_party(sub, "user")
+            kind = "delegated" if actor is not None else "person"
+        elif typed:
+            # A typed agent or app token keeps its own kind, with or without an actor.
+            principal = _parse_party(sub, "user")
+            kind = "agent" if principal.kind == "agent" else "machine"
+        elif sub.startswith("agt_"):
             principal, kind = _parse_party(sub, "agent"), "agent"
-        elif sub.startswith("app:") or (client and sub == client):
+        elif client and sub == client:
             principal, kind = _parse_party(sub, "app"), "machine"
         else:
             principal, kind = _parse_party(sub, "user"), "person"
@@ -282,6 +286,11 @@ def _raw(token: Secret | str) -> str:
     return token.reveal() if isinstance(token, Secret) else token
 
 
+def _log_refused(logger: logging.Logger, error: InvalidToken) -> None:
+    """A refusal, with its precise code: info when no token was sent, else warning (as the kernel logs it)."""
+    logger.log(logging.INFO if error.code == "token_missing" else logging.WARNING, "refused a token: %s", error.code)
+
+
 class _VerifierBase:
     def __init__(
         self,
@@ -293,14 +302,26 @@ class _VerifierBase:
     ) -> None:
         if leeway is not None and not 0 <= leeway <= 300:
             raise ConfigurationError(f"leeway must be from 0 to 300 seconds, not {leeway!r}")
+        if expected_tenant_id is not None and not expected_tenant_id.strip():
+            raise ConfigurationError(
+                "expected_tenant_id must not be empty: leave it out for no pin. An empty value read from the "
+                "environment would otherwise switch the tenant check off."
+            )
         self._config = VerifyConfig(
             issuer=project.issuer,
             audiences=check_audiences(project, audience),
             leeway=project.leeway if leeway is None else float(leeway),
-            expected_tenant_id=expected_tenant_id or None,
+            expected_tenant_id=expected_tenant_id,
         )
         self._clock = project.clock
         self._log = project.logger
+        self._origin_checked = False
+
+    def _check_learned_origin(self, project: AuthFI | AsyncAuthFI) -> None:
+        """Once discovery has taught the API origin, refuse an audience under it, as construction could not."""
+        if not self._origin_checked:
+            check_audiences(project, sorted(self._config.audiences))
+            self._origin_checked = True
 
     @property
     def issuer(self) -> str:
@@ -329,7 +350,7 @@ class _VerifierBase:
         return InvalidToken("token_dpop_unbound", "the DPoP scheme with a token bound to no key")
 
     def _refused(self, error: InvalidToken) -> InvalidToken:
-        self._log.debug("refused a token: %s", error.code)
+        _log_refused(self._log, error)
         return error
 
     def __repr__(self) -> str:
@@ -386,6 +407,8 @@ class TokenVerifier(_VerifierBase):
     def _claims(self, raw: str, config: VerifyConfig, *, bearer: bool) -> Mapping[str, Any]:
         try:
             token: Unverified = inspect_token(raw)
+            self._project.resolve_api_origin()
+            self._check_learned_origin(self._project)
             claims = verify_signature(token, self._project._key(token.kid))  # pyright: ignore[reportPrivateUsage]
             check_claims(claims, config, self._clock.time(), bearer=bearer)
         except InvalidToken as error:
@@ -445,6 +468,8 @@ class AsyncTokenVerifier(_VerifierBase):
     async def _claims(self, raw: str, config: VerifyConfig, *, bearer: bool) -> Mapping[str, Any]:
         try:
             token = inspect_token(raw)
+            await self._project.resolve_api_origin()
+            self._check_learned_origin(self._project)
             key = await self._project._key(token.kid)  # pyright: ignore[reportPrivateUsage]
             claims = verify_signature(token, key)
             check_claims(claims, config, self._clock.time(), bearer=bearer)
@@ -517,9 +542,13 @@ class MultiIssuerVerifier:
         return tuple(self._verifiers)
 
     def _pick(self, raw: str) -> TokenVerifier:
-        verifier = self._verifiers.get(_issuer_of(raw))
-        if verifier is None:
-            raise InvalidToken("token_issuer_not_accepted", "the token's issuer is not on the allow-list")
+        try:
+            verifier = self._verifiers.get(_issuer_of(raw))
+            if verifier is None:
+                raise InvalidToken("token_issuer_not_accepted", "the token's issuer is not on the allow-list")
+        except InvalidToken as error:
+            _log_refused(self.logger, error)
+            raise
         return verifier
 
     def verify(self, raw: Secret | str) -> AccessToken:
@@ -536,7 +565,11 @@ class MultiIssuerVerifier:
         url: str | None = None,
     ) -> AccessToken:
         """See :meth:`TokenVerifier.verify_request`."""
-        _, raw = _scheme(authorization)
+        try:
+            _, raw = _scheme(authorization)
+        except InvalidToken as error:
+            _log_refused(self.logger, error)
+            raise
         return self._pick(raw).verify_request(authorization, dpop=dpop, method=method, url=url)
 
 
@@ -557,9 +590,13 @@ class AsyncMultiIssuerVerifier:
         return tuple(self._verifiers)
 
     def _pick(self, raw: str) -> AsyncTokenVerifier:
-        verifier = self._verifiers.get(_issuer_of(raw))
-        if verifier is None:
-            raise InvalidToken("token_issuer_not_accepted", "the token's issuer is not on the allow-list")
+        try:
+            verifier = self._verifiers.get(_issuer_of(raw))
+            if verifier is None:
+                raise InvalidToken("token_issuer_not_accepted", "the token's issuer is not on the allow-list")
+        except InvalidToken as error:
+            _log_refused(self.logger, error)
+            raise
         return verifier
 
     async def verify(self, raw: Secret | str) -> AccessToken:
@@ -576,5 +613,9 @@ class AsyncMultiIssuerVerifier:
         url: str | None = None,
     ) -> AccessToken:
         """See :meth:`TokenVerifier.verify_request`."""
-        _, raw = _scheme(authorization)
+        try:
+            _, raw = _scheme(authorization)
+        except InvalidToken as error:
+            _log_refused(self.logger, error)
+            raise
         return await self._pick(raw).verify_request(authorization, dpop=dpop, method=method, url=url)
