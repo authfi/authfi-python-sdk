@@ -117,6 +117,56 @@ def test_an_exchanged_delegated_token_t6_has_a_bare_subject(af: AuthFI, platform
     assert token.token_kind == "delegated"
 
 
+# One table, read the same by every SDK (the conformance vectors carry these cases too).
+KINDS: list[tuple[str, dict[str, Any], tuple[str, str, str | None, str | None]]] = [
+    (
+        "typed agent with an actor",
+        {"sub": "agent:agt_1", "act": {"sub": "agt_2"}},
+        ("agent", "agent:agt_1", "agent:agt_2", None),
+    ),
+    (
+        "typed app with an actor",
+        {"sub": "app:app_1", "act": {"sub": "agt_1"}},
+        ("machine", "app:app_1", "agent:agt_1", None),
+    ),
+    ("typed app alone", {"sub": "app:app_1"}, ("machine", "app:app_1", None, None)),
+    (
+        "typed user with an actor",
+        {"sub": "user:usr_1", "act": {"sub": "agent:agt_1"}},
+        ("delegated", "user:usr_1", "agent:agt_1", None),
+    ),
+    ("typed user alone", {"sub": "user:usr_1"}, ("person", "user:usr_1", None, None)),
+    (
+        "bare subject with an actor",
+        {"sub": "usr_1", "act": {"sub": "agt_1"}},
+        ("delegated", "user:usr_1", "agent:agt_1", None),
+    ),
+    ("agt_ subject", {"sub": "agt_1", "client_id": "agt_1"}, ("agent", "agent:agt_1", None, None)),
+    ("subject equals client_id", {"sub": "app_1", "client_id": "app_1"}, ("machine", "app:app_1", None, None)),
+    (
+        "subject equals azp, no client_id",
+        {"sub": "app_1", "client_id": None, "azp": "app_1"},
+        ("person", "user:app_1", None, None),
+    ),
+    ("scp is not the scope claim", {"scp": "a b", "scope": None}, ("person", "user:usr_1", None, "")),
+]
+
+
+@pytest.mark.parametrize(("name", "extra", "expected"), KINDS, ids=[k[0] for k in KINDS])
+def test_the_kind_of_token_is_read_the_way_node_reads_it(
+    af: AuthFI, platform: Platform, name: str, extra: dict[str, Any], expected: tuple[str, str, str | None, str | None]
+) -> None:
+    kind, principal, actor, scopes = expected
+    token = af.verifier(audience=AUD).verify(platform.access_token(**extra))
+    assert token.token_kind == kind
+    assert str(token.principal) == principal
+    assert (str(token.actor) if token.actor else None) == actor
+    if scopes is not None:
+        assert token.scopes == frozenset(scopes.split())
+    if "azp" in extra:
+        assert token.client_id == ""
+
+
 def test_an_es256_token_verifies(af: AuthFI, platform: Platform) -> None:
     assert af.verifier(audience=AUD).verify(platform.access_token(alg="ES256")).principal.id == "usr_1"
 
@@ -196,6 +246,20 @@ def test_expiry_and_issue_times_respect_the_leeway(af: AuthFI, platform: Platfor
     assert code_of(strict.verify, platform.keys.sign(claims(platform, exp=now - 1))) == "token_expired"
 
 
+def test_a_token_is_expired_from_the_second_exp_plus_the_leeway_is_reached(
+    af: AuthFI, platform: Platform, clock: FakeClock
+) -> None:
+    """RFC 7519 §4.1.4: ``exp`` is the first instant the token is not to be accepted. Node does the same."""
+    now = int(clock.wall)
+    clock.wall = float(now)
+    verifier = af.verifier(audience=AUD, leeway=60)
+    assert verifier.verify(platform.keys.sign(claims(platform, exp=now - 59))).principal.id == "usr_1"
+    assert code_of(verifier.verify, platform.keys.sign(claims(platform, exp=now - 60))) == "token_expired"
+    assert code_of(af.verifier(audience=AUD, leeway=0).verify, platform.keys.sign(claims(platform, exp=now))) == (
+        "token_expired"
+    )
+
+
 def test_the_issuer_must_match_exactly(verify: Any, platform: Platform) -> None:
     raw = platform.keys.sign(claims(platform, iss=platform.issuer + "/"))
     assert code_of(verify, raw) == "token_issuer_not_accepted"
@@ -243,6 +307,11 @@ def test_a_sender_constrained_token_is_refused_as_bearer(
     assert code_of(verify, platform.keys.sign(claims(platform, **bound))) == "token_dpop_proof_required"
 
 
+def test_a_bound_token_is_refused_before_an_actor_chain_is_looked_at(verify: Any, platform: Platform) -> None:
+    raw = platform.access_token(cnf={"jkt": "x"}, act={"sub": "agt_1", "act": {"sub": "agt_2"}})
+    assert code_of(verify, raw) == "token_dpop_proof_required"
+
+
 def test_a_nested_actor_chain_is_refused(verify: Any, platform: Platform) -> None:
     raw = platform.keys.sign(claims(platform, act={"sub": "agt_1", "act": {"sub": "agt_2"}}))
     assert code_of(verify, raw) == "token_act_chain_unsupported"
@@ -266,6 +335,13 @@ def test_the_tenant_pin(af: AuthFI, platform: Platform) -> None:
 )
 def test_malformed_tokens(verify: Any, raw: str) -> None:
     assert code_of(verify, raw) in ("token_malformed", "token_missing")
+
+
+def test_a_token_over_16_kib_is_refused_before_any_key_is_fetched(af: AuthFI, platform: Platform) -> None:
+    padding = "x" * (17 * 1024)
+    raw = f"{b64url(b'{}')}.{b64url(padding.encode())}.{b64url(b'sig')}"
+    assert code_of(af.verifier(audience=AUD).verify, raw) == "token_malformed"
+    assert platform.calls("GET", "/.well-known/jwks.json") == []
 
 
 def test_a_tampered_payload_does_not_verify(verify: Any, platform: Platform) -> None:
@@ -297,6 +373,38 @@ def test_a_url_under_the_api_origin_is_refused(clock: FakeClock) -> None:
     af = AuthFI("https://login.acme.com", api_origin="https://acme.authfi.io", clock=clock)
     with pytest.raises(ConfigurationError):
         af.verifier(audience=["https://acme.authfi.io/mcp"])
+
+
+def test_an_audience_under_an_api_origin_learned_from_discovery_is_refused_on_first_use(clock: FakeClock) -> None:
+    platform = Platform(issuer="https://login.acme.com")
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    af = AuthFI(platform.issuer, http_client=platform.client(), clock=clock)
+    verifier = af.verifier(audience=["https://acme.authfi.io/mcp"])  # the API origin is not known yet
+    with pytest.raises(ConfigurationError, match="resource=<your API's client id>"):
+        verifier.verify(platform.access_token(aud="https://acme.authfi.io/mcp"))
+
+
+async def test_the_async_verifier_refuses_an_audience_under_a_learned_api_origin(clock: FakeClock) -> None:
+    platform = Platform(issuer="https://login.acme.com")
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
+        verifier = aaf.verifier(audience=["https://acme.authfi.io/mcp"])
+        with pytest.raises(ConfigurationError, match="resource=<your API's client id>"):
+            await verifier.verify(platform.access_token(aud="https://acme.authfi.io/mcp"))
+
+
+@pytest.mark.parametrize("pin", ["", "   "])
+def test_a_blank_tenant_pin_is_an_error_not_no_pin(af: AuthFI, aaf: AsyncAuthFI, pin: str) -> None:
+    """``os.environ.get("AUTHFI_TENANT_ID", "")`` must not quietly switch the tenant check off."""
+    with pytest.raises(ConfigurationError, match="expected_tenant_id must not be empty"):
+        af.verifier(audience=AUD, expected_tenant_id=pin)
+    with pytest.raises(ConfigurationError, match="expected_tenant_id must not be empty"):
+        aaf.verifier(audience=AUD, expected_tenant_id=pin)
+    assert af.verifier(audience=AUD).expected_tenant_id is None
 
 
 @pytest.mark.parametrize("audience", [[], [""], "api_orders"])
