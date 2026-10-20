@@ -155,3 +155,13 @@ def test_api_errors_and_relayed_provider_envelopes() -> None:
     nested = api_error(answer(403, b'{"error":{"code":"EMODEL003","message":"not granted"}}'), "x")
     assert isinstance(nested, APIError) and nested.code == "EMODEL003" and nested.description == "not granted"
     assert isinstance(api_error(answer(502, b""), "x"), TransportError)
+
+
+@pytest.mark.parametrize("body", [b'{"expires_in": NaN}', b'{"expires_in": Infinity}', b'{"expires_in": -Infinity}'])
+def test_json_constants_that_are_not_json_are_refused(body: bytes) -> None:
+    response = answer(200, body)
+    with pytest.raises(ValueError, match="not valid JSON"):
+        response.json()
+    assert response.json_object() is None
+    with pytest.raises(OAuthError):
+        parse_token_response(response, what="the token endpoint")

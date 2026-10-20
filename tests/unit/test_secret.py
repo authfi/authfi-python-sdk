@@ -75,10 +75,11 @@ def test_equality_and_no_hash() -> None:
         hash(Secret("a"))
 
 
-def test_truthiness_and_length_do_not_reveal() -> None:
+def test_truthiness_is_kept_and_the_length_is_not_given_away() -> None:
     assert Secret("abc")
     assert not Secret("")
-    assert len(Secret("abc")) == 3
+    with pytest.raises(TypeError):
+        len(Secret("abc"))  # type: ignore[arg-type]
 
 
 def test_a_non_string_is_refused() -> None:
