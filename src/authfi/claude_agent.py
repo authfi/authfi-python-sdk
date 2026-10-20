@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import shlex
 import sys
 from collections import OrderedDict
@@ -70,7 +71,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
 from authfi.errors import ConfigurationError, GatewayTokenRefused, NotSupportedError
-from authfi.gateway import HOLD_MESSAGE, token_refusal
+from authfi.gateway import HOLD_MESSAGE, PendingApproval, ToolApprovalRequired, ToolRefused, token_refusal
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
@@ -91,26 +92,34 @@ CONTENT_SWITCHES = (
 #: an agent token's lifetime of minutes.
 KEY_HELPER_TTL_MS = 240_000
 
-#: Environment that would hand Claude Code a fixed credential; the helper is the only way in.
+#: Environment that would hand Claude Code a fixed credential; the helper is the only way in. Claude
+#: Code inherits this process's environment, so each is also blanked in the environment it is given.
 _FIXED_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY")
+
+#: Environment the integration sets and the caller may not: a different value would send the agent's
+#: token to another host, run another helper, or switch content on.
+_OWNED = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "OTEL_RESOURCE_ATTRIBUTES",
+)
+_OWNED_PREFIXES = ("AUTHFI_", "OTEL_LOG_")
 
 #: How many held or decided calls the integration remembers until Claude Code runs them.
 MEMORY = 10_000
+
+#: How long it remembers one. A call nobody ran is forgotten, so a later identical call is sent afresh.
+MEMORY_SECONDS = 120.0
 
 #: Returns, or resolves, once the person has decided; its value is not read: the gateway decides.
 WaitForDecision = Callable[["PendingApproval"], object]
 CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext], Awaitable[PermissionResultAllow | PermissionResultDeny]
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class PendingApproval:
-    """A call the gateway holds until a person approves it in AuthFI."""
-
-    approval_id: str
-    tool: str
-    args: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +149,7 @@ class ClaudeAgentIntegration:
             ``python -m authfi token``, which signs with that file.
         wait_for_decision: awaited with a :class:`PendingApproval` when the gateway holds a call;
             return once the person has decided in AuthFI. Without it, a held call is refused for now
-            with "This action is waiting for a person's approval.", and the same call made later is
+            with "This action is waiting for a person's approval in AuthFI.", and the same call made later is
             sent with the approval.
         project: the project, for a credential of your own that does not name it.
         server_name: the name of the gateway's MCP server in Claude Code.
@@ -178,7 +187,7 @@ class ClaudeAgentIntegration:
         self.prefix = f"mcp__{server_name}__"
         #: The gateway's refusal of the token, once it happened: the run was stopped.
         self.token_refused: GatewayTokenRefused | None = None
-        self._calls: OrderedDict[str, _Held | _Decided] = OrderedDict()
+        self._calls: OrderedDict[str, tuple[_Held | _Decided, float]] = OrderedDict()
         self._other: CanUseTool | None = None
 
     # --- the gateway's tools --------------------------------------------------------------------------
@@ -224,26 +233,41 @@ class ClaudeAgentIntegration:
         except Exception as error:
             raise self._refused(error) from error
         outcome = self.gateway.read_result(result)
-        if outcome.kind == "approval_required":
+        if isinstance(outcome, ToolApprovalRequired):
             self.gateway.project.logger.info("%s waits for approval %s", tool, outcome.approval_id)
-            return _Held(cast(str, outcome.approval_id))
-        if outcome.kind == "refused":
+            return _Held(outcome.approval_id)
+        if isinstance(outcome, ToolRefused):
             self.gateway.project.logger.info("the gateway refused %s: %s", tool, outcome.code or outcome.error)
             return _Decided(_text(outcome.model_text))
         content = [block.model_dump(by_alias=True, exclude_none=True) for block in result.content]
         return _Decided({"content": content, "is_error": bool(result.isError)})
 
     def _remember(self, key: str, entry: _Held | _Decided) -> None:
-        self._calls[key] = entry
+        self._calls[key] = (entry, self.gateway.project.clock.monotonic())
         self._calls.move_to_end(key)
         while len(self._calls) > MEMORY:
             self._calls.popitem(last=False)
+
+    def _recall(self, key: str, *, take: bool = False) -> _Held | _Decided | None:
+        """What was remembered for this call, unless it is older than :data:`MEMORY_SECONDS`."""
+        found = self._calls.pop(key, None) if take else self._calls.get(key)
+        if found is None:
+            return None
+        entry, at = found
+        if self.gateway.project.clock.monotonic() - at > MEMORY_SECONDS:
+            self._calls.pop(key, None)
+            return None
+        return entry
+
+    def reset(self) -> None:
+        """Forget every remembered call. Call it when a run ends, so the next run never inherits an answer."""
+        self._calls.clear()
 
     def _handler(self, tool: str) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
         async def run(arguments: dict[str, Any]) -> dict[str, Any]:
             args = self.gateway.strip_approval_argument(arguments)
             key = _key(tool, args)
-            known = self._calls.pop(key, None)
+            known = self._recall(key, take=True)
             if isinstance(known, _Decided):  # can_use_tool sent it and the gateway decided
                 return known.answer
             try:
@@ -292,7 +316,7 @@ class ClaudeAgentIntegration:
         tool = tool_name[len(self.prefix) :]
         args = self.gateway.strip_approval_argument(tool_input)
         key = _key(tool, args)
-        known = self._calls.get(key)
+        known = self._recall(key)
         try:
             if not isinstance(known, _Decided):
                 known = await self._send(tool, args, known.approval_id if known else None)
@@ -352,12 +376,18 @@ class ClaudeAgentIntegration:
                 "permission_mode bypassPermissions skips can_use_tool, and with it AuthFI approvals"
             )
         given_env = dict(claude_options.pop("env", None) or {})
-        for name in _FIXED_CREDENTIALS:
-            if name in given_env:
-                raise ConfigurationError(
-                    f"{name} in env is a fixed credential; Claude Code gets the agent's token itself"
-                )
+        _refuse_owned(given_env, "env")
+        inherited = [name for name in _FIXED_CREDENTIALS if os.environ.get(name)]
+        if inherited:
+            self.gateway.project.logger.warning(
+                "%s is set in this process's environment; Claude Code is not given it: the agent's token comes "
+                "from the key file",
+                ", ".join(inherited),
+            )
         env = {
+            **given_env,
+            # Claude Code starts with this process's environment under these: blank, so none reaches it.
+            **dict.fromkeys(_FIXED_CREDENTIALS, ""),
             "ANTHROPIC_BASE_URL": self.gateway.model_base_url("anthropic"),
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
@@ -369,9 +399,9 @@ class ClaudeAgentIntegration:
             "OTEL_RESOURCE_ATTRIBUTES": f"authfi.agent_id={self.agent_id}",
             **self.helper_env(),
             **{name: "1" if capture_content else "0" for name in CONTENT_SWITCHES},
-            **given_env,
         }
         settings = _settings(claude_options.pop("settings", None))
+        _refuse_owned(settings.get("env"), "settings['env']")
         settings["apiKeyHelper"] = f"{shlex.quote(sys.executable)} -m authfi token"
         servers = dict(claude_options.pop("mcp_servers", None) or {})
         if self.server_name in servers:
@@ -409,6 +439,26 @@ class ClaudeAgentIntegration:
         metadata["authfi_agent_id"] = self.agent_id
         configure_langsmith(capture_content=capture_content)
         return bool(configure_claude_agent_sdk(metadata=metadata, **kwargs))
+
+
+def _refuse_owned(env: object, where: str) -> None:
+    """Refuse an environment variable that would turn the agent's token, or the content switches, elsewhere."""
+    if not isinstance(env, Mapping):
+        return
+    for name in cast(Mapping[str, object], env):
+        if name in _FIXED_CREDENTIALS:
+            raise ConfigurationError(
+                f"{name} in {where} is a fixed credential; Claude Code gets the agent's token itself"
+            )
+        if name == "ANTHROPIC_BASE_URL":
+            raise ConfigurationError(
+                f"ANTHROPIC_BASE_URL in {where} would send the agent's token to another host: Claude Code is "
+                "pointed at the AuthFI gateway by this integration"
+            )
+        if name.startswith("OTEL_LOG_"):
+            raise ConfigurationError(f"{name} in {where} is set from capture_content, not by hand")
+        if name in _OWNED or name.startswith(_OWNED_PREFIXES):
+            raise ConfigurationError(f"{name} in {where} is set by the integration")
 
 
 def _settings(value: object) -> dict[str, Any]:

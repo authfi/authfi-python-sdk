@@ -198,7 +198,11 @@ async with ClaudeSDKClient(options) as client:
 gateway with that token, running it again every four minutes. The helper signs as the agent with
 the agent's key file, so the agent's key must be loaded from a file (`AgentKey.from_file` or
 `AUTHFI_AGENT_KEY_FILE`). Claude Code's options and environment hold the file's path, never the key
-or a token; an `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` passed in `env` is refused.
+or a token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
+switch content on: `ANTHROPIC_BASE_URL`, every `AUTHFI_*` and `OTEL_LOG_*` name, the other variables
+the integration sets, and `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Claude Code starts with this
+process's environment as well, so the options blank those two (and `AUTHFI_AGENT_PRIVATE_KEY`) in
+the environment they give it, and log that they were set here.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code
@@ -216,10 +220,15 @@ gateway's tools to the permission flow, so `can_use_tool` always runs for them;
 | holds it for approval | `wait_for_decision(pending)` is awaited, then the call is sent again with the approval, and the gateway decides |
 
 Without `wait_for_decision`, a held call is refused for now with "This action is waiting for a
-person's approval."; the same call made after the person decides goes with the approval. The
+person's approval in AuthFI."; the same call made after the person decides goes with the approval. The
 approval id never reaches the model, and one the model writes is removed. `can_use_tool` never
 grants a lasting permission. Tools that are not AuthFI's are refused, unless you pass your own
 `can_use_tool` to `options()`, which then decides them.
+
+The integration remembers the answer to a call for up to two minutes (`MEMORY_SECONDS`), from
+`can_use_tool` until Claude Code runs the tool. A call Claude Code never ran is then forgotten, and
+`claude.reset()` forgets every one at once: call it when a run ends, so the next run, with the same
+tool and arguments, is sent afresh.
 
 **A refused token** stops the run (`can_use_tool` interrupts it), and
 `claude.token_refused` holds the `GatewayTokenRefused`.
