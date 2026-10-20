@@ -105,6 +105,30 @@ class TestLiveAgentToken(unittest.TestCase):
         if not ran:
             self.skipTest("no AUTHFI_LIVE_<ALG>_AGENT_ID / _KEY_FILE configured")
 
+    def test_the_agent_mints_at_the_token_endpoint_the_project_publishes(self):
+        agent = _agent("EDDSA")
+        if agent is None:
+            self.skipTest("AUTHFI_LIVE_EDDSA_AGENT_ID / _KEY_FILE not configured")
+        published = agent.authorization_server_metadata()["token_endpoint"]
+        self.assertEqual(agent.token_endpoint, published)
+        self.assertEqual(published, ORIGIN + "/oauth/token")
+        self.assertTrue(agent.token())
+
+    def test_a_deprecated_token_route_is_reported(self):
+        agent = _agent("EDDSA")
+        if agent is None:
+            self.skipTest("AUTHFI_LIVE_EDDSA_AGENT_ID / _KEY_FILE not configured")
+        legacy = (agent.discovery().get("endpoints") or {}).get("token")
+        if not legacy or legacy == agent.token_endpoint:
+            self.skipTest("agent-configuration names no separate token route")
+        import authfi
+        authfi._deprecations_reported.discard(legacy)
+        old = AgentAuth(agent_id=agent.agent_id, key=agent.key, platform_url=ORIGIN, token_endpoint=legacy)
+        with self.assertLogs("authfi", "WARNING") as logs:
+            self.assertTrue(old.token())
+        self.assertIn(legacy + " is deprecated", logs.output[0])
+        self.assertIn("its successor is " + ORIGIN + "/oauth/token", logs.output[0])
+
     def test_a_key_the_agent_did_not_register_is_refused(self):
         for alg in ALGS:
             agent_id, kid = _env(alg + "_AGENT_ID"), _env(alg + "_KID")

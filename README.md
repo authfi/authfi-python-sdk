@@ -104,9 +104,15 @@ every child process and captured in crash dumps.
 The project address is required, as `platform_url` or `AUTHFI_PLATFORM_URL`, and has no
 default: an agent is registered in one project, and only that project can authenticate it.
 
-Endpoints are read from `/.well-known/agent-configuration`, not hard-coded — the token
-endpoint moves with the project's origin, and the assertion's `aud` is built from the same
-document the server checks it against.
+Endpoints are read from the project, not hard-coded: the token endpoint from its
+authorization server metadata (`/.well-known/oauth-authorization-server`, RFC 8414), falling
+back to `/.well-known/agent-configuration`, and the CIBA endpoint from agent-configuration.
+They move with the project's origin, and the assertion's `aud` is the token endpoint the
+server checks it against.
+
+When a response carries a `Deprecation` header (RFC 9745), the SDK logs one warning per
+address on the `authfi` logger, naming the `successor-version` link, so a route on its way
+out shows up in your logs before it is removed.
 
 `agent.token()` caches and refreshes 60s before expiry. A refusal raises `AgentAuthError`
 carrying the registered OAuth code (`err.error` — `invalid_client`, `invalid_target`, …)

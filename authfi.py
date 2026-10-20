@@ -44,6 +44,8 @@ import base64
 import hashlib
 import hmac
 import functools
+import logging
+import re
 import warnings
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
@@ -65,6 +67,9 @@ __version__ = "0.1.0"
 USER_AGENT = "authfi-python-sdk/" + __version__
 
 _thread_local = local()
+
+# The SDK's logger. A library logs and leaves the configuration to the application.
+_log = logging.getLogger("authfi")
 
 
 class AuthFIError(Exception):
@@ -939,10 +944,15 @@ class AgentAuth:
     own (``https://<project>.authfi.io`` or its custom domain). A default would
     send the agent's signed assertion to a project where it does not exist.
 
-    Endpoints come from ``/.well-known/agent-configuration`` rather than being
-    hard-coded: the token endpoint moves with the project's origin (a tenant
-    subdomain, a custom domain), and the assertion's ``aud`` is built from the
-    same document the server builds its own check from.
+    Endpoints are read from the project, never hard-coded: the token endpoint
+    from its RFC 8414 metadata (``/.well-known/oauth-authorization-server``),
+    falling back to ``/.well-known/agent-configuration``, and the CIBA endpoint
+    from agent-configuration. They move with the project's origin (a tenant
+    subdomain, a custom domain), and the assertion's ``aud`` is the token
+    endpoint the server checks it against.
+
+    A response that carries a ``Deprecation`` header (RFC 9745) is logged once
+    per address on the ``authfi`` logger, with its ``successor-version`` link.
     """
 
     def __init__(
@@ -980,6 +990,7 @@ class AgentAuth:
         self._token_endpoint = token_endpoint
         self._backchannel_endpoint = backchannel_endpoint
         self._discovery = None
+        self._as_metadata = None
 
         self._access_token = None
         self._token_audience = None
@@ -1060,25 +1071,44 @@ class AgentAuth:
 
     def discovery(self):
         """Fetch (once) and check ``/.well-known/agent-configuration``."""
-        if self._discovery is not None:
-            return self._discovery
+        if self._discovery is None:
+            doc = _get_json(self.discovery_url, "Agent discovery")
+            self._check_accepts_this_key(doc)
+            self._discovery = doc
+        return self._discovery
 
-        req = Request(self.discovery_url)
-        req.add_header("User-Agent", USER_AGENT)
-        req.add_header("Accept", "application/json")
-        try:
-            with urlopen(req) as res:
-                doc = json.loads(res.read())
-        except HTTPError as e:
-            raise AuthFIError(
-                "Agent discovery failed at %s: HTTP %s" % (self.discovery_url, e.code),
-                status=e.code,
-            ) from e
-        except Exception as e:
-            raise AuthFIError(
-                "Agent discovery failed at %s: %s" % (self.discovery_url, e), status=502
-            ) from e
+    def authorization_server_metadata(self):
+        """The project's RFC 8414 metadata, fetched once, or None when it publishes none.
 
+        Read from ``<issuer>/.well-known/oauth-authorization-server``, where
+        ``<issuer>`` is :attr:`platform_url`. The document must name that same
+        issuer (RFC 8414 §3.3); one that names another is refused rather than
+        used, because its endpoints would belong to someone else.
+        """
+        if self._as_metadata is None:
+            url = self.platform_url + "/.well-known/oauth-authorization-server"
+            try:
+                doc = _get_json(url, "Authorization server metadata")
+            except AuthFIError as e:
+                if e.status != 404:
+                    raise
+                _log.info("%s publishes no RFC 8414 metadata (HTTP 404)", url)
+                doc = {}
+            if doc:
+                issuer = str(doc.get("issuer") or "").rstrip("/")
+                if issuer != self.platform_url:
+                    raise AuthFIError(
+                        "The authorization server metadata at %s names issuer %r, not %s "
+                        "(RFC 8414 §3.3), so its endpoints are not this project's."
+                        % (url, issuer, self.platform_url),
+                        status=502,
+                    )
+                self._check_accepts_this_key(doc)
+            self._as_metadata = doc
+        return self._as_metadata or None
+
+    def _check_accepts_this_key(self, doc):
+        """Refuse a deployment that would refuse this agent's credential, saying why."""
         methods = doc.get("token_endpoint_auth_methods_supported") or []
         if methods and "private_key_jwt" not in methods:
             # Said here rather than met as an opaque 401 from the token endpoint.
@@ -1099,18 +1129,23 @@ class AgentAuth:
                 % (self.key.alg, ", ".join(algs)),
                 status=400,
             )
-        self._discovery = doc
-        return doc
 
     @property
     def token_endpoint(self):
+        """The project's token endpoint: ``token_endpoint`` from the RFC 8414
+        metadata, or ``endpoints.token`` from agent-configuration when the project
+        publishes no metadata or the metadata names no token endpoint."""
         if not self._token_endpoint:
-            self._token_endpoint = (self.discovery().get("endpoints") or {}).get("token")
-            if not self._token_endpoint:
+            endpoint = (self.authorization_server_metadata() or {}).get("token_endpoint")
+            if not endpoint:
+                endpoint = (self.discovery().get("endpoints") or {}).get("token")
+            if not endpoint:
                 raise AuthFIError(
-                    "Discovery at %s published no token endpoint" % self.discovery_url,
+                    "Neither the authorization server metadata nor discovery at %s "
+                    "published a token endpoint" % self.discovery_url,
                     status=502,
                 )
+            self._token_endpoint = endpoint
         return self._token_endpoint
 
     @property
@@ -1291,6 +1326,57 @@ class AgentAuth:
         return self.await_user_token(approval, timeout=timeout)
 
 
+def _get_json(url, what):
+    """GET a JSON document, reporting a Deprecation header and naming what failed."""
+    req = Request(url)
+    req.add_header("User-Agent", USER_AGENT)
+    req.add_header("Accept", "application/json")
+    try:
+        with urlopen(req) as res:
+            _note_deprecation(url, res.headers)
+            return json.loads(res.read())
+    except HTTPError as e:
+        _note_deprecation(url, e.headers)
+        raise AuthFIError("%s failed at %s: HTTP %s" % (what, url, e.code), status=e.code) from e
+    except Exception as e:
+        raise AuthFIError("%s failed at %s: %s" % (what, url, e), status=502) from e
+
+
+# Addresses whose Deprecation header has been reported, so each is logged once
+# per process rather than on every token refresh.
+_deprecations_reported = set()
+
+_LINK = re.compile(r'<([^>]*)>\s*((?:;[^,<]*)*)')
+
+
+def _successor(link_headers):
+    """The ``successor-version`` target among RFC 8288 Link header values, or None."""
+    for value in link_headers:
+        for target, params in _LINK.findall(value or ""):
+            rel = re.search(r'rel\s*=\s*"?([^";]*)"?', params)
+            if rel and "successor-version" in rel.group(1).split():
+                return target
+    return None
+
+
+def _note_deprecation(url, headers):
+    """Log once that ``url`` answered with a Deprecation header (RFC 9745).
+
+    The server keeps answering a deprecated route until it is removed, so the
+    only sign a caller gets before that day is this header. Nothing is retried
+    or redirected: the warning names the successor so it can be configured.
+    """
+    deprecation = headers.get("Deprecation") if headers is not None else None
+    if not isinstance(deprecation, str) or url in _deprecations_reported:
+        return
+    _deprecations_reported.add(url)
+    successor = _successor(headers.get_all("Link") or [])
+    _log.warning(
+        "%s is deprecated (Deprecation: %s)%s",
+        url, deprecation, "; its successor is %s" % successor if successor else "",
+    )
+
+
 def _post_form(url, params):
     """POST an OAuth form and decode the response, RFC 6749 §4.4.2 / §5.1 / §5.2.
 
@@ -1306,8 +1392,11 @@ def _post_form(url, params):
     data = urlencode(params).encode("utf-8")
     try:
         with urlopen(req, data) as res:
+            _note_deprecation(url, res.headers)
             return json.loads(res.read())
     except HTTPError as e:
+        # A refusal from a deprecated route carries the header too.
+        _note_deprecation(url, e.headers)
         raw = e.read()
         try:
             body = json.loads(raw)

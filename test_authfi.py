@@ -379,22 +379,64 @@ DISCOVERY = {
 TOKEN_ENDPOINT = DISCOVERY["endpoints"]["token"]
 
 
-def _response(body):
+def _headers(pairs=()):
+    """Response headers as urllib gives them (an email.message.Message), so repeats survive."""
+    from email.message import Message
+    msg = Message()
+    for name, value in pairs:
+        msg[name] = value
+    return msg
+
+
+def _response(body, headers=()):
     """A urlopen() context manager returning ``body`` as JSON."""
     res = MagicMock()
     res.read.return_value = json.dumps(body).encode()
+    res.headers = _headers(headers)
     res.__enter__ = lambda s: s
     res.__exit__ = MagicMock(return_value=False)
     return res
 
 
-def _oauth_error(code, description=None, status=400):
+def _oauth_error(code, description=None, status=400, headers=()):
     body = {"error": code}
     if description:
         body["error_description"] = description
     return HTTPError(
-        TOKEN_ENDPOINT, status, code, {}, io.BytesIO(json.dumps(body).encode())
+        TOKEN_ENDPOINT, status, code, _headers(headers), io.BytesIO(json.dumps(body).encode())
     )
+
+
+def _http_error(url, status):
+    return HTTPError(url, status, "error", _headers(), io.BytesIO(b"{}"))
+
+
+#: The project's RFC 8414 metadata, as platform-beta publishes it (trimmed).
+AS_METADATA_URL = ORIGIN + "/.well-known/oauth-authorization-server"
+AGENT_CONFIGURATION_URL = ORIGIN + "/.well-known/agent-configuration"
+OAUTH_TOKEN = ORIGIN + "/oauth/token"
+AS_METADATA = {
+    "issuer": ORIGIN,
+    "token_endpoint": OAUTH_TOKEN,
+    "grant_types_supported": ["client_credentials", CIBA_GRANT_TYPE],
+    "token_endpoint_auth_methods_supported": ["client_secret_post", "private_key_jwt"],
+    "token_endpoint_auth_signing_alg_values_supported": ["EdDSA", "ES256", "PS256"],
+}
+
+
+def _routes(table):
+    """A urlopen() side effect answering by URL: a dict body, an exception, or a list of either."""
+    def answer(req, data=None, *args, **kwargs):
+        url = req.full_url if hasattr(req, "full_url") else req
+        if url not in table:
+            raise AssertionError("unexpected request to %s" % url)
+        out = table[url]
+        if isinstance(out, list):
+            out = out.pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out if isinstance(out, MagicMock) else _response(out)
+    return answer
 
 
 def _form(call):
@@ -785,11 +827,15 @@ class TestAgentDiscovery(unittest.TestCase):
 
     @patch("authfi.urlopen")
     def test_endpoints_come_from_discovery_and_are_fetched_once(self, mock_urlopen):
-        mock_urlopen.return_value = _response(DISCOVERY)
+        mock_urlopen.side_effect = _routes({
+            AS_METADATA_URL: _http_error(AS_METADATA_URL, 404),
+            AGENT_CONFIGURATION_URL: DISCOVERY,
+        })
         a = self._agent()
         self.assertEqual(a.token_endpoint, TOKEN_ENDPOINT)
         self.assertEqual(a.backchannel_endpoint, DISCOVERY["backchannel_authentication_endpoint"])
-        self.assertEqual(mock_urlopen.call_count, 1)
+        a.token_endpoint
+        self.assertEqual(mock_urlopen.call_count, 2)
 
     @patch("authfi.urlopen")
     def test_a_deployment_without_private_key_jwt_is_refused_up_front(self, mock_urlopen):
@@ -837,6 +883,138 @@ class TestAgentDiscovery(unittest.TestCase):
         with patch("authfi.urlopen") as mock_urlopen:
             self.assertEqual(a.token_endpoint, TOKEN_ENDPOINT)
             mock_urlopen.assert_not_called()
+
+
+class TestTokenEndpointFromMetadata(unittest.TestCase):
+    """The token endpoint is the project's RFC 8414 token_endpoint, not agent-configuration's."""
+
+    def setUp(self):
+        import authfi
+        authfi._deprecations_reported.clear()
+
+    def _agent(self, alg="EdDSA"):
+        return AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1", alg), platform_url=ORIGIN)
+
+    @staticmethod
+    def _urls(mock_urlopen):
+        return [c[0][0].full_url for c in mock_urlopen.call_args_list]
+
+    @patch("authfi.urlopen")
+    def test_the_metadata_names_the_token_endpoint(self, mock_urlopen):
+        mock_urlopen.side_effect = _routes({AS_METADATA_URL: AS_METADATA})
+        a = self._agent()
+        self.assertEqual(a.token_endpoint, OAUTH_TOKEN)
+        a.token_endpoint
+        # Read once, and agent-configuration is not needed for the token endpoint.
+        self.assertEqual(self._urls(mock_urlopen), [AS_METADATA_URL])
+
+    @patch("authfi.urlopen")
+    def test_the_agent_mints_and_signs_for_the_metadata_endpoint(self, mock_urlopen):
+        mock_urlopen.side_effect = _routes({
+            AS_METADATA_URL: AS_METADATA,
+            OAUTH_TOKEN: {"access_token": "at_abc", "expires_in": 900},
+        })
+        self.assertEqual(self._agent().token(), "at_abc")
+        self.assertEqual(self._urls(mock_urlopen)[-1], OAUTH_TOKEN)
+        claims = json.loads(_b64decode(_form(mock_urlopen.call_args)["client_assertion"].split(".")[1]))
+        self.assertEqual(claims["aud"], OAUTH_TOKEN)
+
+    @patch("authfi.urlopen")
+    def test_no_metadata_falls_back_to_agent_configuration(self, mock_urlopen):
+        mock_urlopen.side_effect = _routes({
+            AS_METADATA_URL: _http_error(AS_METADATA_URL, 404),
+            AGENT_CONFIGURATION_URL: DISCOVERY,
+        })
+        with self.assertLogs("authfi", "INFO") as logs:
+            self.assertEqual(self._agent().token_endpoint, TOKEN_ENDPOINT)
+        self.assertIn("publishes no RFC 8414 metadata", logs.output[0])
+
+    @patch("authfi.urlopen")
+    def test_metadata_without_a_token_endpoint_falls_back(self, mock_urlopen):
+        doc = dict(AS_METADATA)
+        doc.pop("token_endpoint")
+        mock_urlopen.side_effect = _routes({AS_METADATA_URL: doc, AGENT_CONFIGURATION_URL: DISCOVERY})
+        self.assertEqual(self._agent().token_endpoint, TOKEN_ENDPOINT)
+
+    @patch("authfi.urlopen")
+    def test_metadata_naming_another_issuer_is_refused_not_used(self, mock_urlopen):
+        doc = dict(AS_METADATA, issuer="https://evil.example", token_endpoint="https://evil.example/token")
+        mock_urlopen.side_effect = _routes({AS_METADATA_URL: doc})
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent().token_endpoint
+        self.assertIn("RFC 8414", str(ctx.exception))
+        self.assertEqual(self._urls(mock_urlopen), [AS_METADATA_URL])
+
+    @patch("authfi.urlopen")
+    def test_a_failing_metadata_read_is_an_error_not_a_fallback(self, mock_urlopen):
+        # Only "there is no metadata" falls back. A 5xx is reported as what it is.
+        mock_urlopen.side_effect = _routes({AS_METADATA_URL: _http_error(AS_METADATA_URL, 503)})
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent().token_endpoint
+        self.assertEqual(ctx.exception.status, 503)
+
+    @patch("authfi.urlopen")
+    def test_the_metadata_is_checked_for_this_keys_algorithm(self, mock_urlopen):
+        doc = dict(AS_METADATA, token_endpoint_auth_signing_alg_values_supported=["EdDSA"])
+        mock_urlopen.side_effect = _routes({AS_METADATA_URL: doc})
+        with self.assertRaises(AuthFIError) as ctx:
+            self._agent("ES256").token_endpoint
+        self.assertIn("ES256", str(ctx.exception))
+
+    @patch("authfi.urlopen")
+    def test_a_deprecation_header_is_logged_once_with_its_successor(self, mock_urlopen):
+        deprecated = {
+            "Deprecation": "@1792108800",
+            "Link": '<%s>; rel="successor-version"' % OAUTH_TOKEN,
+        }.items()
+        body = {"access_token": "at_abc", "expires_in": 900}
+        mock_urlopen.side_effect = lambda req, data=None: _response(body, deprecated)
+        a = AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN,
+                      token_endpoint=TOKEN_ENDPOINT)
+        with self.assertLogs("authfi", "WARNING") as logs:
+            a.token()
+            a.token(force=True)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(TOKEN_ENDPOINT + " is deprecated (Deprecation: @1792108800)", logs.output[0])
+        self.assertIn("its successor is " + OAUTH_TOKEN, logs.output[0])
+
+    @patch("authfi.urlopen")
+    def test_a_refusal_from_a_deprecated_route_is_reported_too(self, mock_urlopen):
+        mock_urlopen.side_effect = _oauth_error(
+            "invalid_client", status=401, headers=[("Deprecation", "@1792108800")]
+        )
+        a = AgentAuth(agent_id="agt_1", key=AgentKey.generate("k1"), platform_url=ORIGIN,
+                      token_endpoint=TOKEN_ENDPOINT)
+        with self.assertLogs("authfi", "WARNING") as logs:
+            with self.assertRaises(AgentAuthError):
+                a.token()
+        self.assertIn("is deprecated", logs.output[0])
+        self.assertNotIn("successor", logs.output[0])
+
+    @patch("authfi.urlopen")
+    def test_no_deprecation_header_no_warning(self, mock_urlopen):
+        import logging
+        mock_urlopen.side_effect = _routes({
+            AS_METADATA_URL: AS_METADATA,
+            OAUTH_TOKEN: {"access_token": "at_abc", "expires_in": 900},
+        })
+        seen = []
+        handler = logging.Handler()
+        handler.emit = seen.append
+        logging.getLogger("authfi").addHandler(handler)
+        try:
+            self._agent().token()
+        finally:
+            logging.getLogger("authfi").removeHandler(handler)
+        self.assertEqual([r for r in seen if r.levelno >= logging.WARNING], [])
+
+    def test_the_successor_is_found_among_several_links(self):
+        from authfi import _successor
+        links = ['<https://a.example/docs>; rel="help", <%s>; rel="successor-version"' % OAUTH_TOKEN]
+        self.assertEqual(_successor(links), OAUTH_TOKEN)
+        self.assertEqual(_successor(['<https://a.example/x>; rel=successor-version']), "https://a.example/x")
+        self.assertIsNone(_successor(['<https://a.example/docs>; rel="help"']))
+        self.assertIsNone(_successor([]))
 
 
 class TestAgentToken(unittest.TestCase):
