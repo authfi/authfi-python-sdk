@@ -681,6 +681,10 @@ class AgentKey:
         self.alg = _alg_for_private_key(private_key)
         self._key = private_key
         self.key_id = str(key_id).strip()
+        # The file the key was read from, when it was: a helper process that must
+        # sign as this agent (Claude Code's apiKeyHelper) is pointed at the file,
+        # never handed the key.
+        self.path = None
 
     # --- Loading ---
 
@@ -702,8 +706,11 @@ class AgentKey:
         if not data.strip():
             raise AuthFIError("The agent key file %s is empty" % path, status=400)
         if data.lstrip()[:1] == b"{":
-            return cls.from_jwk(json.loads(data.decode("utf-8")), key_id=key_id)
-        return cls.from_pem(data, key_id)
+            key = cls.from_jwk(json.loads(data.decode("utf-8")), key_id=key_id)
+        else:
+            key = cls.from_pem(data, key_id)
+        key.path = os.path.abspath(path)
+        return key
 
     @classmethod
     def from_pem(cls, pem, key_id):

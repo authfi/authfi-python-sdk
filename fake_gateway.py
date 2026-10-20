@@ -17,7 +17,11 @@ either of its two published forms:
 ``<server>__<tool>`` and accepts both (after authfi-regional-mcp#64).
 
 A token is accepted when it starts with ``accept_prefix``; anything else gets
-401. The model endpoint plays back ``model_script``: each entry is a list of
+401. It also plays the project's authorization server for ``AgentAuth``: RFC
+8414 metadata, agent-configuration and a token endpoint that mints
+``tok-minted-<n>`` for any client assertion (signatures are the platform's
+tests' business, not these), and the approval address, which answers 403 as
+platform-beta does today unless ``approvals_readable``. The model endpoint plays back ``model_script``: each entry is a list of
 content blocks (``{"type": "text", ...}`` or ``{"type": "tool_use", ...}``).
 Everything received is kept in ``requests`` for the tests to inspect.
 """
@@ -41,8 +45,12 @@ TOOLS = {
 
 
 class FakeGateway:
-    def __init__(self, refusals="http", names="dotted", accept_prefix="tok-"):
+    def __init__(self, refusals="http", names="dotted", accept_prefix="tok-", approvals_readable=False,
+                 token_lifetime=900):
         self.refusals = refusals
+        self.approvals_readable = approvals_readable
+        self.token_lifetime = token_lifetime
+        self.minted = []
         self.names = names
         self.accept_prefix = accept_prefix
         self.requests = []
@@ -59,7 +67,8 @@ class FakeGateway:
 
             def do_GET(self):
                 gateway._record(self, None)
-                self._send(405, b"")
+                status, out = gateway._get(self.path.split("?")[0], dict(self.headers))
+                self._send(status, out)
 
             def do_DELETE(self):
                 gateway._record(self, None)
@@ -69,7 +78,7 @@ class FakeGateway:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
                 gateway._record(self, body)
-                status, headers, out = gateway._answer(self.path, dict(self.headers), body)
+                status, headers, out = gateway._answer(self.path.split("?")[0], dict(self.headers), body)
                 self._send(status, out, headers)
 
             def _send(self, status, body, headers=None):
@@ -113,7 +122,7 @@ class FakeGateway:
         return out
 
     def model_requests(self):
-        return [r for r in self.requests if r["path"].endswith("/v1/messages")]
+        return [r for r in self.requests if r["path"].split("?")[0].endswith("/v1/messages")]
 
     # --- internals
 
@@ -127,11 +136,50 @@ class FakeGateway:
                                   "headers": {k.lower(): v for k, v in handler.headers.items()},
                                   "body": body, "json": parsed})
 
+    def _get(self, path, headers):
+        o = self.origin
+        if path == "/.well-known/oauth-authorization-server":
+            return 200, json.dumps({"issuer": o, "token_endpoint": o + "/oauth/token",
+                                    "grant_types_supported": ["client_credentials"],
+                                    "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+                                    "token_endpoint_auth_signing_alg_values_supported": ["EdDSA", "ES256", "PS256"]
+                                    }).encode()
+        if path == "/.well-known/agent-configuration":
+            return 200, json.dumps({"issuer": o, "default_location": self.url, "endpoints": {
+                "token": o + "/oauth/token", "approval": o + "/apis/regional/v1/ai/auth/approvals/{id}"},
+                "token_endpoint_auth_methods_supported": ["private_key_jwt"],
+                "token_endpoint_auth_signing_alg_values_supported": ["EdDSA", "ES256", "PS256"]}).encode()
+        prefix = "/apis/regional/v1/ai/auth/approvals/"
+        if path.startswith(prefix):
+            if not self._authorized(headers):
+                return 401, b'{"error":"invalid_token"}'
+            if not self.approvals_readable:
+                return 403, b'{"error":"forbidden"}'
+            aid = path[len(prefix):]
+            record = self.approvals.get(aid)
+            if record is None:
+                return 404, b'{"error":"not_found"}'
+            return 200, json.dumps({"data": {"approval_id": aid, "status": record["status"]}}).encode()
+        return 405, b""
+
+    def _mint(self, body):
+        from urllib.parse import parse_qs
+        form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+        if form.get("grant_type") != "client_credentials" or not form.get("client_assertion"):
+            return 400, {}, b'{"error":"invalid_request"}'
+        with self._lock:
+            token = "tok-minted-%d" % (len(self.minted) + 1)
+            self.minted.append(token)
+        return 200, {}, json.dumps({"access_token": token, "token_type": "Bearer",
+                                    "expires_in": self.token_lifetime}).encode()
+
     def _authorized(self, headers):
         auth = {k.lower(): v for k, v in headers.items()}.get("authorization") or ""
         return auth.startswith("Bearer " + self.accept_prefix)
 
     def _answer(self, path, headers, body):
+        if path == "/oauth/token":
+            return self._mint(body)
         if not self._authorized(headers):
             return 401, {"WWW-Authenticate": 'Bearer error="invalid_token", error_description="token revoked"'}, \
                 b'{"error":"invalid_token"}'

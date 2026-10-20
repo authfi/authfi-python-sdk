@@ -39,7 +39,11 @@ setup(
         # authfi.openai_agents: tracing without the token or content, LiteLLM on
         # the AI gateway, governed MCP tools and approvals.
         "openai-agents": ["openai-agents[litellm]>=0.24", "httpx>=0.23"],
+        # authfi.claude_agent: approvals through can_use_tool, the `authfi token`
+        # and `authfi headers` helpers, content logging off.
+        "claude-agent": ["claude-agent-sdk>=0.2"],
     },
+    entry_points={"console_scripts": ["authfi = authfi.cli:main"]},
     author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",
     license="Apache-2.0",

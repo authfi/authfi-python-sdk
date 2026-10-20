@@ -527,6 +527,17 @@ class TestAgentKey(unittest.TestCase):
             with self.assertRaises(AuthFIError):
                 AgentKey.from_file(empty, key_id="k1")
 
+    def test_a_key_remembers_the_file_it_came_from(self):
+        import tempfile
+        key = AgentKey.generate("k1")
+        self.assertIsNone(key.path)
+        self.assertIsNone(AgentKey.from_pem(key.private_pem(), "k1").path)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "agent.key")
+            with open(path, "w") as fh:
+                fh.write(key.private_pem())
+            self.assertEqual(AgentKey.from_file(path, key_id="k1").path, os.path.abspath(path))
+
 
 def _pem(key, fmt="PKCS8"):
     """A private key as unencrypted PEM: PKCS#8, or the type's own TraditionalOpenSSL form."""

@@ -337,6 +337,49 @@ async with AuthFIMCPServer(agent_auth) as tools:
 
 A complete agent is in [examples/openai-agents](examples/openai-agents/agent.py).
 
+### Claude Agent SDK
+
+```bash
+pip install 'authfi[claude-agent]'
+```
+
+```python
+from authfi import AgentAuth
+from authfi.claude_agent import AuthFIClaudeClient, claude_options
+
+agent = AgentAuth.from_env()            # the key in a file: AUTHFI_AGENT_KEY_FILE
+
+async def wait_for_decision(approval):  # {"approval_id", "tool", "args"}
+    ...                                 # return once a person has decided
+
+options = claude_options(agent, model="claude-haiku-5-5", wait_for_decision=wait_for_decision)
+async with AuthFIClaudeClient(options, agent=agent) as client:
+    await client.query("Describe the wiki of pallets/flask")
+    async for message in client.receive_response():
+        ...
+```
+
+- **Model credential.** Claude Code runs `authfi token` as its `apiKeyHelper` and runs it again
+  before the token expires. The command signs with the agent's key file; the key is never put
+  in Claude Code's environment. `authfi token` works on its own too, for any tool that runs a
+  command to get a credential.
+- **MCP credential.** The gateway's headers come from `authfi headers` (`headersHelper`), which
+  Claude Code runs when it connects; `AuthFIClaudeClient` reconnects the server before the token
+  expires.
+- **Approvals.** Claude Code asks `can_use_tool` only when a permission mode tells it to, so
+  `claude_options` sets `permission_mode="default"` and a `PreToolUse` hook that sends the
+  gateway's tools to it. A held call is noted by a `PostToolUse` hook; when the model calls it
+  again, `can_use_tool` awaits `wait_for_decision` and sends the call with the approval id. A
+  decision of `{"status": "denied"}` (or `False`) refuses it before it is sent. Without
+  `wait_for_decision`, the agent reads the approval itself, where the project allows that.
+  Tools that are not the gateway's are denied unless you pass `other_tools`.
+- **Content.** Claude Code's OpenTelemetry content logging is off unless `capture_content=True`;
+  the agent id and run id are resource attributes, and the run id goes to the gateway as
+  `X-Request-Id`. `trace_with_langsmith(agent)` turns on LangSmith's Claude Agent SDK tracing
+  with content hidden and the agent id and run id in each run's metadata.
+
+A complete agent is in [examples/claude-agent-sdk](examples/claude-agent-sdk/agent.py).
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)

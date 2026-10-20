@@ -32,6 +32,7 @@ except ImportError as e:  # pragma: no cover - exercised only without the extra
         "authfi.langchain needs langchain-anthropic: pip install 'authfi[langchain]'"
     ) from e
 
+from ._tracing import langsmith_metadata_only
 from .gateway import credential, model_base_url, request_id_header
 
 # The token rides in each request's headers. The client still needs a credential
@@ -121,9 +122,4 @@ def metadata_only_tracing(capture_content=False, **client_kwargs):
     LangChain traces with, and returns it. Call it once at startup.
     ``client_kwargs`` go to ``langsmith.Client`` (``api_url``, ``api_key``...).
     """
-    import langsmith
-
-    hide = not capture_content
-    client = langsmith.Client(hide_inputs=hide, hide_outputs=hide, **client_kwargs)
-    langsmith.configure(client=client)
-    return client
+    return langsmith_metadata_only(capture_content, **client_kwargs)
