@@ -46,7 +46,6 @@ langgraph = [
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
-    "openai-agents[litellm]>=0.24,<0.25",
 ]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
 
