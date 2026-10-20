@@ -52,6 +52,11 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - `authfi.langchain.LangChainIntegration` (extra `langchain`): a `ChatAnthropic` on the AI gateway
   whose token is attached per request, never a model setting LangSmith records; tracing without
   content by default; `GatewayTokenRefused` when the gateway refuses the token.
+- `authfi.langgraph.LangGraphIntegration` (extra `langgraph`): the gateway's MCP tools under the
+  gateway's names, through one MCP client; a refusal as the tool's error so the run carries on; a
+  held call recorded in graph state and resumed through an approval node that calls `interrupt()`
+  first; `agent_graph()` for a ready agent. The approval id never passes through the model.
+- `Gateway.governance_of(tool)`: the agent's advisory outlook for a tool from `tools/list`.
 
 ### Changed
 

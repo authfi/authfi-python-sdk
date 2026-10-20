@@ -41,6 +41,12 @@ flask = ["flask>=3.0,<4"]
 # Each framework extra pins the range its adapter is tested with: an adapter reaches into the
 # framework where it has no public seam, and checks that seam when it is imported.
 langchain = ["langchain-anthropic>=1.7,<1.8", "langsmith>=0.14,<1"]
+langgraph = [
+    "authfi[langchain]",
+    "langgraph>=1.2,<2",
+    "langchain-mcp-adapters>=0.3.2,<0.4",
+    "mcp>=1.30,<2",
+]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -72,6 +78,9 @@ dev = [
     "openai>=3.0,<4",
     "langchain-anthropic>=1.7,<1.8",
     "langsmith>=0.14,<1",
+    "langgraph>=1.2,<2",
+    "langchain-mcp-adapters>=0.3.2,<0.4",
+    "mcp>=1.30,<2",
 ]
 
 [tool.pytest.ini_options]
@@ -124,7 +133,9 @@ executionEnvironments = [
     { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
     { root = "src" },
     { root = "scripts" },
-    { root = "examples" },
+    # Framework signatures carry unparameterised generics (LangGraph's Command), which strict mode
+    # reports on every call an example makes; the examples' own code is still checked in full.
+    { root = "examples", reportUnknownMemberType = false },
 ]
 
 [tool.ruff]
