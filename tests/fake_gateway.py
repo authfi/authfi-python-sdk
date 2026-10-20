@@ -44,7 +44,11 @@ def _scope(name: str) -> str:
 class FakeGateway:
     """Use as a context manager; ``issuer`` is its address."""
 
-    def __init__(self, *, approvals_readable: bool = False, token_lifetime: int = 900) -> None:
+    def __init__(
+        self, *, approvals_readable: bool = False, token_lifetime: int = 900, api_origin: str | None = None
+    ) -> None:
+        #: Where discovery says the machine APIs are, for a project on a custom domain; the issuer's when None.
+        self.api_origin = api_origin
         self.approvals_readable = approvals_readable
         self.token_lifetime = token_lifetime
         self.minted: list[str] = []
@@ -146,7 +150,8 @@ class FakeGateway:
                     "issuer": o,
                     "token_endpoint": o + "/oauth/token",
                     "jwks_uri": o + "/.well-known/jwks.json",
-                    "backchannel_authentication_endpoint": o + "/apis/regional/v1/ai/auth/backchannel-authorize",
+                    "backchannel_authentication_endpoint": (self.api_origin or o)
+                    + "/apis/regional/v1/ai/auth/backchannel-authorize",
                     "grant_types_supported": ["client_credentials", "urn:openid:params:grant-type:ciba"],
                     "token_endpoint_auth_methods_supported": ["private_key_jwt"],
                     "token_endpoint_auth_signing_alg_values_supported": ["EdDSA", "ES256", "PS256"],
