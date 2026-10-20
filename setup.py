@@ -32,6 +32,10 @@ setup(
         # as the frameworks do; the core SDK keeps Python 3.8.
         # authfi.langchain: a Claude client whose token LangSmith never records.
         "langchain": ["langchain-anthropic>=1.0", "langsmith>=0.4"],
+        # authfi.langgraph: governed MCP tools, refusals as tool results,
+        # approvals through interrupt().
+        "langgraph": ["langchain-anthropic>=1.0", "langsmith>=0.4", "langgraph>=1.0",
+                      "langchain-mcp-adapters>=0.2", "httpx>=0.23"],
     },
     author="AuthFI",
     url="https://github.com/authfi/authfi-python-sdk",

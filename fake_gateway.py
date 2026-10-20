@@ -49,6 +49,7 @@ class FakeGateway:
         self.approvals = {}       # id -> {"status", "tool", "args"}
         self.tool_calls = []      # (gateway name, arguments) that reached the tool
         self.model_script = []
+        self.after_model = None   # called after each model answer (a test's revocation, say)
         self._lock = threading.Lock()
         gateway = self
 
@@ -238,6 +239,8 @@ class FakeGateway:
         msg = {"id": "msg_" + uuid.uuid4().hex[:12], "type": "message", "role": "assistant",
                "model": req.get("model"), "content": content, "stop_reason": stop, "stop_sequence": None,
                "usage": {"input_tokens": 3, "output_tokens": 2}}
+        if self.after_model:
+            self.after_model()
         if req.get("stream"):
             return 200, {"Content-Type": "text/event-stream"}, _sse(msg)
         return 200, {}, json.dumps(msg).encode()

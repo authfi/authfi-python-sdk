@@ -255,6 +255,45 @@ metadata names the agent (`authfi_agent_id`).
 `metadata_only_tracing(capture_content=False)` installs a LangSmith client with
 `hide_inputs` and `hide_outputs` set; pass `capture_content=True` to record content.
 
+### LangGraph
+
+```bash
+pip install 'authfi[langgraph]'
+```
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+from authfi import AgentAuth, AsyncAgentAuth
+from authfi.langgraph import AuthFIGateway, ask
+
+gateway = AuthFIGateway(AsyncAgentAuth(AgentAuth.from_env()))
+tools = await gateway.tools()
+graph = gateway.agent_graph(gateway.chat_model("claude-haiku-5-5"), tools, checkpointer=InMemorySaver())
+
+config = {"configurable": {"thread_id": "t1"}}
+state = await graph.ainvoke(ask("Describe the wiki of pallets/flask"), config)
+while "__interrupt__" in state:                       # a call waits for a person's approval
+    held = state["__interrupt__"][0].value["authfi_approvals"]
+    ...                                               # once they have decided:
+    state = await graph.ainvoke(Command(resume=True), config)
+```
+
+- **Tools** come from your project's MCP gateway with the agent's current token on every request,
+  under names every model provider accepts; tools the gateway marks `never_allowed` are left out.
+- **A refused call** reaches the model as the tool's error, naming why, and the run carries on.
+  A token the gateway will not take at all ends the run with `GatewayRefusedToken`.
+- **Approvals** use LangGraph's `interrupt()`, in a node of their own (`authfi_approval`) that
+  runs after the tools node. On resume it sends each held call again with its approval id and the
+  gateway decides; a call still waiting pauses the run again. Do not call `interrupt()` inside a
+  tool call: LangGraph re-runs the node from its start on resume, so the call is sent again and
+  opens a second approval nobody will use. Resume with `{"stop": True}` to give up instead.
+- **Linking**: each tool call and model call sends its LangChain run id as `X-Request-Id`.
+
+Building your own graph: add `gateway.approval_node` as a node, route from your tools node with
+`route_after_tools`, and use `AuthFIState` (or add its `authfi_holds` field to your state).
+A complete agent is in [examples/langgraph](examples/langgraph/agent.py).
+
 ## Features
 
 - JWKS + RS256 verification (via PyJWT when installed)
