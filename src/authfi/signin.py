@@ -53,7 +53,7 @@ from authfi._protocol.signin import (
     verify_id_token,
 )
 from authfi._protocol.verify import unverified_claims
-from authfi.errors import ConfigurationError, InvalidIdToken, NotSupportedError
+from authfi.errors import APIError, ConfigurationError, InvalidIdToken, NotSupportedError
 from authfi.secret import Secret
 from authfi.tokens import (
     AsyncRefreshGate,
@@ -96,7 +96,7 @@ class PendingSignIn:
 
     __slots__ = ("_client_id", "_key", "_redirect_uri", "_state", "url")
 
-    def __init__(self, state: PendingState, url: str, *, key: bytes, client_id: str, redirect_uri: str) -> None:
+    def __init__(self, state: PendingState, url: str, *, key: Secret, client_id: str, redirect_uri: str) -> None:
         self._state = state
         self.url = url
         self._key = key
@@ -110,7 +110,7 @@ class PendingSignIn:
 
     def dump(self) -> str:
         """An opaque string, encrypted under the app's ``state_key``: safe in a cookie or a session."""
-        return seal(self._state, self._key, self._client_id, self._redirect_uri)
+        return seal(self._state, state_key_bytes(self._key), self._client_id, self._redirect_uri)
 
     @classmethod
     def load(cls, blob: str, *, key: Secret, client_id: str, redirect_uri: str, now: float) -> PendingSignIn:
@@ -119,9 +119,8 @@ class PendingSignIn:
         Raises :class:`~authfi.InvalidPendingSignIn` when it was tampered with, made for another
         client or redirect URI, or is older than ten minutes.
         """
-        raw = state_key_bytes(key)
-        state = unseal(blob, raw, client_id, redirect_uri, now)
-        return cls(state, "", key=raw, client_id=client_id, redirect_uri=redirect_uri)
+        state = unseal(blob, state_key_bytes(key), client_id, redirect_uri, now)
+        return cls(state, "", key=key, client_id=client_id, redirect_uri=redirect_uri)
 
     def __repr__(self) -> str:
         return f"PendingSignIn(client_id={self._client_id!r})"
@@ -177,7 +176,7 @@ class _Config:
         if not self.client_id:
             raise ConfigurationError("client_id is required: the app's client id (app_...)")
         self.redirect_uri = check_redirect_uri(redirect_uri)
-        self.key = state_key_bytes(state_key)
+        state_key_bytes(state_key)  # refuse a key of the wrong length now; the bytes are derived where used
         self.state_key = state_key
         if client_secret is None:
             self.auth = ClientAuth.none(self.client_id)
@@ -218,7 +217,7 @@ class _Config:
             login_hint=login_hint,
             prompt=prompt,
         )
-        return PendingSignIn(state, url, key=self.key, client_id=self.client_id, redirect_uri=self.redirect_uri)
+        return PendingSignIn(state, url, key=self.state_key, client_id=self.client_id, redirect_uri=self.redirect_uri)
 
     def load(self, blob: str) -> PendingSignIn:
         return PendingSignIn.load(
@@ -232,10 +231,15 @@ class _Config:
     def code(self, callback: Mapping[str, str] | str, pending: PendingSignIn) -> str:
         return read_callback(callback, issuer=self.project.issuer, state=pending.state)
 
-    def revocation(self, metadata: ServerMetadata, token: Secret) -> HttpRequest | None:
+    def revocation(self, metadata: ServerMetadata, tokens: TokenSet) -> HttpRequest:
+        """Revoke the refresh token; with none, the access token, under its own hint."""
         if metadata.revocation_endpoint is None:
-            return None
-        return revocation_request(metadata.revocation_endpoint, self.auth, token=token)
+            raise NotSupportedError("revocation", "This AuthFI project's discovery names no revocation endpoint.")
+        if tokens.refresh_token is not None:
+            return revocation_request(metadata.revocation_endpoint, self.auth, token=tokens.refresh_token)
+        return revocation_request(
+            metadata.revocation_endpoint, self.auth, token=tokens.access_token, token_type_hint="access_token"
+        )
 
     def end_session(self, metadata: ServerMetadata, post_logout_redirect_uri: str | None, state: str | None) -> str:
         if metadata.end_session_endpoint is None:
@@ -265,7 +269,7 @@ class _Config:
             raise api_error(response, "the userinfo endpoint")
         body = response.json_object()
         if body is None:
-            raise ConfigurationError("the userinfo endpoint did not answer a JSON object")
+            raise APIError("invalid_response", "the userinfo endpoint did not answer a JSON object", response.status)
         info = UserInfo.of(body)
         signed_in = _subject(tokens)
         if signed_in is not None and info.sub != signed_in:
@@ -410,17 +414,17 @@ class WebApp:
     ) -> str:
         """Revoke the refresh token, then return the end-session URL to send the browser to.
 
-        Ending the session at AuthFI does not revoke the refresh token, so it is revoked here first.
+        Ending the session at AuthFI does not revoke the refresh token, so it is revoked here first;
+        a person with no refresh token has the access token revoked. A project whose discovery names no
+        revocation endpoint raises :class:`~authfi.NotSupportedError` rather than sign the person out
+        with their tokens still alive.
         """
         metadata = self.project.metadata()
         url = self._config.end_session(metadata, post_logout_redirect_uri, state)
-        token = tokens.refresh_token or tokens.access_token
-        request = self._config.revocation(metadata, token)
-        if request is not None:
-            transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
-            response = transport.send(request)
-            if response.status != 200:
-                raise api_error(response, "the revocation endpoint")
+        request = self._config.revocation(metadata, tokens)
+        response = self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        if response.status != 200:
+            raise api_error(response, "the revocation endpoint")
         return url
 
     def session(self, tokens: TokenSet, *, store: TokenStore, key: str, send_to: Sequence[str] = ()) -> PersonSession:
@@ -587,13 +591,10 @@ class AsyncWebApp:
         """See :meth:`WebApp.sign_out`."""
         metadata = await self.project.metadata()
         url = self._config.end_session(metadata, post_logout_redirect_uri, state)
-        token = tokens.refresh_token or tokens.access_token
-        request = self._config.revocation(metadata, token)
-        if request is not None:
-            transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
-            response = await transport.send(request)
-            if response.status != 200:
-                raise api_error(response, "the revocation endpoint")
+        request = self._config.revocation(metadata, tokens)
+        response = await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        if response.status != 200:
+            raise api_error(response, "the revocation endpoint")
         return url
 
     async def session(

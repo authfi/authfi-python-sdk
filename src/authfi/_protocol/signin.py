@@ -218,10 +218,23 @@ def authorize_url(
     return authorization_endpoint + separator + urlencode(query)
 
 
+#: Parameters of the callback that must appear at most once (RFC 6749 §3.1, RFC 9207 §2.4).
+_SINGLE = ("iss", "state", "code", "error", "error_description")
+
+
 def _callback_params(callback: Mapping[str, str] | str) -> dict[str, str]:
-    if isinstance(callback, str):
-        return dict(parse_qsl(urlsplit(callback).query, keep_blank_values=True))
-    return {str(k): str(v) for k, v in callback.items()}
+    if not isinstance(callback, str):
+        return {str(k): str(v) for k, v in callback.items()}
+    pairs = parse_qsl(urlsplit(callback).query, keep_blank_values=True)
+    seen: set[str] = set()
+    for name, _ in pairs:
+        if name in _SINGLE and name in seen:
+            raise InvalidCallback(
+                "callback_parameter_repeated",
+                f"the callback carries {name} more than once; which one is meant is unknown",
+            )
+        seen.add(name)
+    return dict(pairs)
 
 
 def read_callback(callback: Mapping[str, str] | str, *, issuer: str, state: str) -> str:
@@ -230,7 +243,7 @@ def read_callback(callback: Mapping[str, str] | str, *, issuer: str, state: str)
     iss = params.get("iss")
     if not iss:
         raise InvalidCallback("callback_iss_missing", "the callback names no iss (RFC 9207); AuthFI always sends it")
-    if iss.rstrip("/") != issuer.rstrip("/"):
+    if iss != issuer:
         raise InvalidCallback("callback_iss_mismatch", f"the callback comes from {iss!r}, not {issuer!r}")
     if not hmac.compare_digest(params.get("state", "").encode(), state.encode()):
         raise InvalidCallback("callback_state_mismatch", "the callback's state is not this sign-in's")

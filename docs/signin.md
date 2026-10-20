@@ -40,8 +40,10 @@ signed_in.tokens                                    # access, refresh and ID tok
 
 Every sign-in uses PKCE (S256), a fresh `state` and a fresh `nonce`. `finish_sign_in`:
 
-- requires the callback's `iss` and checks it is this project (RFC 9207), so a response from another
-  issuer cannot be mixed in;
+- requires the callback's `iss` and checks it is this project exactly (RFC 9207), so a response from
+  another issuer cannot be mixed in;
+- refuses a callback that repeats `iss`, `state`, `code`, `error` or `error_description`
+  (`InvalidCallback`, code `callback_parameter_repeated`): which value is meant is unknown;
 - checks `state` in constant time;
 - exchanges the code with the PKCE verifier;
 - verifies the ID token: an algorithm the project's discovery names, `typ` `JWT`, the issuer, the
@@ -99,8 +101,10 @@ url = web.sign_out(tokens, post_logout_redirect_uri="https://app.example.com/")
 return redirect(url)
 ```
 
-`sign_out` revokes the refresh token first (ending the session at AuthFI does not), then returns the
-end-session URL, naming your client, to send the browser to.
+`sign_out` revokes the refresh token first (ending the session at AuthFI does not; with no refresh
+token, it revokes the access token), then returns the end-session URL, naming your client, to send the
+browser to. A project whose discovery names no revocation endpoint raises `NotSupportedError`
+(`feature == "revocation"`) instead of signing the person out with their tokens still alive.
 
 ## In asyncio code
 

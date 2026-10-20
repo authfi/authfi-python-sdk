@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from authfi import (
+    APIError,
     AsyncAuthFI,
     AsyncInMemoryTokenStore,
     AuthFI,
@@ -56,6 +57,7 @@ class OIDC:
         self.id_kid: str | None = None
         self.refreshes = 0
         self.revoked: list[str] = []
+        self.revoke_hints: list[str] = []
         self.refresh_answer: dict[str, Any] | None = None
         platform.route("POST", "/oauth/token", self.token)
         platform.route("GET", "/oauth/userinfo", self.userinfo)
@@ -95,6 +97,7 @@ class OIDC:
             body["nonce"] = nonce
         body.update(self.id_claims)
         body.update(claims)
+        body = {name: value for name, value in body.items() if value is not None}  # None leaves a claim out
         return self.platform.keys.sign(body, alg=self.id_alg, typ=self.id_typ, kid=self.id_kid)
 
     def token(self, request: httpx.Request) -> httpx.Response:
@@ -140,7 +143,9 @@ class OIDC:
         )
 
     def revoke(self, request: httpx.Request) -> httpx.Response:
-        self.revoked.append(parse_qs(request.content.decode())["token"][0])
+        form = parse_qs(request.content.decode())
+        self.revoked.append(form["token"][0])
+        self.revoke_hints.append(form["token_type_hint"][0])
         return httpx.Response(200)
 
 
@@ -322,6 +327,42 @@ def test_the_callback_is_refused_before_the_code_is_used(
     assert platform.calls("POST", "/oauth/token") == []
 
 
+@pytest.mark.parametrize("suffix", ["/", "//"])
+def test_the_issuer_is_compared_exactly_not_after_trimming_a_slash(web: WebApp, oidc: OIDC, suffix: str) -> None:
+    """RFC 9207 §2.4: a simple string comparison."""
+    pending = web.start_sign_in()
+    with pytest.raises(InvalidCallback) as caught:
+        web.finish_sign_in(oidc.browser(pending.url, iss=oidc.platform.issuer + suffix), pending)
+    assert caught.value.code == "callback_iss_mismatch"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "state=other",
+        "iss=https%3A%2F%2Fevil.example",
+        "code=another",
+        "error=a&error=b",
+        "error_description=x&error_description=y",
+    ],
+)
+def test_a_callback_that_repeats_a_parameter_is_refused_not_read(
+    web: WebApp, oidc: OIDC, platform: Platform, extra: str
+) -> None:
+    """RFC 6749 §3.1 and RFC 9207 §2.4: these appear at most once; reading the first or the last is a guess."""
+    pending = web.start_sign_in()
+    url = oidc.browser(pending.url)
+    with pytest.raises(InvalidCallback) as caught:
+        web.finish_sign_in(url + "&" + extra, pending)
+    assert caught.value.code == "callback_parameter_repeated"
+    assert platform.calls("POST", "/oauth/token") == []
+
+
+def test_a_parameter_the_callback_may_repeat_is_left_alone(web: WebApp, oidc: OIDC) -> None:
+    pending = web.start_sign_in()
+    assert web.finish_sign_in(oidc.browser(pending.url) + "&utm=1&utm=2", pending).user.sub == "usr_ada"
+
+
 def test_a_callback_without_iss_is_refused(web: WebApp, oidc: OIDC) -> None:
     pending = web.start_sign_in()
     url = oidc.browser(pending.url)
@@ -356,6 +397,8 @@ def test_a_refusal_in_the_callback(web: WebApp, oidc: OIDC) -> None:
         ({"id_claims": {"at_hash": "AAAA"}}, "id_token_at_hash_mismatch"),
         ({"id_claims": {"exp": 1}}, "id_token_expired"),
         ({"id_claims": {"iat": 4_000_000_000}}, "id_token_claims_invalid"),
+        ({"id_claims": {"iat": None}}, "id_token_claims_invalid"),
+        ({"id_claims": {"exp": None}}, "id_token_claims_invalid"),
         ({"id_claims": {"sub": ""}}, "id_token_claims_invalid"),
         ({"id_typ": "at+jwt"}, "id_token_not_id_token"),
         ({"id_typ": "JOSE"}, "id_token_not_id_token"),
@@ -489,6 +532,55 @@ def test_sign_out_revokes_the_refresh_token_first(web: WebApp, oidc: OIDC, platf
     assert "id_token_hint" not in query
 
 
+def test_a_person_with_no_refresh_token_has_the_access_token_revoked_under_its_own_hint(
+    web: WebApp, oidc: OIDC
+) -> None:
+    import dataclasses
+
+    tokens = dataclasses.replace(_sign_in(web, oidc).tokens, refresh_token=None)
+    web.sign_out(tokens)
+    assert oidc.revoked == [tokens.access_token.reveal()]
+    assert oidc.revoke_hints == ["access_token"]
+
+
+def test_the_refresh_token_is_revoked_under_the_refresh_hint(web: WebApp, oidc: OIDC) -> None:
+    web.sign_out(_sign_in(web, oidc).tokens)
+    assert oidc.revoke_hints == ["refresh_token"]
+
+
+def test_sign_out_says_so_when_the_project_cannot_revoke(platform: Platform, web: WebApp, oidc: OIDC) -> None:
+    """Signing a person out with their tokens still alive, silently, is the failure to avoid."""
+    tokens = _sign_in(web, oidc).tokens
+    platform.discovery.pop("revocation_endpoint")
+    web.project.metadata(refresh=True)
+    with pytest.raises(NotSupportedError) as caught:
+        web.sign_out(tokens)
+    assert caught.value.feature == "revocation"
+    assert oidc.revoked == []
+
+
+async def test_the_asyncio_sign_out_says_so_too(platform: Platform, oidc: OIDC, clock: FakeClock) -> None:
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
+        web = aaf.web_app(client_id=CLIENT, client_secret=Secret("s3cret"), redirect_uri=REDIRECT, state_key=STATE_KEY)
+        pending = await web.start_sign_in()
+        signed_in = await web.finish_sign_in(oidc.browser(pending.url), pending)
+        platform.discovery.pop("revocation_endpoint")
+        await aaf.metadata(refresh=True)
+        with pytest.raises(NotSupportedError) as caught:
+            await web.sign_out(signed_in.tokens)
+        assert caught.value.feature == "revocation"
+
+
+def test_the_state_key_is_not_held_as_bytes_on_the_app_or_the_pending_sign_in(web: WebApp) -> None:
+    pending = web.start_sign_in()
+    raw = base64.urlsafe_b64decode(STATE_KEY.reveal())
+    for holder in (web._config, pending):  # pyright: ignore[reportPrivateUsage]
+        attributes = [v for v in vars(holder).values()] if hasattr(holder, "__dict__") else []
+        slots = [getattr(holder, n) for n in getattr(type(holder), "__slots__", ())]
+        assert all(not isinstance(v, bytes | bytearray) or v != raw for v in [*attributes, *slots])
+    assert raw not in repr(web._config.__dict__).encode()  # pyright: ignore[reportPrivateUsage]
+
+
 def test_a_failed_revocation_is_reported(web: WebApp, oidc: OIDC, platform: Platform) -> None:
     tokens = _sign_in(web, oidc).tokens
     platform.route("POST", "/oauth/token/revoke", json_response({"error": "server_error"}, 400))
@@ -578,8 +670,9 @@ def test_userinfo_refusals(web: WebApp, oidc: OIDC, platform: Platform) -> None:
     with pytest.raises(Exception, match="invalid_token"):
         web.userinfo(tokens)
     platform.route("GET", "/oauth/userinfo", json_response(["not", "an", "object"]))
-    with pytest.raises(ConfigurationError, match="JSON object"):
+    with pytest.raises(APIError, match="JSON object") as bad:
         web.userinfo(tokens)
+    assert bad.value.code == "invalid_response"
     platform.route("GET", "/oauth/userinfo", json_response({"sub": "anyone"}))
     without_id_token = dataclasses.replace(tokens, id_token=None)
     assert web.userinfo(without_id_token).sub == "anyone"

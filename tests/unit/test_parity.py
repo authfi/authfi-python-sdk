@@ -76,6 +76,7 @@ PLAIN_ON_BOTH = {
     "governance_of",
     "http_client",
     "httpx_auth",
+    "load_pending",
     "model_base_url",
     "names_authfi",
     "new_http_client",
@@ -84,6 +85,7 @@ PLAIN_ON_BOTH = {
     "scope_of",
     "strip_approval_argument",
     "verifier",
+    "web_app",
     "with_approval",
 }
 
