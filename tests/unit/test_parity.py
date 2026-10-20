@@ -70,10 +70,19 @@ PLAIN_ON_BOTH = {
     "agent_from_env",
     "client_credentials",
     "for_resource",
+    "gateway",
+    "governance_of",
+    "http_client",
     "httpx_auth",
+    "model_base_url",
     "names_authfi",
+    "new_http_client",
     "pinned",
+    "read_result",
+    "scope_of",
+    "strip_approval_argument",
     "verifier",
+    "with_approval",
 }
 
 

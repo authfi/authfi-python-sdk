@@ -602,6 +602,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         self.project = project
         self._tokens: SyncCache[_Minted] = SyncCache(project.clock, max_entries=32)
         self._endpoints: SyncCache[AgentEndpoints] = SyncCache(project.clock, max_entries=1)
+        self._gateway = Gateway(project, self)
 
     def _send(self, request: HttpRequest) -> HttpResponse:
         return self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
@@ -819,8 +820,12 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
     # --- the gateways --------------------------------------------------------------------------------
 
     def gateway(self) -> Gateway:
-        """The AuthFI gateways (MCP tools, models, cloud credentials) with this agent's own token."""
-        return Gateway(self.project, self)
+        """The AuthFI gateways (MCP tools, models, cloud credentials) with this agent's own token.
+
+        One per agent: every call returns the same object, so its HTTP clients are made once and
+        closed with the project.
+        """
+        return self._gateway
 
     # --- the action gate -----------------------------------------------------------------------------
 
@@ -953,6 +958,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         self.project = project
         self._tokens: AsyncCache[_Minted] = AsyncCache(project.clock, max_entries=32)
         self._endpoints: AsyncCache[AgentEndpoints] = AsyncCache(project.clock, max_entries=1)
+        self._gateway = AsyncGateway(project, self)
 
     async def _send(self, request: HttpRequest) -> HttpResponse:
         return await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
@@ -1110,7 +1116,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
 
     def gateway(self) -> AsyncGateway:
         """See :meth:`AgentAuth.gateway`."""
-        return AsyncGateway(self.project, self)
+        return self._gateway
 
     async def transaction_token(
         self,

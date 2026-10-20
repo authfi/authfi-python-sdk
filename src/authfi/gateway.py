@@ -25,9 +25,13 @@ import httpx
 
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
+    CLOUD_PATH,
     HOLD_MESSAGE,
     CloudCredential,
+    ToolAllowed,
+    ToolApprovalRequired,
     ToolOutcome,
+    ToolRefused,
     cloud_request,
     governance_of,
     parse_cloud,
@@ -51,7 +55,10 @@ __all__ = [
     "CloudCredential",
     "CloudCredentialOutcome",
     "Gateway",
+    "ToolAllowed",
+    "ToolApprovalRequired",
     "ToolOutcome",
+    "ToolRefused",
     "token_refusal",
 ]
 
@@ -305,9 +312,10 @@ class Gateway(_GatewayBase):
         once a person has decided. A refusal raises :class:`~authfi.APIError` with the gateway's
         code. The platform caps ``expires_in``.
         """
-        url = self.project.api_origin + "/mcp/v1/cloud/credentials"
+        api_origin = self.project.resolve_api_origin()
+        url = api_origin + CLOUD_PATH
         request = cloud_request(
-            self.project.api_origin,
+            api_origin,
             self.source.headers("POST", url),
             account=account,
             role=role,
@@ -425,9 +433,10 @@ class AsyncGateway(_GatewayBase):
         approval_id: str | None = None,
     ) -> CloudCredentialOutcome:
         """See :meth:`Gateway.cloud_credentials`."""
-        url = self.project.api_origin + "/mcp/v1/cloud/credentials"
+        api_origin = await self.project.resolve_api_origin()
+        url = api_origin + CLOUD_PATH
         request = cloud_request(
-            self.project.api_origin,
+            api_origin,
             await self.source.headers("POST", url),
             account=account,
             role=role,
