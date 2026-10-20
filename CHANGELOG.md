@@ -69,6 +69,11 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   the agent's token through `python -m authfi token` as its `apiKeyHelper` (renewed, never in its
   environment), the gateway's tools through an MCP server in your process, approvals through
   `can_use_tool` with a permission mode that makes Claude Code ask it, and OpenTelemetry content off.
+- `authfi.adk.ADKIntegration` (extra `adk`): a LiteLLM model that puts the agent's token on each
+  call outside ADK's traces; ADK's `McpToolset` on the gateway with the token on every request and
+  Google's mTLS client kept off it (checked against the tested ADK, loudly); refusals the model
+  reads; held calls as ADK's tool confirmation; ADK span content off by default.
+- `AsyncGateway.token_refused`: the gateway's refusal of the token as an MCP client last saw it.
 
 ### Changed
 

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 __all__ = [
     "APPROVAL_ARGUMENT",
     "HOLD_MESSAGE",
+    "TOKEN_REFUSED_MESSAGE",
     "AsyncGateway",
     "CloudCredential",
     "CloudCredentialOutcome",
@@ -67,6 +68,8 @@ ModelApi = Literal["anthropic", "openai"]
 
 #: The JSON-RPC error an MCP client gets when the gateway refuses the token (see ``mcp_client_factory``).
 TOKEN_REFUSED_RPC_CODE = -32001
+#: Its message, which a framework that hands every MCP failure to the model as text carries along.
+TOKEN_REFUSED_MESSAGE = "The AuthFI gateway refused this credential"
 _REFUSAL_DATA = "authfi_refusal"
 
 
@@ -177,7 +180,7 @@ class _RefusalAsJsonRpc:
         await response.aclose()
         error = {
             "code": TOKEN_REFUSED_RPC_CODE,
-            "message": "The AuthFI gateway refused this credential",
+            "message": TOKEN_REFUSED_MESSAGE,
             "data": {_REFUSAL_DATA: "gateway_token_refused", "url": str(request.url), "www_authenticate": challenge},
         }
         return self._package.Response(

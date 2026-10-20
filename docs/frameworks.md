@@ -241,3 +241,64 @@ tracing with inputs and outputs hidden and `authfi_agent_id` in each run's metad
 
 The integration runs Claude Code as the agent itself; a token the agent holds for a person is not
 accepted (`NotSupportedError`), as Claude Code could only receive it as a fixed value.
+
+## Google ADK
+
+```bash
+pip install "authfi[adk] @ git+https://github.com/authfi/authfi-python-sdk@main"
+```
+
+```python
+from google.adk.runners import InMemoryRunner
+from google.genai import types
+from authfi import AsyncAuthFI
+from authfi.adk import ADKIntegration
+
+af = AsyncAuthFI.from_env()
+adk = ADKIntegration(af.agent_from_env())
+adk.configure_tracing()                            # before the runner is built
+agent = adk.agent(name="support", instruction="Help with refunds.", model="claude-haiku-5-5")
+runner = InMemoryRunner(agent=agent, app_name="support")
+session = await runner.session_service.create_session(app_name="support", user_id="u1")
+
+async def send(message):
+    return [e async for e in runner.run_async(user_id="u1", session_id=session.id, new_message=message)]
+
+events = await send(types.Content(role="user", parts=[types.Part(text="Refund order 4411")]))
+for pending in adk.held_approvals(events):         # approval_id, tool, args
+    ...                                            # once the person has decided in AuthFI:
+    events = await send(adk.answer(pending, confirmed=True))
+```
+
+**The model.** `model(name)` is Claude on the AI gateway through LiteLLM. It puts the agent's
+current token on each call itself, in the request's HTTP headers, which ADK leaves out of its
+traces; LiteLLM's required API key is a placeholder. A refused token raises `GatewayTokenRefused`.
+
+**The tools.** `toolset()` is ADK's `McpToolset` on the gateway with the gateway's HTTP client, so
+every request carries the current token, including a session ADK opens outside a run. A tool the
+gateway marks `never_allowed` is left out (`include_never_allowed=True` keeps it), and the tool list
+is cached for a minute. ADK replaces an MCP connection's HTTP client with a Google mTLS client when
+it finds Google credentials, which would send no AuthFI token; that is turned off for this toolset
+only. The integration checks, when the toolset is made, that the ADK it reaches into is the one it
+is tested with (`google-adk` 2.12, pinned by the extra), and raises `IntegrationError` otherwise.
+
+**Refusals** reach the model as `{"error": "<why>"}`. ADK turns every MCP failure into text for the
+model; when the gateway refused the token itself, the tool callback raises `GatewayTokenRefused`
+instead, ending the run. The callback reads the refusal from that call's own response, so tool
+calls ADK runs in parallel cannot clear or inherit one another's.
+
+**Approvals.** A held call becomes ADK's tool confirmation: `held_approvals(events)` lists them, and
+`answer(pending, confirmed=...)` is the message that answers one. A pending approval is
+`authfi.gateway.PendingApproval` (`approval_id`, `tool`, `args`) with ADK's `call_id`. Send it once the person has
+decided in AuthFI: the call is then sent with the approval, and the gateway decides. ADK confirms a
+call once, so a call confirmed before the person decided reaches the model as still waiting, and
+the same call made again goes under the same approval and asks again; no second approval is
+opened. A call answered `confirmed=False` is not sent. The approval id travels in ADK's
+confirmation, which ADK keeps out of what the model reads, and one the model writes is removed.
+
+**Content.** `configure_tracing(capture_content=False)` sets ADK's
+`ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` off and the OpenTelemetry GenAI content mode to `NO_CONTENT`,
+and adds `authfi.agent_id` to `OTEL_RESOURCE_ATTRIBUTES`. Call it before the runner is built.
+
+`agent(name=..., instruction=..., model=..., tools=...)` builds an `LlmAgent` with all of it;
+`before_tool_callback` and `after_tool_callback` you pass run after the integration's.
