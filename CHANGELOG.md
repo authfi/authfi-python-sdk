@@ -58,6 +58,13 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   held call recorded in graph state and resumed through an approval node that calls `interrupt()`
   first; `agent_graph()` for a ready agent. The approval id never passes through the model.
 - `Gateway.governance_of(tool)`: the agent's advisory outlook for a tool from `tools/list`.
+- `authfi.openai_agents.OpenAIAgentsIntegration` (extra `openai-agents`): `configure_tracing()`
+  removes the SDK's default exporter and keeps content out of spans; `model()` reaches Claude
+  through the AI gateway with the agent's token and no OpenAI key; `mcp_server()` gives the
+  gateway's tools, refusals the model reads, and approvals through the SDK's own approval items,
+  approved only once the gateway has decided (`resolve()`).
+- `AsyncGateway.mcp_client_factory()`: HTTP clients for MCP libraries, which get a refused token
+  as a JSON-RPC error at once instead of waiting out their session timeout.
 
 ### Changed
 

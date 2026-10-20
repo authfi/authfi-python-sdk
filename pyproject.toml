@@ -47,6 +47,7 @@ langgraph = [
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
+openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -89,6 +90,7 @@ dev = [
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
+    "openai-agents[litellm]>=0.24,<0.25",
 ]
 
 [tool.pytest.ini_options]
@@ -101,6 +103,8 @@ markers = ["live: runs against a real AuthFI project; needs AUTHFI_LIVE_* settin
 filterwarnings = [
     "error::authfi.errors.AuthFIDeprecationWarning",
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    # openai-agents 0.24 opens MCP sessions with the client mcp renamed
+    "ignore:Use `streamable_http_client` instead:DeprecationWarning",
 ]
 
 [tool.mutmut]

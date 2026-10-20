@@ -55,6 +55,7 @@ __all__ = [
     "CloudCredential",
     "CloudCredentialOutcome",
     "Gateway",
+    "PendingApproval",
     "ToolAllowed",
     "ToolApprovalRequired",
     "ToolOutcome",
@@ -67,6 +68,20 @@ ModelApi = Literal["anthropic", "openai"]
 #: The JSON-RPC error an MCP client gets when the gateway refuses the token (see ``mcp_client_factory``).
 TOKEN_REFUSED_RPC_CODE = -32001
 _REFUSAL_DATA = "authfi_refusal"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingApproval:
+    """A tool call the gateway holds until a person approves it: the one vocabulary every adapter uses.
+
+    ``approval_id`` names the approval to resume the call with, ``tool`` is the gateway's tool name
+    (``<server>__<tool>``) and ``args`` the call's arguments. An adapter subclasses it to add what its
+    framework needs to find the call again.
+    """
+
+    approval_id: str
+    tool: str
+    args: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
