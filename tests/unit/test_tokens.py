@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import pickle
 import threading
 import time
@@ -72,6 +73,15 @@ def test_headers_go_only_to_the_named_origins() -> None:
     assert MARKER not in str(caught.value)
 
 
+async def test_async_headers_go_only_to_the_named_origins() -> None:
+    source = AsyncStaticSource(MARKER, ("https://api.example.com",))
+    assert await source.headers("GET", "https://api.example.com/orders") == {"Authorization": "Bearer " + MARKER}
+    with pytest.raises(ConfigurationError) as caught:
+        await source.headers("GET", "https://evil.example/steal")
+    assert caught.value.code == "destination_not_allowed"
+    assert MARKER not in str(caught.value)
+
+
 def test_httpx_auth_attaches_per_request_and_refuses_other_origins() -> None:
     seen: list[str | None] = []
 
@@ -137,6 +147,13 @@ def test_a_token_set_does_not_print_or_pickle() -> None:
         pickle.dumps(ts)
     with pytest.raises(TypeError):
         hash(ts)
+
+
+def test_a_framework_that_copies_its_config_can_copy_a_token_set() -> None:
+    ts = token_set()
+    assert copy.copy(ts) is ts
+    assert copy.deepcopy(ts) is ts
+    assert copy.deepcopy({"tokens": ts})["tokens"] is ts
 
 
 def test_a_token_set_from_a_refresh_keeps_what_the_answer_left_out() -> None:

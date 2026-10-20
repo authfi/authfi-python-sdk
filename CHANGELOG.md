@@ -16,6 +16,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   repeating a request is safe; a refusal is never retried.
 - `X-Request-Id`, `traceparent` and a named `User-Agent` on every request; the platform's
   request id on every error.
+- `resolve_api_origin()` on both clients, for building a machine-API URL on a project with a custom domain.
 - Typed errors with stable codes (`AuthFIError.code`), including the platform's token refusal
   codes, generated from the AuthFI kernel.
 - `Secret`, which does not print, pickle or serialise a credential.
@@ -46,7 +47,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - The `authfi` command: `keygen`, `token` and `headers`.
 - `agent.gateway()`: the AuthFI gateways for any credential. `http_client()` (the token per
   request, origin-pinned, no redirects, `X-Request-Id` and `traceparent`), `read_result()` into a
-  `ToolOutcome` (`allowed`, `refused`, `approval_required`), model base URLs, the grant a tool
+  `ToolOutcome` (a union of `ToolAllowed`, `ToolRefused` and `ToolApprovalRequired`, which a `match` narrows), model base URLs, the grant a tool
   needs, and `cloud_credentials()`. A held call's text never reaches a model; a model-written
   approval id is removed.
 - `authfi.langchain.LangChainIntegration` (extra `langchain`): a `ChatAnthropic` on the AI gateway
@@ -101,3 +102,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - CIBA and token exchange return a `DelegatedToken`, not the token response `dict`, which put a
   person's token in a printable value.
 - The single-module `authfi.py` layout. The names it exported are kept at the top level.
+- A wait that runs out its own `timeout` no longer raises `OAuthError` `authorization_pending`, the
+  server's word for "not decided yet": it raises `WaitTimeout` (`code == "wait_timeout"`), and a
+  CIBA request that really expired raises `ConsentExpired`. An intended break.
+- `send_to` on `af.agent()`, and a customer API's `resource` there: the agent sends its own token to
+  AuthFI's endpoints, so it holds only a token for AuthFI. Use `agent.for_resource(resource,
+  send_to=[...])` for a customer API.
