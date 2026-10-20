@@ -16,6 +16,7 @@ never sent again after it may have arrived.
 
 from __future__ import annotations
 
+import dataclasses
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from typing import Any, Literal, cast
 from urllib.parse import quote
 
 from authfi._protocol.errors import CIBA_GRANT, api_error, oauth_error
-from authfi._protocol.http import Flow, HttpRequest, HttpResponse, Retry, call, pause
+from authfi._protocol.http import Attempt, Flow, HttpRequest, HttpResponse, Retry, call, pause
 from authfi._protocol.oauth import (
     ACCESS_TOKEN_TYPE,
     ClientAuth,
@@ -36,10 +37,12 @@ from authfi._protocol.verify import unverified_claims
 from authfi.errors import (
     APIError,
     ConfigurationError,
+    ConsentExpired,
     DiscoveryError,
     InvalidToken,
     NotSupportedError,
     OAuthError,
+    WaitTimeout,
 )
 from authfi.secret import Secret
 
@@ -191,23 +194,26 @@ def ciba_poll_flow(
     *,
     auth_req_id: Secret,
     interval: float,
-    deadline: float,
+    wait_deadline: float,
+    request_deadline: float,
     now: Callable[[], float],
     resource: str | None,
 ) -> Flow[TokenResponse]:
     """Poll until the person decides (CIBA §7.3), waiting ``interval`` before the first poll.
 
     ``authorization_pending`` keeps it waiting and ``slow_down`` widens the interval by five
-    seconds. A decision is raised at once: :class:`ConsentDenied`, :class:`ConsentExpired`. At
-    ``deadline`` (monotonic) it raises ``authorization_pending``: the request may still be open.
+    seconds. A decision is raised at once: :class:`ConsentDenied`, :class:`ConsentExpired`. The next
+    poll would fall after ``request_deadline`` (when the request expires, monotonic): the request has
+    run out, :class:`ConsentExpired`. After ``wait_deadline`` (the caller's timeout): :class:`WaitTimeout`,
+    and the request may still be open.
     """
     wait = interval
     while True:
-        if now() + wait > deadline:
-            raise OAuthError(
-                "authorization_pending",
-                "the person had not decided in time; the request may still be open, and waiting on it again "
-                "with the same request continues it",
+        if now() + wait > min(wait_deadline, request_deadline):
+            if request_deadline <= wait_deadline:
+                raise ConsentExpired("expired_token", "the request ran out before the person decided")
+            raise WaitTimeout(
+                "the person had not decided in time; the request is still open, and waiting on it again continues it"
             )
         yield from pause(wait)
         form = {"grant_type": CIBA_GRANT, "auth_req_id": auth_req_id.reveal()}
@@ -337,16 +343,25 @@ def authorize_request(
     return _json_request("POST", endpoint or api_origin + _AUTHORIZE_PATH, "the action gate", {}, body)
 
 
-def parse_action_decision(response: HttpResponse) -> tuple[str, str | None, str | None]:
+Decision = Literal["allow", "deny", "approval_required"]
+
+
+def parse_action_decision(response: HttpResponse) -> tuple[Decision, str | None, str | None]:
     """``(decision, approval_id, reason)``; the decision is ``allow``, ``deny`` or ``approval_required``."""
     data = _data(response, "the action gate")
     decision = data.get("decision")
-    if decision not in ("allow", "deny", "approval_required"):
+    if decision == "allow":
+        verdict: Decision = "allow"
+    elif decision == "deny":
+        verdict = "deny"
+    elif decision == "approval_required":
+        verdict = "approval_required"
+    else:
         raise APIError("invalid_response", f"the action gate answered decision {decision!r}", response.status)
     approval_id = data.get("approval_id")
     reason = data.get("reason")
     return (
-        cast(str, decision),
+        verdict,
         approval_id if isinstance(approval_id, str) and approval_id else None,
         reason if isinstance(reason, str) and reason else None,
     )
@@ -372,26 +387,35 @@ def approval_request(
     endpoint: str,
     *,
     agent_id: str,
-    assertion: str,
+    sign: Callable[[str], str],
+    audience: str,
     action: str,
     context: Mapping[str, Any] | None,
     expires_in: int,
 ) -> HttpRequest:
-    """Open an approval for ``action``. Never retried after send: a retry would open a second one."""
+    """Open an approval for ``action``, signing a new assertion for ``audience`` on every attempt.
+
+    Never retried after send: a retry would open a second one. When it is sent again, because the
+    request provably never left or the platform answered 429 or 503 with ``Retry-After``, the
+    assertion and its ``jti`` are new.
+    """
     if not _given(action):
         raise ConfigurationError("action is required: it is what the person approves")
     if expires_in <= 0:
         raise ConfigurationError("expires_in must be a positive number of seconds")
-    body: dict[str, Any] = {
-        "agent_id": agent_id,
-        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        "client_assertion": assertion,
-        "requesting_action": action,
-        "timeout_seconds": int(expires_in),
-    }
+    body: dict[str, Any] = {"agent_id": agent_id, "requesting_action": action, "timeout_seconds": int(expires_in)}
     if context:
         body["context"] = dict(context)
-    return _json_request("POST", endpoint, "the approval endpoint", {}, body)
+    request = _json_request("POST", endpoint, "the approval endpoint", {}, body)
+    return dataclasses.replace(
+        request,
+        per_attempt=lambda: Attempt(
+            json_body={
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": sign(audience),
+            }
+        ),
+    )
 
 
 def read_approval_request(template: str, approval_id: str, bearer: str) -> HttpRequest:

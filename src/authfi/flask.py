@@ -32,7 +32,15 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError("authfi.flask needs Flask: pip install 'authfi[flask]'") from exc
 
-from authfi._resource import Refusal, Requirements, log_refusal, refusal_for
+from authfi._resource import (
+    UNAVAILABLE,
+    Refusal,
+    Requirements,
+    log_refusal,
+    log_unavailable,
+    refusal_for,
+    unavailable_refusal,
+)
 from authfi.errors import ConfigurationError, InvalidToken
 from authfi.verify import AccessToken, AsyncMultiIssuerVerifier, AsyncTokenVerifier, MultiIssuerVerifier, TokenVerifier
 
@@ -147,6 +155,10 @@ class AuthFIFlask:
                     rules.check(token)
                 except InvalidToken as error:
                     raise self._refuse(error) from None
+                except UNAVAILABLE as error:
+                    rid = request.headers.get("X-Request-Id")
+                    log_unavailable(self._verifier.logger, error, request.method, request.path, rid)
+                    raise AuthFIRefusalError(unavailable_refusal(rid)) from None
                 setattr(g, _G_KEY, token)
                 return view(*args, **kwargs)
 

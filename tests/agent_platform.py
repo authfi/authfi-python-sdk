@@ -36,6 +36,8 @@ class AgentPlatform(Platform):
     ciba_answers: list[str] = field(default_factory=list[str])  # "pending", "slow_down", "ok", "denied", ...
     ciba_polls: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
     exchanges: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
+    actor_audiences: list[Any] = field(default_factory=list[Any])
+    bearer_audiences: list[Any] = field(default_factory=list[Any])  # the audience of each bearer an endpoint saw
     exchange_refusal: str | None = None
     approval_status: str | int = "pending"  # a status, or an HTTP status to answer
     approval_reads: int = 0
@@ -159,8 +161,12 @@ class AgentPlatform(Platform):
             return self.refuse("invalid_client", 401)
         if self.exchange_refusal:
             return self.refuse(self.exchange_refusal, 403)
-        subject = jwt.decode(form["subject_token"], options={"verify_signature": False})
+        try:
+            subject = jwt.decode(form["subject_token"], options={"verify_signature": False})
+        except jwt.PyJWTError:  # an opaque token: the platform resolves it by itself
+            subject = {"sub": "usr_opaque"}
         actor = jwt.decode(form["actor_token"], options={"verify_signature": False})
+        self.actor_audiences.append(actor.get("aud"))
         now = int(time.time())
         claims = {
             "iss": self.issuer,
@@ -195,6 +201,7 @@ class AgentPlatform(Platform):
             claims = jwt.decode(raw, options={"verify_signature": False})
         except jwt.PyJWTError:
             return False
+        self.bearer_audiences.append(claims.get("aud"))
         return bool(claims.get("sub") == self.agent_id)
 
     def _transaction_token(self, request: httpx.Request) -> httpx.Response:

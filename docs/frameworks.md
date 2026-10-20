@@ -41,7 +41,9 @@ It takes `ChatAnthropic`'s arguments, except those that carry a credential or an
 metadata names the agent (`authfi_agent_id`), so a trace shows which agent made each call.
 
 `configure_tracing(capture_content=False, **client_kwargs)` installs the LangSmith client that
-LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`.
+LangChain traces with and returns it; `client_kwargs` go to `langsmith.Client`. It is process-wide
+(`langsmith.configure`): an app that has its own LangSmith client should not call it, or should pass
+that client's settings in `client_kwargs`.
 
 ## LangGraph
 

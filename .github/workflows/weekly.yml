@@ -19,5 +19,53 @@ jobs:
       - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
         with:
           python-version: "3.12"
-      - run: uv sync --frozen
+      - run: uv sync --locked
       - run: uv run python scripts/drift.py https://platform-beta.authfi.io
+
+  # The newest release of each framework, past the range its extra allows. A failure here is the
+  # warning to test the new release and widen the range, before a user installs it unannounced.
+  canary:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter:
+          - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_api_adapters.py" }
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: uv venv
+      - name: Install the newest releases, with the extras' upper bounds lifted
+        run: |
+          printf '%s\n' ${{ matrix.adapter.overrides }} > overrides.txt
+          uv pip install --override overrides.txt --resolution highest ".[${{ matrix.adapter.extras }}]" --group test
+      - run: .venv/bin/python -m pytest -p no:cacheprovider ${{ matrix.adapter.tests }}
+
+  # Mutation testing of the verifier and the protocol rules: a mutant that survives is a rule no test
+  # notices. The report is in the job summary; it does not fail the job, because some mutants (the
+  # wording of an error message) change nothing a test can see.
+  mutation:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --group mutation
+      - run: uv run mutmut run "authfi.verify*" "authfi._protocol.verify*" "authfi._protocol.jwks*"
+      - name: Report the surviving mutants
+        if: always()
+        run: |
+          {
+            echo "## Surviving mutants"
+            echo '```'
+            uv run mutmut results
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
