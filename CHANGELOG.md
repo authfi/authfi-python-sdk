@@ -35,6 +35,16 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   sent only to that API's origins.
 - `authfi.fastapi.AuthFIBearer` and `authfi.flask.AuthFIFlask`, answering refusals as RFC 6750
   and RFC 9470 say, with the precise reason in the log only.
+- `af.agent(agent_id, key)` and `af.agent_from_env()`: an AI agent on the shared core. Its own
+  token (client credentials with `private_key_jwt`, at the project's token endpoint), CIBA with a
+  required `binding_message`, token exchange, the action gate (`transaction_token`,
+  `authorize_action`) and approvals. `AsyncAgentAuth` is its asyncio twin, on
+  `httpx.AsyncClient`, never threads.
+- `DelegatedToken`: a token an agent holds for a person, as a `TokenSource`. A CIBA token is
+  never renewed; an exchanged one is exchanged again while the person's token lives.
+- `AgentKey` for Ed25519, P-256 and RSA, signing through PyJWT; `write()` creates an owner-only
+  file (POSIX mode or Windows DACL), and `from_file()` refuses one others can read.
+- The `authfi` command: `keygen`, `token` and `headers`.
 
 ### Changed
 
@@ -46,7 +56,10 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 ### Deprecated
 
 - 0.1's `AuthFI(tenant, api_key, ...)`, `verify_token`, `require`, `require_role`,
-  `current_user`, the 0.1 attributes, and `AgentAuthError`: each still works and warns
+  `current_user`, the 0.1 attributes, and `AgentAuthError`; 0.1's `AgentAuth(agent_id, key,
+  platform_url=...)`, `AgentAuth.from_env()`, `token(audience)`, `auth_header`, `can`,
+  `discovery`, `request_user_approval`, and `AgentKey`'s `key_id` and `private_pem`: each still
+  works and warns
   `AuthFIDeprecationWarning`; removed at 1.0. See [docs/migration-0.2.md](docs/migration-0.2.md).
 
 ### Removed
@@ -56,4 +69,13 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   replaces them.
 - Verifying a token without an audience, or without a `kid`, and accepting a JWT that is not an
   access token. These are intended breaks; see the migration guide.
+- `AgentAuth`'s default project (`https://platform.authfi.io`): an agent's project must be named.
+- CIBA and token exchange return a `DelegatedToken`, not the token response `dict`, which put a
+  person's token in a printable value.
 - The single-module `authfi.py` layout. The names it exported are kept at the top level.
+- A wait that runs out its own `timeout` no longer raises `OAuthError` `authorization_pending`, the
+  server's word for "not decided yet": it raises `WaitTimeout` (`code == "wait_timeout"`), and a
+  CIBA request that really expired raises `ConsentExpired`. An intended break.
+- `send_to` on `af.agent()`, and a customer API's `resource` there: the agent sends its own token to
+  AuthFI's endpoints, so it holds only a token for AuthFI. Use `agent.for_resource(resource,
+  send_to=[...])` for a customer API.

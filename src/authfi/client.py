@@ -30,6 +30,9 @@ from authfi._protocol.jwks import KeySet, PublicKey, jwks_flow
 from authfi._protocol.retry import RetryPolicy
 from authfi._protocol.urls import FIRST_PARTY_CLIENTS, is_under, origin_of, validate_issuer, validate_origin
 from authfi._transport import DEFAULT_TIMEOUT, AsyncTransport, SyncTransport, Timeout, user_agent
+from authfi.agents._legacy import key_from_env
+from authfi.agents.agent import AgentAuth, AsyncAgentAuth
+from authfi.agents.keys import AgentKey, Signer
 from authfi.errors import AuthFIDeprecationWarning, ConfigurationError
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
@@ -204,6 +207,15 @@ async def _async_authorization(credential: AsyncTokenSource | Secret, method: st
     if isinstance(credential, AsyncTokenSource):  # pyright: ignore[reportUnnecessaryIsInstance]
         return await credential.headers(method, url)
     raise ConfigurationError("credential must be an AsyncTokenSource or a Secret, never a plain string")
+
+
+def _agent_settings(env: Mapping[str, str] | None, resource: str | None) -> tuple[str, AgentKey, str | None]:
+    source = os.environ if env is None else env
+    agent_id = source.get("AUTHFI_AGENT_ID", "").strip()
+    if not agent_id:
+        raise ConfigurationError("AUTHFI_AGENT_ID is not set: set it to the agent's id (agt_...)")
+    key = key_from_env(source)
+    return agent_id, key, resource or source.get("AUTHFI_AGENT_RESOURCE", "").strip() or None
 
 
 def _register(instance: AuthFI | AsyncAuthFI) -> None:
@@ -394,6 +406,33 @@ class AuthFI(LegacyAuthFIMixin, _Project):
             self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
         )
 
+    def agent(
+        self,
+        agent_id: str,
+        key: Signer,
+        *,
+        resource: str | None = None,
+        refresh_skew: float = 60.0,
+    ) -> AgentAuth:
+        """An AI agent of this project, authenticating with ``key`` (an :class:`~authfi.AgentKey`).
+
+        ``resource`` is what its own token is for, and must be AuthFI's own: ``<issuer>/mcp`` (the
+        AuthFI gateway) when absent. For a customer's API, use ``agent.for_resource(resource,
+        send_to=[...])``: the agent sends its own token to AuthFI's endpoints, so it never holds a
+        token for another API by default.
+        """
+        return AgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
+
+    def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AgentAuth:
+        """The agent the environment names.
+
+        ``AUTHFI_AGENT_ID``; ``AUTHFI_AGENT_KEY_FILE`` (the default and the documented way) or, for a
+        runtime with no filesystem, ``AUTHFI_AGENT_PRIVATE_KEY`` (which warns); ``AUTHFI_AGENT_KID``;
+        and ``AUTHFI_AGENT_RESOURCE``. The project itself comes from ``AuthFI.from_env``.
+        """
+        agent_id, key, chosen = _agent_settings(env, resource)
+        return self.agent(agent_id, key, resource=chosen)
+
     def check(
         self,
         credential: TokenSource | Secret,
@@ -417,6 +456,7 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
+        self._closables = [ref for ref in self._closables if ref() is not None]
         self._closables.append(weakref.ref(closable))
 
     def close(self) -> None:
@@ -555,6 +595,22 @@ class AsyncAuthFI(_Project):
             self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
         )
 
+    def agent(
+        self,
+        agent_id: str,
+        key: Signer,
+        *,
+        resource: str | None = None,
+        refresh_skew: float = 60.0,
+    ) -> AsyncAgentAuth:
+        """See :meth:`AuthFI.agent`."""
+        return AsyncAgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
+
+    def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AsyncAgentAuth:
+        """See :meth:`AuthFI.agent_from_env`."""
+        agent_id, key, chosen = _agent_settings(env, resource)
+        return self.agent(agent_id, key, resource=chosen)
+
     async def check(
         self,
         credential: AsyncTokenSource | Secret,
@@ -573,6 +629,7 @@ class AsyncAuthFI(_Project):
         return CheckResult(allowed=allowed, approval_required=held, reason=reason)
 
     def _track(self, closable: Any) -> None:
+        self._closables = [ref for ref in self._closables if ref() is not None]
         self._closables.append(weakref.ref(closable))
 
     async def aclose(self) -> None:

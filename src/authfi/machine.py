@@ -23,7 +23,7 @@ from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.oauth import ClientAuth, client_credentials_request, parse_token_response
 from authfi.errors import ConfigurationError, NotSupportedError
 from authfi.secret import Secret
-from authfi.tokens import AsyncTokenSource, TokenSource, normalise_send_to
+from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
 
 if TYPE_CHECKING:
     from authfi._protocol.oauth import TokenResponse
@@ -87,13 +87,7 @@ class _Config:
         if isinstance(scope, str):
             raise ConfigurationError("scope is a sequence of names, such as ('orders:read',), not one string")
         self.scope = tuple(scope) if scope is not None else None
-        self.own = project.names_authfi(self.resource)
-        self._send_to = normalise_send_to(send_to)
-        if not self.own and not self._send_to:
-            raise ConfigurationError(
-                f"send_to is required with resource={self.resource!r}: name the API's origin, such as "
-                'send_to=["https://api.example.com"], so the token can go nowhere else.'
-            )
+        self.destinations = Destinations(project, self.resource, send_to)
         if self.resource is None and warn_without_resource:
             warn_once(
                 project.logger,
@@ -106,9 +100,7 @@ class _Config:
 
     @property
     def send_to(self) -> tuple[str, ...]:
-        if self.own:
-            return tuple(dict.fromkeys((*self.project.authfi_origins, *self._send_to)))
-        return self._send_to
+        return self.destinations.origins
 
 
 class ClientCredentials(TokenSource):

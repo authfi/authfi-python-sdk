@@ -32,6 +32,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.scripts]
+authfi = "authfi.cli:main"
+
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
@@ -145,6 +148,7 @@ ignore = [
     "S105",   # "token" names a domain concept here, not a password; secrets are held in Secret
     "S106",
     "S107",
+    "ASYNC109", # the async clients take timeout= as the blocking ones do: one signature for both
 ]
 
 [tool.ruff.lint.per-file-ignores]
