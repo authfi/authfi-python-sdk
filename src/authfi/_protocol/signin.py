@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -222,10 +222,23 @@ def authorize_url(
 _SINGLE = ("iss", "state", "code", "error", "error_description")
 
 
+def _pairs(callback: Mapping[str, str] | str) -> list[tuple[str, str]]:
+    """Every name and value the callback carries, repeats included where its type keeps them."""
+    if isinstance(callback, str):
+        return parse_qsl(urlsplit(callback).query, keep_blank_values=True)
+    multi_items = getattr(callback, "multi_items", None)  # Starlette's and FastAPI's query parameters
+    if callable(multi_items):
+        return [(str(k), str(v)) for k, v in cast("Iterable[tuple[object, object]]", multi_items())]
+    lists = getattr(callback, "lists", None)  # Werkzeug's and Flask's MultiDict
+    if callable(lists):
+        return [
+            (str(k), str(v)) for k, values in cast("Iterable[tuple[object, Iterable[object]]]", lists()) for v in values
+        ]
+    return [(str(k), str(v)) for k, v in callback.items()]
+
+
 def _callback_params(callback: Mapping[str, str] | str) -> dict[str, str]:
-    if not isinstance(callback, str):
-        return {str(k): str(v) for k, v in callback.items()}
-    pairs = parse_qsl(urlsplit(callback).query, keep_blank_values=True)
+    pairs = _pairs(callback)
     seen: set[str] = set()
     for name, _ in pairs:
         if name in _SINGLE and name in seen:

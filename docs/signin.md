@@ -43,7 +43,9 @@ Every sign-in uses PKCE (S256), a fresh `state` and a fresh `nonce`. `finish_sig
 - requires the callback's `iss` and checks it is this project exactly (RFC 9207), so a response from
   another issuer cannot be mixed in;
 - refuses a callback that repeats `iss`, `state`, `code`, `error` or `error_description`
-  (`InvalidCallback`, code `callback_parameter_repeated`): which value is meant is unknown;
+  (`InvalidCallback`, code `callback_parameter_repeated`): which value is meant is unknown. Pass the
+  full URL, or the framework's own query parameters (`request.query_params` in FastAPI and
+  Starlette, `request.args` in Flask), which keep every value, so a repeat is seen;
 - checks `state` in constant time;
 - exchanges the code with the PKCE verifier;
 - verifies the ID token: an algorithm the project's discovery names, `typ` `JWT`, the issuer, the
@@ -78,8 +80,11 @@ info = web.userinfo(tokens)                         # must name the same person
 ```
 
 A refresh token can be used once: a second use revokes it and every token made from it, which signs
-the person out. `refresh` makes one request per refresh token across threads (and tasks, in
-`AsyncWebApp`), and every caller gets its result.
+the person out. `refresh` makes one request per refresh token across the threads (and tasks, in
+`AsyncWebApp`) that call it at the same time, and each of them gets its result. The result is not
+kept: a caller that arrives later with the refresh token that was already spent is sent to the
+server, which refuses it (`OAuthError`, `invalid_grant`), and is never handed the earlier answer. Store
+the new tokens that `refresh` returns and refresh those.
 
 Across workers, keep the tokens in a shared `TokenStore` (a protocol with `load(key)` and
 `compare_and_set(key, old, new)`, which your database or cache implements) and use the person's

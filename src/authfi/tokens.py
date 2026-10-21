@@ -373,9 +373,10 @@ class AsyncInMemoryTokenStore:
         return f"AsyncInMemoryTokenStore({len(self._sets)} sets)"
 
 
-# How long a finished refresh is remembered, so a caller still holding the old refresh token gets
-# the new set instead of spending the old token a second time (which would revoke the family).
-_REMEMBER_REFRESH = 120.0
+# A finished refresh is not remembered. Callers that overlap share one refresh; a caller that comes
+# later with the spent refresh token goes to the server, which refuses it (invalid_grant), because a
+# replayed refresh token is never answered from memory.
+_REMEMBER_REFRESH = 0.0
 
 
 def _refresh_key(refresh_token: Secret) -> str:
@@ -383,13 +384,17 @@ def _refresh_key(refresh_token: Secret) -> str:
 
 
 class RefreshGate:
-    """One refresh per refresh token at a time across threads, and its result shared."""
+    """One refresh per refresh token at a time across threads, and its result shared with the callers waiting."""
 
     def __init__(self, clock: Clock) -> None:
         self._cache: SyncCache[TokenSet] = SyncCache(clock, max_entries=1024)
 
     def run(self, refresh_token: Secret, refresh: Callable[[], TokenSet]) -> TokenSet:
-        """``refresh()`` once for ``refresh_token``; concurrent and late callers get its result."""
+        """``refresh()`` once for ``refresh_token``; callers that overlap in time get its result.
+
+        A caller that arrives after it finished runs ``refresh`` itself: the refresh token is spent,
+        and the server's refusal, not an earlier answer, is what it is told.
+        """
         return self._cache.get(_refresh_key(refresh_token), lambda: (refresh(), _REMEMBER_REFRESH))
 
     def after_fork(self) -> None:
@@ -398,7 +403,7 @@ class RefreshGate:
 
 
 class AsyncRefreshGate:
-    """One refresh per refresh token at a time across tasks, and its result shared."""
+    """One refresh per refresh token at a time across tasks, and its result shared with the tasks waiting."""
 
     def __init__(self, clock: Clock) -> None:
         self._cache: AsyncCache[TokenSet] = AsyncCache(clock, max_entries=1024)

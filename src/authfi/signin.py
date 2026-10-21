@@ -388,7 +388,9 @@ class WebApp:
         """New tokens for ``tokens``: one refresh per refresh token across threads, its result shared.
 
         A refresh token is single-use; a second use revokes its family and signs the person out, so
-        concurrent and late callers get the first refresh's result. Across workers, use
+        callers that overlap get the first refresh's result. A caller that arrives after it finished
+        and still holds the spent token is not handed that result: the server answers it
+        (``invalid_grant``), so keep the new tokens and refresh those. Across workers, use
         :meth:`session` with a shared :class:`~authfi.TokenStore`.
         """
         refresh_token = _needs_refresh(tokens)

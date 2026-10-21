@@ -78,7 +78,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   `state` and `nonce`; the callback's `iss` required (RFC 9207); the pending sign-in encrypted
   (AES-256-GCM under `state_key`, bound to the client and redirect URI, ten minutes); the ID token
   verified (discovery's algorithm, `typ`, audience and `azp`, `nonce`, `at_hash`, `max_age`, `acr`);
-  `StepUpRequired` for a weaker sign-in than asked; single-flight `refresh`; `userinfo` checked
+  `StepUpRequired` for a weaker sign-in than asked; single-flight `refresh` (callers that overlap share one request; a later caller holding the spent refresh token is refused by the server, never answered from memory); `userinfo` checked
   against the person who signed in; `sign_out` revoking the refresh token before ending the
   session; `session()`, the person's token as a `TokenSource` shared through a `TokenStore`.
   `AsyncWebApp` is its asyncio twin.

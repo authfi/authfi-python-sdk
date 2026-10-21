@@ -8,9 +8,10 @@ import base64
 import hashlib
 import secrets
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -56,6 +57,8 @@ class OIDC:
         self.id_typ: str | None = "JWT"
         self.id_kid: str | None = None
         self.refreshes = 0
+        self.spent: set[str] = set()
+        self.hold_refresh: threading.Event | None = None  # when set, a refresh answers only once it is released
         self.revoked: list[str] = []
         self.revoke_hints: list[str] = []
         self.refresh_answer: dict[str, Any] | None = None
@@ -122,6 +125,12 @@ class OIDC:
             )
         if form["grant_type"] == "refresh_token":
             self.refreshes += 1
+            if self.hold_refresh is not None:
+                self.hold_refresh.wait(5)
+            # A refresh token is single-use (and a reuse revokes its family): the second presentation fails.
+            if form["refresh_token"] in self.spent:
+                return json_response({"error": "invalid_grant"}, 400)
+            self.spent.add(form["refresh_token"])
             if self.refresh_answer is not None:
                 return json_response(self.refresh_answer, 400 if "error" in self.refresh_answer else 200)
             access = f"at-refreshed-{self.refreshes}"
@@ -358,6 +367,36 @@ def test_a_callback_that_repeats_a_parameter_is_refused_not_read(
     assert platform.calls("POST", "/oauth/token") == []
 
 
+@pytest.mark.parametrize("framework", ["starlette", "werkzeug"])
+def test_a_repeat_is_refused_in_the_query_parameters_a_web_framework_hands_over(
+    web: WebApp, oidc: OIDC, platform: Platform, framework: str
+) -> None:
+    """Request.query_params and request.args keep every value; reading one of them would be a guess."""
+    pending = web.start_sign_in()
+    query = urlsplit(oidc.browser(pending.url)).query + "&state=other"
+    params: Any
+    if framework == "starlette":
+        from starlette.datastructures import QueryParams
+
+        params = QueryParams(query)
+    else:
+        from werkzeug.datastructures import MultiDict
+
+        params = MultiDict(parse_qsl(query))
+    with pytest.raises(InvalidCallback) as caught:
+        web.finish_sign_in(params, pending)
+    assert caught.value.code == "callback_parameter_repeated"
+    assert platform.calls("POST", "/oauth/token") == []
+
+
+def test_query_parameters_with_no_repeat_are_read_from_a_framework_type(web: WebApp, oidc: OIDC) -> None:
+    from starlette.datastructures import QueryParams
+
+    pending = web.start_sign_in()
+    params = QueryParams(urlsplit(oidc.browser(pending.url)).query + "&utm=1&utm=2")
+    assert web.finish_sign_in(params, pending).user.sub == "usr_ada"
+
+
 def test_a_parameter_the_callback_may_repeat_is_left_alone(web: WebApp, oidc: OIDC) -> None:
     pending = web.start_sign_in()
     assert web.finish_sign_in(oidc.browser(pending.url) + "&utm=1&utm=2", pending).user.sub == "usr_ada"
@@ -394,6 +433,7 @@ def test_a_refusal_in_the_callback(web: WebApp, oidc: OIDC) -> None:
         ({"id_claims": {"aud": [CLIENT, "app_other"]}}, "id_token_audience_mismatch"),
         ({"id_claims": {"azp": "app_other"}}, "id_token_audience_mismatch"),
         ({"id_claims": {"iss": "https://evil.example"}}, "id_token_issuer_mismatch"),
+        ({"id_claims": {"iss": "https://acme.authfi.io/"}}, "id_token_issuer_mismatch"),
         ({"id_claims": {"at_hash": "AAAA"}}, "id_token_at_hash_mismatch"),
         ({"id_claims": {"exp": 1}}, "id_token_expired"),
         ({"id_claims": {"iat": 4_000_000_000}}, "id_token_claims_invalid"),
@@ -454,6 +494,7 @@ def test_refresh_is_single_flight(web: WebApp, oidc: OIDC) -> None:
     tokens = _sign_in(web, oidc).tokens
     results: list[TokenSet] = []
     barrier = threading.Barrier(4)
+    oidc.hold_refresh = release = threading.Event()  # the refresh stays in flight until every thread has joined it
 
     def refresh() -> None:
         barrier.wait()
@@ -462,6 +503,8 @@ def test_refresh_is_single_flight(web: WebApp, oidc: OIDC) -> None:
     threads = [threading.Thread(target=refresh) for _ in range(4)]
     for t in threads:
         t.start()
+    time.sleep(0.3)
+    release.set()
     for t in threads:
         t.join()
 
@@ -469,6 +512,18 @@ def test_refresh_is_single_flight(web: WebApp, oidc: OIDC) -> None:
     assert {r.access_token.reveal() for r in results} == {"at-refreshed-1"}
     assert results[0].refresh_token == Secret("rt-2")
     assert results[0].id_token == tokens.id_token  # kept from the sign-in
+
+
+def test_a_later_caller_holding_the_spent_refresh_token_is_not_handed_the_first_result(web: WebApp, oidc: OIDC) -> None:
+    """Only callers that overlap share a refresh: a replayed refresh token is answered by the server."""
+    tokens = _sign_in(web, oidc).tokens
+    assert web.refresh(tokens).access_token.reveal() == "at-refreshed-1"
+
+    with pytest.raises(OAuthError) as caught:
+        web.refresh(tokens)
+
+    assert caught.value.code == "invalid_grant"
+    assert oidc.refreshes == 2
 
 
 def test_a_refresh_answering_an_id_token_must_name_the_same_person(web: WebApp, oidc: OIDC) -> None:
@@ -624,12 +679,16 @@ async def test_asyncio_sign_in_refresh_and_sign_out(platform: Platform, oidc: OI
         fresh = await asyncio.gather(*(web.refresh(signed_in.tokens) for _ in range(3)))
         assert oidc.refreshes == 1
         assert {t.access_token.reveal() for t in fresh} == {"at-refreshed-1"}
+        with pytest.raises(OAuthError) as caught:  # the same spent token, later: the server answers, not memory
+            await web.refresh(signed_in.tokens)
+        assert caught.value.code == "invalid_grant"
+        assert oidc.refreshes == 2
 
         assert (await web.userinfo(signed_in.tokens)).sub == "usr_ada"
         store = AsyncInMemoryTokenStore()
-        session = await web.session(signed_in.tokens, store=store, key="k")
+        session = await web.session(fresh[0], store=store, key="k")
         clock.advance(900)
-        assert await session.token() == "at-refreshed-2"
+        assert await session.token() == "at-refreshed-3"
         url = await web.sign_out(signed_in.tokens)
         assert url.startswith(platform.issuer + "/oauth/logout?client_id=")
         assert oidc.revoked == ["rt-1"]
