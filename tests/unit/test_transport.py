@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from urllib.parse import parse_qs
 
@@ -335,9 +336,11 @@ async def test_an_async_body_that_stops_arriving_is_cut_at_the_deadline() -> Non
 
     server = Server(lambda _r: httpx.Response(200, content=stalls()), failures=1)
     t = _async_transport(server, SystemClock(), Timeout(connect=1.0, read=1.0, total=0.3))
+    started = time.monotonic()
     with pytest.raises(TransportError) as caught:
         await t.send(HttpRequest("GET", URL, what="the token endpoint"))
     assert caught.value.code == "timeout"
+    assert time.monotonic() - started < 5, "the wait ran on to the server's own pace instead of the deadline"
 
 
 def test_a_body_that_cannot_be_decoded_is_a_transport_error_not_an_httpx_one(clock: FakeClock) -> None:
