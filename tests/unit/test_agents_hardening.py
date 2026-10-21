@@ -355,3 +355,41 @@ async def test_a_cold_async_agent_on_a_custom_domain_sends_the_transaction_token
         agent = project.agent(AGENT, key)
         await agent.transaction_token("refund")
     assert [r.url.host for r in platform.calls("POST", TXN)] == ["acme.authfi.io"]
+
+
+# --- poll_interval: finite and positive; the CIBA wait never polls faster than the server asks ------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "3"])
+def test_a_poll_interval_must_be_finite_and_positive(af: AuthFI, key: AgentKey, bad: Any) -> None:
+    agent = af.agent(AGENT, key)
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        agent.wait_for_approval("apr_1", poll_interval=bad)
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        agent.await_user_token(request, poll_interval=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+async def test_the_asyncio_poll_interval_is_checked_too(aaf: AsyncAuthFI, key: AgentKey, bad: float) -> None:
+    agent = aaf.agent(AGENT, key)
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        await agent.wait_for_approval("apr_1", poll_interval=bad)
+    request = await agent.request_user_token("priya@acme.com", binding_message="Refund")
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        await agent.await_user_token(request, poll_interval=bad)
+
+
+def test_a_smaller_poll_interval_is_raised_to_the_servers_and_a_larger_one_is_kept(
+    af: AuthFI, key: AgentKey, platform: AgentPlatform, clock: FakeClock
+) -> None:
+    agent = af.agent(AGENT, key)
+    platform.ciba_answers = ["pending", "ok"]
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    agent.await_user_token(request, poll_interval=0.01)
+    assert clock.sleeps == [request.interval, request.interval]
+    clock.sleeps.clear()
+    platform.ciba_answers = ["pending", "ok"]
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    agent.await_user_token(request, poll_interval=request.interval + 7)
+    assert clock.sleeps == [request.interval + 7, request.interval + 7]
