@@ -380,3 +380,22 @@ def test_each_adapter_takes_the_verifier_its_framework_needs(platform: Platform,
     guard = AuthFIFlask(None, af.verifier(audience=AUD))
     with pytest.raises(ConfigurationError):
         guard.protect(optional=True, permissions=["a"])
+
+
+def test_a_request_path_cannot_forge_a_log_line_or_fill_the_log(caplog: pytest.LogCaptureFixture) -> None:
+    """Flask decodes %0a in a path: it is logged escaped, on one line, and capped."""
+    from authfi import InvalidToken
+    from authfi._resource import log_refusal, log_unavailable
+
+    logger = logging.getLogger("authfi")
+    forged = "/a\nWARNING authfi: forged"
+    with caplog.at_level(logging.INFO, logger="authfi"):
+        log_refusal(logger, InvalidToken("token_expired", "x"), "GET", forged, "r1")
+        log_unavailable(logger, RuntimeError("x"), "GET", forged, "r1")
+        log_refusal(logger, InvalidToken("token_expired", "x"), "GET", "/" + "p" * 5000, "r1")
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 3
+    assert all("\n" not in m for m in messages)
+    escaped = "/a" + chr(92) + "nWARNING authfi: forged"
+    assert escaped in messages[0] and escaped in messages[1]
+    assert len(messages[2]) < 400
