@@ -321,3 +321,75 @@ def test_warnings_are_not_raised_by_the_new_form(af: AuthFI, key: AgentKey) -> N
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         af.agent(AGENT, key)
+
+
+# --- a cold client on a custom domain asks the machine API host, not the issuer's ------------------------
+
+
+def _custom_domain(key: AgentKey) -> AgentPlatform:
+    platform = AgentPlatform(issuer="https://login.acme.com", agent_jwk=key.public_jwk())
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    return platform
+
+
+TXN = "/apis/regional/v1/ai/auth/transaction-token"
+
+
+def test_a_cold_agent_on_a_custom_domain_sends_the_transaction_token_request_to_the_machine_api_host(
+    key: AgentKey, clock: FakeClock
+) -> None:
+    platform = _custom_domain(key)
+    with AuthFI(platform.issuer, http_client=platform.client(), clock=clock) as project:
+        agent = project.agent(AGENT, key)
+        agent.transaction_token("refund")
+    assert [r.url.host for r in platform.calls("POST", TXN)] == ["acme.authfi.io"]
+
+
+async def test_a_cold_async_agent_on_a_custom_domain_sends_the_transaction_token_request_to_the_machine_api_host(
+    key: AgentKey, clock: FakeClock
+) -> None:
+    platform = _custom_domain(key)
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as project:
+        agent = project.agent(AGENT, key)
+        await agent.transaction_token("refund")
+    assert [r.url.host for r in platform.calls("POST", TXN)] == ["acme.authfi.io"]
+
+
+# --- poll_interval: finite and positive; the CIBA wait never polls faster than the server asks ------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), True, "3"])
+def test_a_poll_interval_must_be_finite_and_positive(af: AuthFI, key: AgentKey, bad: Any) -> None:
+    agent = af.agent(AGENT, key)
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        agent.wait_for_approval("apr_1", poll_interval=bad)
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        agent.await_user_token(request, poll_interval=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+async def test_the_asyncio_poll_interval_is_checked_too(aaf: AsyncAuthFI, key: AgentKey, bad: float) -> None:
+    agent = aaf.agent(AGENT, key)
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        await agent.wait_for_approval("apr_1", poll_interval=bad)
+    request = await agent.request_user_token("priya@acme.com", binding_message="Refund")
+    with pytest.raises(ConfigurationError, match="poll_interval"):
+        await agent.await_user_token(request, poll_interval=bad)
+
+
+def test_a_smaller_poll_interval_is_raised_to_the_servers_and_a_larger_one_is_kept(
+    af: AuthFI, key: AgentKey, platform: AgentPlatform, clock: FakeClock
+) -> None:
+    agent = af.agent(AGENT, key)
+    platform.ciba_answers = ["pending", "ok"]
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    agent.await_user_token(request, poll_interval=0.01)
+    assert clock.sleeps == [request.interval, request.interval]
+    clock.sleeps.clear()
+    platform.ciba_answers = ["pending", "ok"]
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    agent.await_user_token(request, poll_interval=request.interval + 7)
+    assert clock.sleeps == [request.interval + 7, request.interval + 7]
