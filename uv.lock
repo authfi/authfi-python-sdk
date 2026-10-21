@@ -357,7 +357,7 @@ requires-dist = [
     { name = "langsmith", marker = "extra == 'claude-agent'", specifier = ">=0.14,<1" },
     { name = "langsmith", marker = "extra == 'langchain'", specifier = ">=0.14,<1" },
     { name = "langsmith", marker = "extra == 'langgraph'", specifier = ">=0.14,<1" },
-    { name = "litellm", marker = "extra == 'adk'", specifier = ">=1.83,<2" },
+    { name = "litellm", marker = "extra == 'adk'", specifier = ">=1.83,!=1.92.*,<1.106" },
     { name = "mcp", marker = "extra == 'adk'", specifier = ">=1.30,<2" },
     { name = "mcp", marker = "extra == 'claude-agent'", specifier = ">=1.30,<2" },
     { name = "mcp", marker = "extra == 'langgraph'", specifier = ">=1.30,<2" },
