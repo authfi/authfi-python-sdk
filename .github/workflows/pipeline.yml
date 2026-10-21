@@ -85,6 +85,7 @@ jobs:
         resolution: [lowest-direct, highest]
         adapter:
           - { extras: "fastapi,flask", tests: "tests/unit/test_api_adapters.py" }
+          - { extras: "langchain", tests: "tests/unit/test_langchain.py" }
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
