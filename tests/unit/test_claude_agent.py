@@ -24,7 +24,7 @@ from authfi import (
     GatewayTokenRefused,
     NotSupportedError,
 )
-from authfi.claude_agent import CONTENT_SWITCHES, MEMORY_SECONDS, ClaudeAgentIntegration, PendingApproval
+from authfi.claude_agent import CONTENT_SWITCHES, ClaudeAgentIntegration, PendingApproval
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
 from tests.support import FakeClock
@@ -363,7 +363,7 @@ async def test_an_answer_nobody_collected_is_not_served_to_a_later_call(
 ) -> None:
     claude, clock = timed
     assert isinstance(await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT), PermissionResultAllow)
-    clock.advance(MEMORY_SECONDS + 1)  # Claude Code never ran the call: a hook denied it, the run stopped
+    clock.advance(121)  # two minutes: Claude Code never ran the call: a hook denied it, the run stopped
     await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)
     answer = await _handler(claude, ALLOWED)(ARGS)
     assert answer["is_error"] is False
@@ -375,7 +375,7 @@ async def test_an_answer_is_served_within_its_time(
 ) -> None:
     claude, clock = timed
     await claude.can_use_tool(_name(ALLOWED), ARGS, CONTEXT)
-    clock.advance(MEMORY_SECONDS - 1)
+    clock.advance(119)
     await _handler(claude, ALLOWED)(ARGS)
     assert len(fake.tool_calls) == 1
 
@@ -397,7 +397,7 @@ async def test_a_held_call_is_forgotten_after_its_time_too(
     claude, clock = timed
     first = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
     assert isinstance(first, PermissionResultDeny)
-    clock.advance(MEMORY_SECONDS + 1)
+    clock.advance(121)
     fake_requests = len(fake.tool_calls)
     again = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
     assert isinstance(again, PermissionResultDeny)
