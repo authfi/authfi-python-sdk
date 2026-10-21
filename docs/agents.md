@@ -84,7 +84,9 @@ httpx.Client(auth=as_priya.httpx_auth())
 
 - `binding_message` is required: it is what the person reads before they approve.
 - The agent never sees or relays a code.
-- The wait polls at the interval the project asks for. It raises `ConsentDenied` if they say no and
+- The wait polls at the interval the project asks for. `poll_interval=` may ask for a longer wait; a
+  smaller value is raised to the project's interval, and it must be finite and above zero
+  (`ConfigurationError`). It raises `ConsentDenied` if they say no and
   `ConsentExpired` if the request runs out. At your own `timeout` it raises `WaitTimeout`
   (`code == "wait_timeout"`); the request stays open, and waiting on it again continues it.
 - `agent.token_as_user(...)` does both steps.
