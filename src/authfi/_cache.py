@@ -2,7 +2,8 @@
 
 Concurrent callers needing the same value share one in-flight fetch: N threads (or tasks) at a
 cold start make one discovery request, and N callers at a token's expiry make one mint. A fetch
-that fails is not cached: the next caller tries again.
+that fails is not cached: the next caller tries again. A fetch that returns a lifetime of 0 is shared
+with the callers already waiting and kept for no one after them.
 
 The sync cache uses a ``threading`` lock and futures; the async one runs a task per fetch and
 shields it, so a caller that is cancelled does not cancel the fetch the others wait on. Both reset
@@ -41,6 +42,9 @@ class _Store(Generic[V]):
         return entry[0]
 
     def put(self, key: str, value: V, ttl: float) -> None:
+        if ttl <= 0:  # shared with the callers waiting on this fetch, and kept for nobody after them
+            self.values.pop(key, None)
+            return
         now = self.clock.monotonic()
         self.values[key] = (value, now + ttl, now)
         self.values.move_to_end(key)

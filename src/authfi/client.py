@@ -36,6 +36,7 @@ from authfi.agents.keys import AgentKey, Signer
 from authfi.errors import AuthFIDeprecationWarning, ConfigurationError
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.secret import Secret
+from authfi.signin import AsyncWebApp, WebApp
 from authfi.tokens import AsyncTokenSource, TokenSource
 from authfi.verify import AsyncTokenVerifier, CheckResult, TokenVerifier
 
@@ -406,6 +407,33 @@ class AuthFI(LegacyAuthFIMixin, _Project):
             self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
         )
 
+    def web_app(
+        self,
+        *,
+        client_id: str,
+        client_secret: Secret | None,
+        redirect_uri: str,
+        state_key: Secret,
+        auth_method: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic",
+        step_up_acr: Sequence[str] = (),
+    ) -> WebApp:
+        """A server-rendered web app that signs people in (OpenID Connect code flow with PKCE).
+
+        ``client_secret`` is ``None`` for a public client (PKCE alone). ``state_key`` is 32 random
+        bytes in base64; it encrypts the pending sign-in between the redirect and the callback.
+        ``step_up_acr`` is what a step-up asks for when the token endpoint answers
+        ``insufficient_user_authentication``.
+        """
+        return WebApp(
+            self,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            state_key=state_key,
+            auth_method=auth_method,
+            step_up_acr=step_up_acr,
+        )
+
     def agent(
         self,
         agent_id: str,
@@ -593,6 +621,27 @@ class AsyncAuthFI(_Project):
         """See :meth:`AuthFI.client_credentials`."""
         return AsyncClientCredentials(
             self, client_id, client_secret, resource=resource, send_to=send_to, scope=scope, auth_method=auth_method
+        )
+
+    def web_app(
+        self,
+        *,
+        client_id: str,
+        client_secret: Secret | None,
+        redirect_uri: str,
+        state_key: Secret,
+        auth_method: Literal["client_secret_basic", "client_secret_post"] = "client_secret_basic",
+        step_up_acr: Sequence[str] = (),
+    ) -> AsyncWebApp:
+        """See :meth:`AuthFI.web_app`."""
+        return AsyncWebApp(
+            self,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            state_key=state_key,
+            auth_method=auth_method,
+            step_up_acr=step_up_acr,
         )
 
     def agent(

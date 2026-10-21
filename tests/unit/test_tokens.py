@@ -215,9 +215,10 @@ def test_one_refresh_per_refresh_token_across_threads(clock: FakeClock) -> None:
         t.join()
     assert len(calls) == 1
     assert results == [token_set("new")] * 6
-    # A caller still holding the spent refresh token gets the result, and never spends it again.
+    # Only callers that overlap share a flight: a later caller holding the spent refresh token goes to
+    # the server (which answers invalid_grant), and is never handed the first result from memory.
     assert gate.run(Secret("R1"), refresh) == token_set("new")
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 async def test_one_refresh_per_refresh_token_across_tasks(clock: FakeClock) -> None:
@@ -232,6 +233,15 @@ async def test_one_refresh_per_refresh_token_across_tasks(clock: FakeClock) -> N
     results = await asyncio.gather(*(gate.run(Secret("R1"), refresh) for _ in range(6)))
     assert len(calls) == 1
     assert all(r == token_set("new") for r in results)
+    await gate.run(Secret("R1"), refresh)  # later, the same spent token: not answered from memory
+    assert len(calls) == 2
+
+
+def test_a_finished_refresh_leaves_nothing_in_memory(clock: FakeClock) -> None:
+    """The new token set is handed to the callers waiting and then forgotten, not held for 1024 entries."""
+    gate = RefreshGate(clock)
+    gate.run(Secret("R1"), lambda: token_set("new"))
+    assert gate._cache._store.values == {}  # pyright: ignore[reportPrivateUsage]
 
 
 def test_a_failed_refresh_is_not_remembered(clock: FakeClock) -> None:

@@ -30,6 +30,9 @@ __all__ = [
     "InsufficientPermission",
     "InsufficientScope",
     "IntegrationError",
+    "InvalidCallback",
+    "InvalidIdToken",
+    "InvalidPendingSignIn",
     "InvalidToken",
     "KnownCode",
     "NotSupportedError",
@@ -354,6 +357,37 @@ class GatewayTokenRefused(AuthFIError):
             request_id=request_id,
         )
         self.challenge = challenge
+
+
+class InvalidPendingSignIn(AuthFIError):
+    """A pending sign-in could not be restored: tampered with, made for another client, or expired.
+
+    ``code`` is ``pending_sign_in_tampered``, ``pending_sign_in_expired`` or ``pending_sign_in_malformed``.
+    Start the sign-in again.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(
+            f"The pending sign-in was refused ({code}): {detail}. Start the sign-in again.", 400, code=code
+        )
+
+
+class InvalidCallback(AuthFIError):
+    """A sign-in callback was refused before its code was used.
+
+    ``code`` is ``callback_iss_missing``, ``callback_iss_mismatch`` (RFC 9207, a mix-up),
+    ``callback_state_mismatch`` or ``callback_code_missing``.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"The sign-in callback was refused ({code}): {detail}", 400, code=code)
+
+
+class InvalidIdToken(AuthFIError):
+    """An ID token was refused (``id_token_nonce_mismatch``, ``id_token_audience_mismatch``...)."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"The ID token was refused ({code}): {detail}", 401, code=code)
 
 
 class WebhookVerificationError(AuthFIError):

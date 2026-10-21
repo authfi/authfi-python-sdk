@@ -36,6 +36,27 @@ The issuer is the one required setting. Everything else is read from the project
 document. Create one client per project and share it: it owns the caches. In asyncio code, use
 `AsyncAuthFI`, which has the same methods as coroutines; create one per event loop.
 
+## Sign people in
+
+```python
+web = af.web_app(
+    client_id="app_web",
+    client_secret=Secret(os.environ["AUTHFI_CLIENT_SECRET"]),
+    redirect_uri="https://app.example.com/callback",
+    state_key=Secret(os.environ["AUTHFI_STATE_KEY"]),   # 32 random bytes, base64
+)
+
+pending = web.start_sign_in()                      # /login: redirect to pending.url,
+cookie = pending.dump()                            # and keep this encrypted blob in a cookie
+
+signed_in = web.finish_sign_in(callback_url, web.load_pending(cookie))   # /callback
+signed_in.user.email, signed_in.tokens
+```
+
+The code flow with PKCE, `state`, `nonce` and the callback's `iss` (RFC 9207), with the ID token
+verified. Refresh is one request per refresh token, shared; sign-out revokes the refresh token. See
+[docs/signin.md](docs/signin.md).
+
 ## Protect an API
 
 ```python
@@ -130,12 +151,13 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 ## Documentation
 
 - [The core: the project client, timeouts and retries, errors, secrets, credentials](docs/core.md)
+- [Signing people in to a web app](docs/signin.md)
 - [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
 - [Machine clients](docs/machine.md)
 - [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
 - [The AuthFI gateways: tools, models, cloud credentials](docs/gateway.md)
 - [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK, Claude Agent SDK, Google ADK](docs/frameworks.md)
-- Examples: [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine),
+- Examples: [sign people in](examples/sign-in-web), [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine),
   [agent identity](examples/agent-identity), [a caller with no browser](examples/agent-for-a-person-voice),
   [a person signed in to your app](examples/agent-for-a-signed-in-user), [the action gate](examples/action-gate),
   [models through the AI gateway](examples/agent-model-gateway),
