@@ -67,7 +67,7 @@ def is_legacy_construction(args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> 
     if len(args) >= 2 or (LEGACY_KEYWORDS - {"audience"}).intersection(kwargs):
         return True
     if "audience" in kwargs:
-        raise ConfigurationError("audience= belongs to AuthFI(tenant, ...); use af.verifier(audience=[...])")
+        raise ConfigurationError("AuthFI(issuer) takes no audience=: give it to the verifier, af.verifier(audience=[...])")
     return False
 
 
