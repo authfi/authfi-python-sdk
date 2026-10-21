@@ -175,13 +175,22 @@ def _rid(request_id: str | None) -> str:
     return request_id if request_id and is_valid_request_id(request_id) else "-"
 
 
+_MAX_LOGGED_PATH = 200
+
+
+def _logged(path: str) -> str:
+    """A request path made safe to log: control characters escaped (Flask decodes %0a), length capped."""
+    escaped = path[:_MAX_LOGGED_PATH].encode("unicode_escape").decode("ascii")
+    return escaped + ("..." if len(path) > _MAX_LOGGED_PATH else "")
+
+
 def log_refusal(logger: logging.Logger, error: InvalidToken, method: str, path: str, request_id: str | None) -> None:
     """Log a refusal with its precise code, which the wire answer does not carry.
 
     Info for a request that sent no token, warning for any other refusal (as the platform's kernel does).
     """
     level = logging.INFO if error.code == "token_missing" else logging.WARNING
-    logger.log(level, "refused %s %s: %s (request %s)", method, path, error.code, _rid(request_id))
+    logger.log(level, "refused %s %s: %s (request %s)", _logged(method), _logged(path), error.code, _rid(request_id))
 
 
 def unavailable_refusal(request_id: str | None = None) -> Refusal:
@@ -196,8 +205,8 @@ def log_unavailable(logger: logging.Logger, error: Exception, method: str, path:
     """Log that a request was not checked because the issuer's keys or discovery were unreachable."""
     logger.error(
         "could not check the token of %s %s: %s: %s (request %s)",
-        method,
-        path,
+        _logged(method),
+        _logged(path),
         type(error).__name__,
         getattr(error, "code", "-"),
         _rid(request_id),

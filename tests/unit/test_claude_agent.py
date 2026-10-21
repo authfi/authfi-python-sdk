@@ -305,10 +305,11 @@ def test_tracing_records_the_agent_and_not_content(
 async def test_the_callers_env_cannot_override_what_the_integration_sets(
     claude: ClaudeAgentIntegration, name: str, match: str
 ) -> None:
-    with pytest.raises(ConfigurationError, match=match):
-        await claude.options(model="claude-haiku-5-5", env={name: "https://elsewhere.example"})
-    with pytest.raises(ConfigurationError, match=match):
-        await claude.options(model="claude-haiku-5-5", settings={"env": {name: "x"}})
+    for spelled in (name, name.lower()):  # Windows environment names are case-insensitive
+        with pytest.raises(ConfigurationError, match=match):
+            await claude.options(model="claude-haiku-5-5", env={spelled: "https://elsewhere.example"})
+        with pytest.raises(ConfigurationError, match=match):
+            await claude.options(model="claude-haiku-5-5", settings={"env": {spelled: "x"}})
 
 
 async def test_the_callers_other_env_is_kept_and_the_integrations_wins(

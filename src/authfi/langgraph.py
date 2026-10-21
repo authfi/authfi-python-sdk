@@ -1,6 +1,6 @@
 """LangGraph: the gateway's governed tools, refusals the model reads, and approvals through ``interrupt()``.
 
-``pip install 'authfi[langgraph]'``
+``pip install "authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main"``
 
 ::
 
@@ -55,7 +55,10 @@ try:
     from langgraph.types import Command, interrupt
     from mcp.types import CallToolResult, TextContent
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError("authfi.langgraph needs LangGraph: pip install 'authfi[langgraph]'") from exc
+    raise ImportError(
+        "authfi.langgraph needs LangGraph: "
+        "pip install 'authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+    ) from exc
 
 from authfi._adapters import async_gateway_for
 from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolAllowed, ToolRefused, token_refusal
