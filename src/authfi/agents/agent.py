@@ -21,6 +21,7 @@ end in a decision about one action, and no token.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import warnings
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -216,8 +217,17 @@ def _labels(raw: str, agent_id: str) -> tuple[Principal, Principal, frozenset[st
 
 
 def _check_poll(poll_interval: float) -> None:
-    if not isinstance(cast(object, poll_interval), int | float) or poll_interval <= 0:
-        raise ConfigurationError("poll_interval must be a positive number of seconds")
+    given = cast(object, poll_interval)
+    if not isinstance(given, int | float) or isinstance(given, bool) or not math.isfinite(given) or given <= 0:
+        raise ConfigurationError("poll_interval must be a finite, positive number of seconds")
+
+
+def _ciba_interval(request_interval: float, poll_interval: float | None) -> float:
+    """The wait between CIBA polls: the caller's, raised to the server's interval when it is smaller."""
+    if poll_interval is None:
+        return request_interval
+    _check_poll(poll_interval)
+    return max(float(poll_interval), request_interval)
 
 
 def _approval_wait_timeout(approval_id: str) -> WaitTimeout:
@@ -681,6 +691,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         request: CibaRequest,
         *,
         timeout: float = 300.0,
+        poll_interval: float | None = None,
         resource: str | None = None,
         send_to: Sequence[str] = (),
     ) -> DelegatedToken: ...
@@ -702,12 +713,16 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         audience: str | None = None,
         sleep: object = None,
         *,
+        poll_interval: float | None = None,
         resource: str | None = None,
         send_to: Sequence[str] = (),
     ) -> DelegatedToken:
         """Wait for the person's decision, then return the token that acts for them.
 
-        Polls at the request's interval, waiting it before the first poll. ``timeout`` (seconds) is
+        Polls at the request's interval, waiting it before the first poll. ``poll_interval`` may ask
+        for a longer wait; a value smaller than the server's interval is raised to it, since polling
+        faster than the server asks is refused (``slow_down``). It must be finite and above zero
+        (:class:`ConfigurationError`). ``timeout`` (seconds) is
         how long to wait: when it passes, :class:`WaitTimeout` is raised and the request stays open,
         so waiting on it again continues it. A refusal is :class:`ConsentDenied`; a request that ran
         out is :class:`ConsentExpired`.
@@ -728,7 +743,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             metadata.token_endpoint,
             self._auth,
             auth_req_id=request.auth_req_id,
-            interval=request.interval,
+            interval=_ciba_interval(request.interval, poll_interval),
             wait_deadline=self._clock.monotonic() + timeout,
             request_deadline=request.deadline,
             now=self._clock.monotonic,
@@ -754,6 +769,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         scope: Sequence[str] | None = None,
         expires_in: int | None = None,
         timeout: float = 300.0,
+        poll_interval: float | None = None,
         resource: str | None = None,
         send_to: Sequence[str] = (),
     ) -> DelegatedToken:
@@ -761,7 +777,9 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         request = self.request_user_token(
             login_hint, binding_message=binding_message, scope=scope, expires_in=expires_in
         )
-        return self.await_user_token(request, timeout=timeout, resource=resource, send_to=send_to)
+        return self.await_user_token(
+            request, timeout=timeout, poll_interval=poll_interval, resource=resource, send_to=send_to
+        )
 
     def exchange(
         self,
@@ -1001,6 +1019,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         request: CibaRequest,
         *,
         timeout: float = 300.0,
+        poll_interval: float | None = None,
         resource: str | None = None,
         send_to: Sequence[str] = (),
     ) -> AsyncDelegatedToken:
@@ -1012,7 +1031,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             metadata.token_endpoint,
             self._auth,
             auth_req_id=request.auth_req_id,
-            interval=request.interval,
+            interval=_ciba_interval(request.interval, poll_interval),
             wait_deadline=self._clock.monotonic() + timeout,
             request_deadline=request.deadline,
             now=self._clock.monotonic,
@@ -1038,6 +1057,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         scope: Sequence[str] | None = None,
         expires_in: int | None = None,
         timeout: float = 300.0,
+        poll_interval: float | None = None,
         resource: str | None = None,
         send_to: Sequence[str] = (),
     ) -> AsyncDelegatedToken:
@@ -1045,7 +1065,9 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         request = await self.request_user_token(
             login_hint, binding_message=binding_message, scope=scope, expires_in=expires_in
         )
-        return await self.await_user_token(request, timeout=timeout, resource=resource, send_to=send_to)
+        return await self.await_user_token(
+            request, timeout=timeout, poll_interval=poll_interval, resource=resource, send_to=send_to
+        )
 
     async def exchange(
         self,
