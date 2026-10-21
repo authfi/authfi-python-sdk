@@ -9,8 +9,12 @@ Start from the project::
 Every area is made from it and shares its discovery document, key set and HTTP client.
 """
 
+import warnings
+from typing import TYPE_CHECKING, Final
+
 from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.ids import idempotency_key, request_id
+from authfi._transport import user_agent
 from authfi._version import __version__
 from authfi.client import AsyncAuthFI, AuthFI, AuthFIOptions, Timeout
 from authfi.errors import (
@@ -57,7 +61,29 @@ from authfi.verify import (
     TokenVerifier,
 )
 
+#: The ``User-Agent`` this SDK sends (the AuthFI edge refuses an anonymous client).
+USER_AGENT: Final = user_agent()
+
+if TYPE_CHECKING:
+    #: Deprecated: 0.1's name for :class:`OAuthError`.
+    AgentAuthError = OAuthError
+
+_DEPRECATED_ALIASES: dict[str, tuple[object, str]] = {
+    "AgentAuthError": (OAuthError, "authfi.AgentAuthError is authfi.OAuthError"),
+}
+
+
+def __getattr__(name: str) -> object:
+    """0.1's names that moved, each with a deprecation warning."""
+    if name in _DEPRECATED_ALIASES:
+        value, message = _DEPRECATED_ALIASES[name]
+        warnings.warn(message, AuthFIDeprecationWarning, stacklevel=2)
+        return value
+    raise AttributeError(f"module 'authfi' has no attribute {name!r}")
+
+
 __all__ = [
+    "USER_AGENT",
     "APIError",
     "AccessToken",
     "AsyncAuthFI",

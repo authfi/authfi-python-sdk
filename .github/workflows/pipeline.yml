@@ -1,0 +1,121 @@
+# The checks every pull request runs. Self-contained (no reusable workflow from a private repo), with
+# no secrets, every action pinned by commit. The runner is ubuntu-latest unless the repository
+# variable SDK_RUNNER names another: this public repo should not run outside code on runners inside
+# our network (see the SDK design, section 7).
+name: Pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+# A job fails when uv.lock is out of date with pyproject.toml, instead of installing a stale lock.
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  # The linters and both type checkers run on every supported Python: a typing change between versions
+  # is a real difference in what users see.
+  lint:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check src tests scripts examples
+      - run: uv run mypy
+      - run: uv run pyright
+
+  test:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync
+      - run: uv run coverage run -m pytest -m "not live"
+      - run: uv run coverage json -q
+      - run: uv run coverage report
+      - run: uv run python scripts/coverage_gates.py
+
+  # The code that only runs on Windows (owner-only key files) is skipped everywhere else.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run pytest -p no:cacheprovider tests/unit/test_secret.py
+
+  # Each adapter against the lowest version of its framework its extra allows and the newest within the
+  # range. A locked install tests only one version, so a lower bound is otherwise never installed.
+  adapters:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        resolution: [lowest-direct, highest]
+        adapter:
+          - { extras: "fastapi,flask", tests: "tests/unit/test_api_adapters.py" }
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: uv venv
+      - run: uv pip install --resolution ${{ matrix.resolution }} ".[${{ matrix.adapter.extras }}]" --group test
+      - run: .venv/bin/python -m pytest -p no:cacheprovider ${{ matrix.adapter.tests }}
+
+  build:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - run: uvx twine@7.0.0 check --strict dist/*
+      - run: uvx check-wheel-contents@0.6.3 dist/*.whl
+
+  # The one required check: it passes only when every job above passed.
+  ci:
+    if: always()
+    needs: [lint, test, windows, adapters, build]
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "a required job did not pass"; exit 1
+          fi

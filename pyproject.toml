@@ -15,7 +15,7 @@ dependencies = [
     "httpx>=0.28,<1",
     "PyJWT[crypto]>=2.10,<3",
     "cryptography>=44",
-    "typing_extensions>=4.12; python_version < '3.13'",
+    "typing_extensions>=4.12",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -60,6 +60,8 @@ test = [
     "sentry-sdk>=2.20,<3",
     "rich>=13.9,<15",
 ]
+# The weekly mutation run (Linux only): a surviving mutant is a missing test.
+mutation = ["mutmut==3.8.0"]
 dev = [
     { include-group = "test" },
     "pytest-cov>=6,<8",
@@ -82,6 +84,11 @@ filterwarnings = [
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
 
+[tool.mutmut]
+# Every module is copied so the package imports; the weekly job selects which mutants run.
+source_paths = ["src/authfi/"]
+pytest_add_cli_args_test_selection = ["tests/unit/"]
+
 [tool.coverage.run]
 branch = true
 source = ["authfi"]
@@ -102,6 +109,10 @@ python_version = "3.11"
 files = ["src/authfi", "tests", "scripts", "examples"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["tests.compat.*"]
+warn_unreachable = false
 
 [[tool.mypy.overrides]]
 module = ["opentelemetry", "opentelemetry.*"]
@@ -138,6 +149,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D", "S101", "ANN", "PT011", "PT018"]
+"tests/compat/test_main_*.py" = ["PT009", "PT027"]  # main's unittest style, kept as written
 "scripts/**" = ["S603", "S607"]
 "examples/**" = ["T201", "INP001"]
 

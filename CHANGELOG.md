@@ -43,7 +43,17 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   longer how a project is named.
 - HTTP goes through httpx (was `urllib`, with no timeout).
 
+### Deprecated
+
+- 0.1's `AuthFI(tenant, api_key, ...)`, `verify_token`, `require`, `require_role`,
+  `current_user`, the 0.1 attributes, and `AgentAuthError`: each still works and warns
+  `AuthFIDeprecationWarning`; removed at 1.0. See [docs/migration-0.2.md](docs/migration-0.2.md).
+
 ### Removed
 
-- The single-module `authfi.py` layout. The names it exported are kept, with warnings, as the
-  areas that replace them land in this release.
+- `register_permission`, `sync` and `auto_sync`, and `cloud_credentials` / `cloud_token` on the
+  project: they called routes that do not exist. They raise `NotSupportedError` naming what
+  replaces them.
+- Verifying a token without an audience, or without a `kid`, and accepting a JWT that is not an
+  access token. These are intended breaks; see the migration guide.
+- The single-module `authfi.py` layout. The names it exported are kept at the top level.
