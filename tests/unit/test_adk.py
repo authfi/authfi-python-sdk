@@ -118,6 +118,8 @@ async def test_a_refusal_reaches_the_model_naming_why(fake: FakeGateway, adk: AD
 
     (response,) = _responses(events)
     assert "ETOOL003" in response["error"]
+    assert response["error"].startswith("Refused by AuthFI"), "the model is told in the adapter's words"
+    assert "ToolRefused" not in response["error"], "never the outcome object's own text"
     assert _final(events) == "I cannot."
 
 
@@ -174,6 +176,23 @@ async def test_a_call_confirmed_too_early_asks_again_under_the_same_approval(
     assert again.approval_id == first.approval_id
     assert fake.pending() == [first.approval_id]  # no second approval
     assert fake.tool_calls == []
+
+
+async def test_a_call_that_went_through_does_not_reuse_its_spent_approval(
+    fake: FakeGateway, adk: ADKIntegration
+) -> None:
+    """After a held call ran, the same call a second time is held again under a new approval."""
+    fake.model_script += [_use(STEP_UP), [{"type": "text", "text": "Read it."}], _use(STEP_UP)]
+    run = Run(adk)
+    (first,) = adk.held_approvals(await run.ask("Read the wiki"))
+    fake.decide(first.approval_id, "approved")
+    await run.send(adk.answer(first, confirmed=True))
+    assert fake.tool_calls == [(STEP_UP, ARGS)]
+
+    (second,) = adk.held_approvals(await run.ask("Read it again"))
+
+    assert second.approval_id != first.approval_id
+    assert fake.tool_calls == [(STEP_UP, ARGS)], "the second call waits for its own approval"
 
 
 async def test_a_declined_call_is_not_sent(fake: FakeGateway, adk: ADKIntegration) -> None:
