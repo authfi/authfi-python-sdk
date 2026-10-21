@@ -1,6 +1,6 @@
 """The Claude Agent SDK: approvals through ``can_use_tool``, credentials that renew themselves, content off.
 
-``pip install 'authfi[claude-agent]'``
+``pip install "authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main"``
 
 ::
 
@@ -66,7 +66,10 @@ try:
     from mcp.client.streamable_http import streamable_http_client
     from mcp.types import CallToolResult, Tool
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError("authfi.claude_agent needs the Claude Agent SDK: pip install 'authfi[claude-agent]'") from exc
+    raise ImportError(
+        "authfi.claude_agent needs the Claude Agent SDK: "
+        "pip install 'authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+    ) from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi._protocol.urls import origin_of
@@ -453,19 +456,21 @@ def _refuse_owned(env: object, where: str) -> None:
     """Refuse an environment variable that would turn the agent's token, or the content switches, elsewhere."""
     if not isinstance(env, Mapping):
         return
-    for name in cast(Mapping[str, object], env):
-        if name in _FIXED_CREDENTIALS:
+    for given in cast(Mapping[str, object], env):
+        name = str(given)
+        upper = name.upper()  # Windows environment names are case-insensitive, so a lowercase spelling is the same
+        if upper in _FIXED_CREDENTIALS:
             raise ConfigurationError(
                 f"{name} in {where} is a fixed credential; Claude Code gets the agent's token itself"
             )
-        if name == "ANTHROPIC_BASE_URL":
+        if upper == "ANTHROPIC_BASE_URL":
             raise ConfigurationError(
-                f"ANTHROPIC_BASE_URL in {where} would send the agent's token to another host: Claude Code is "
+                f"{name} in {where} would send the agent's token to another host: Claude Code is "
                 "pointed at the AuthFI gateway by this integration"
             )
-        if name.startswith("OTEL_LOG_"):
+        if upper.startswith("OTEL_LOG_"):
             raise ConfigurationError(f"{name} in {where} is set from capture_content, not by hand")
-        if name in _OWNED or name.startswith(_OWNED_PREFIXES):
+        if upper in _OWNED or upper.startswith(_OWNED_PREFIXES):
             raise ConfigurationError(f"{name} in {where} is set by the integration")
 
 

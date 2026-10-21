@@ -1,6 +1,6 @@
 """LangChain: a Claude model on the AuthFI AI gateway, whose token tracers never see.
 
-``pip install 'authfi[langchain]'``
+``pip install "authfi[langchain] @ git+https://github.com/authfi/authfi-python-sdk@main"``
 
 ::
 
@@ -33,7 +33,10 @@ try:
     from langchain_anthropic import ChatAnthropic
     from pydantic import PrivateAttr, SecretStr
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError("authfi.langchain needs langchain-anthropic: pip install 'authfi[langchain]'") from exc
+    raise ImportError(
+        "authfi.langchain needs langchain-anthropic: "
+        "pip install 'authfi[langchain] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+    ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, configure_langsmith, gateway_for, httpx_of
 from authfi.errors import ConfigurationError, IntegrationError
