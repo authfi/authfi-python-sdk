@@ -85,6 +85,7 @@ the person out. `refresh` makes one request per refresh token across the threads
 kept: a caller that arrives later with the refresh token that was already spent is sent to the
 server, which refuses it (`OAuthError`, `invalid_grant`), and is never handed the earlier answer. Store
 the new tokens that `refresh` returns and refresh those.
+Serialise refreshes per session in your app: a reused refresh token can revoke the whole family.
 
 Across workers, keep the tokens in a shared `TokenStore` (a protocol with `load(key)` and
 `compare_and_set(key, old, new)`, which your database or cache implements) and use the person's
