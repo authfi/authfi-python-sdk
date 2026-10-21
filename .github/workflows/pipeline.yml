@@ -22,14 +22,14 @@ env:
   UV_LOCKED: "1"
 
 jobs:
-  # The type checkers run on the oldest and the newest supported Python: a typing change between them
+  # The linters and both type checkers run on every supported Python: a typing change between versions
   # is a real difference in what users see.
   lint:
     runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
