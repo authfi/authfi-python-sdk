@@ -321,3 +321,37 @@ def test_warnings_are_not_raised_by_the_new_form(af: AuthFI, key: AgentKey) -> N
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         af.agent(AGENT, key)
+
+
+# --- a cold client on a custom domain asks the machine API host, not the issuer's ------------------------
+
+
+def _custom_domain(key: AgentKey) -> AgentPlatform:
+    platform = AgentPlatform(issuer="https://login.acme.com", agent_jwk=key.public_jwk())
+    platform.discovery["backchannel_authentication_endpoint"] = (
+        "https://acme.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize"
+    )
+    return platform
+
+
+TXN = "/apis/regional/v1/ai/auth/transaction-token"
+
+
+def test_a_cold_agent_on_a_custom_domain_sends_the_transaction_token_request_to_the_machine_api_host(
+    key: AgentKey, clock: FakeClock
+) -> None:
+    platform = _custom_domain(key)
+    with AuthFI(platform.issuer, http_client=platform.client(), clock=clock) as project:
+        agent = project.agent(AGENT, key)
+        agent.transaction_token("refund")
+    assert [r.url.host for r in platform.calls("POST", TXN)] == ["acme.authfi.io"]
+
+
+async def test_a_cold_async_agent_on_a_custom_domain_sends_the_transaction_token_request_to_the_machine_api_host(
+    key: AgentKey, clock: FakeClock
+) -> None:
+    platform = _custom_domain(key)
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as project:
+        agent = project.agent(AGENT, key)
+        await agent.transaction_token("refund")
+    assert [r.url.host for r in platform.calls("POST", TXN)] == ["acme.authfi.io"]
