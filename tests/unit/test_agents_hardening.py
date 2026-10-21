@@ -23,7 +23,7 @@ from authfi import (
     TransportError,
 )
 from authfi.agents import AgentAuth, AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
-from tests.agent_platform import AGENT, AgentPlatform
+from tests.agent_platform import AGENT, CIBA, AgentPlatform
 from tests.support import FakeClock, form_of
 
 API = "https://api.example.com"
@@ -292,6 +292,27 @@ async def test_deepcopy_of_the_async_surfaces(aaf: AsyncAuthFI, key: AgentKey, p
     delegated = await agent.exchange(Secret(platform.access_token(sub="usr_7")))
     assert isinstance(delegated, AsyncDelegatedToken)
     assert copy.deepcopy(delegated) is delegated
+
+
+def test_a_reset_after_a_ciba_poll_was_sent_is_never_retried(af: AuthFI, key: AgentKey, platform: AgentPlatform) -> None:
+    """The poll that finds the decision consumes the request: repeating it would answer invalid_grant."""
+    agent = af.agent(AGENT, key)
+    request = agent.request_user_token("priya@acme.com", binding_message="Refund")
+    real = platform.routes[("POST", "/oauth/token")]
+    polls = 0
+
+    def handler(sent: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        if form_of(sent).get("grant_type") == CIBA:
+            polls += 1
+            return _reset(sent)
+        return real(sent)
+
+    platform.route("POST", "/oauth/token", handler)
+    with pytest.raises(TransportError) as caught:
+        agent.await_user_token(request)
+    assert not caught.value.retryable
+    assert polls == 1
 
 
 def test_warnings_are_not_raised_by_the_new_form(af: AuthFI, key: AgentKey) -> None:
