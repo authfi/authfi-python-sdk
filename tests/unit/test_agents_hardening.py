@@ -294,7 +294,9 @@ async def test_deepcopy_of_the_async_surfaces(aaf: AsyncAuthFI, key: AgentKey, p
     assert copy.deepcopy(delegated) is delegated
 
 
-def test_a_reset_after_a_ciba_poll_was_sent_is_never_retried(af: AuthFI, key: AgentKey, platform: AgentPlatform) -> None:
+def test_a_reset_after_a_ciba_poll_was_sent_is_never_retried(
+    af: AuthFI, key: AgentKey, platform: AgentPlatform
+) -> None:
     """The poll that finds the decision consumes the request: repeating it would answer invalid_grant."""
     agent = af.agent(AGENT, key)
     request = agent.request_user_token("priya@acme.com", binding_message="Refund")
