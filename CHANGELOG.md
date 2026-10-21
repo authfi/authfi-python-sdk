@@ -50,6 +50,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   `ToolOutcome` (a union of `ToolAllowed`, `ToolRefused` and `ToolApprovalRequired`, which a `match` narrows), model base URLs, the grant a tool
   needs, and `cloud_credentials()`. A held call's text never reaches a model; a model-written
   approval id is removed.
+- `authfi.langchain.LangChainIntegration` (extra `langchain`): a `ChatAnthropic` on the AI gateway
+  whose token is attached per request, never a model setting LangSmith records; tracing without
+  content by default; `GatewayTokenRefused` when the gateway refuses the token.
 
 ### Changed
 

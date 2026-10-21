@@ -38,6 +38,9 @@ authfi = "authfi.cli:main"
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
+# Each framework extra pins the range its adapter is tested with: an adapter reaches into the
+# framework where it has no public seam, and checks that seam when it is imported.
+langchain = ["langchain-anthropic>=1.7,<1.8", "langsmith>=0.14,<1"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -75,6 +78,8 @@ dev = [
     "flask>=3.0,<4",
     "anthropic>=1.0,<2",
     "openai>=3.0,<4",
+    "langchain-anthropic>=1.7,<1.8",
+    "langsmith>=0.14,<1",
 ]
 
 [tool.pytest.ini_options]
