@@ -134,13 +134,14 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 - [Machine clients](docs/machine.md)
 - [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
 - [The AuthFI gateways: tools, models, cloud credentials](docs/gateway.md)
-- [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK](docs/frameworks.md)
+- [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK, Claude Agent SDK](docs/frameworks.md)
 - Examples: [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine),
   [agent identity](examples/agent-identity), [a caller with no browser](examples/agent-for-a-person-voice),
   [a person signed in to your app](examples/agent-for-a-signed-in-user), [the action gate](examples/action-gate),
   [models through the AI gateway](examples/agent-model-gateway),
   [a LangChain model](examples/langchain-model), [approvals in LangGraph](examples/approvals-langgraph),
-  [approvals in the OpenAI Agents SDK](examples/approvals-openai-agents)
+  [approvals in the OpenAI Agents SDK](examples/approvals-openai-agents),
+  [approvals in the Claude Agent SDK](examples/approvals-claude-agent)
 - [Moving from 0.1](docs/migration-0.2.md)
 - [Changelog](CHANGELOG.md)
 
