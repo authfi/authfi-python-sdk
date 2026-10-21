@@ -230,6 +230,20 @@ def test_the_projects_list_of_things_to_close_drops_what_was_collected(agent: Ag
     assert len(project._closables) < 10  # pyright: ignore[reportPrivateUsage]
 
 
+async def test_the_async_projects_list_of_things_to_close_drops_what_was_collected(
+    key: AgentKey, platform: AgentPlatform, clock: FakeClock
+) -> None:
+    from authfi.gateway import AsyncGateway
+
+    async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
+        agent = aaf.agent(AGENT, key)
+        for _ in range(50):
+            AsyncGateway(aaf, agent)
+        gc.collect()
+        AsyncGateway(aaf, agent)
+        assert len(aaf._closables) < 10  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_an_async_agent_has_one_gateway(key: AgentKey, platform: AgentPlatform, clock: FakeClock) -> None:
     async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
         agent = aaf.agent(AGENT, key)

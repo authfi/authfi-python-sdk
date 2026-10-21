@@ -12,6 +12,9 @@ the graph pauses; once the person has decided in AuthFI, it resumes and the gate
   checkpointer until you resume it.
 - **The approval stays out of the model.** The model reads only that the action waits for a
   person; the approval id travels in the graph's state.
+- **A checkpoint holds the held call's arguments.** The checkpointer stores each held call's
+  `args` until you resume it; they can contain personal data, so protect the checkpoint store as you
+  would that data. It never holds a token or an approval secret.
 
 ## Run it
 
