@@ -11,7 +11,8 @@ Each adapter gives a framework the agent's credential through the AuthFI gateway
 
 Any credential works: the agent itself (`af.agent(...)`), or a token it holds for a person (a
 `DelegatedToken`). A blocking credential gives blocking framework objects, an asyncio one gives
-asyncio objects.
+asyncio objects. Every adapter built on the same agent shares the agent's one gateway
+(`agent.gateway()`) and its HTTP client, so making adapters does not make connections.
 
 Each extra pins the framework versions the adapter is tested with. Where a framework has no public
 setting for its HTTP client, the adapter checks the one it uses when it is imported, and raises
