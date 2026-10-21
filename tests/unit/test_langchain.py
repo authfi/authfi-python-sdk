@@ -15,6 +15,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.load import dumps
 
 from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused, IntegrationError
+from authfi._adapters import async_gateway_for
 from authfi.langchain import AuthFIChatAnthropic, LangChainIntegration, _check_seam
 from tests.fake_gateway import CaptureServer, FakeGateway
 
@@ -37,6 +38,25 @@ def fake() -> Iterator[FakeGateway]:
 def integration(fake: FakeGateway, key: AgentKey) -> Iterator[LangChainIntegration]:
     with AuthFI(fake.issuer) as af:
         yield LangChainIntegration(af.agent(AGENT, key))
+
+
+def test_every_integration_on_an_agent_shares_the_agents_one_gateway(fake: FakeGateway, key: AgentKey) -> None:
+    """A gateway owns an HTTP client: one per agent, not one per adapter built on it."""
+    with AuthFI(fake.issuer) as af:
+        agent = af.agent(AGENT, key)
+        assert LangChainIntegration(agent).gateway is agent.gateway()
+        before = len(af._closables)  # pyright: ignore[reportPrivateUsage]
+        for _ in range(100):
+            assert LangChainIntegration(agent).gateway is agent.gateway()
+        assert len(af._closables) == before  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_the_asyncio_integration_shares_the_agents_one_gateway(fake: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(fake.issuer) as af:
+        agent = af.agent(AGENT, key)
+        assert LangChainIntegration(agent).gateway is agent.gateway()
+        assert LangChainIntegration(agent).gateway is LangChainIntegration(agent).gateway
+        assert async_gateway_for(agent) is agent.gateway()  # what the asyncio-only frameworks build on
 
 
 def test_the_model_calls_the_gateway_with_the_agents_token(

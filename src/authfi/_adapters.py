@@ -6,6 +6,7 @@ import importlib
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
+from authfi.agents import AgentAuth, AsyncAgentAuth
 from authfi.errors import ConfigurationError
 from authfi.gateway import AsyncGateway, Gateway
 from authfi.tokens import AsyncTokenSource, TokenSource
@@ -28,10 +29,23 @@ def _project(source: object, project: object) -> Any:
     return chosen
 
 
+def _agents_own(source: object, project: object) -> Gateway | AsyncGateway | None:
+    if isinstance(source, AgentAuth | AsyncAgentAuth) and (project is None or project is source.project):
+        return source.gateway()
+    return None
+
+
 def gateway_for(
     source: TokenSource | AsyncTokenSource, project: AuthFI | AsyncAuthFI | None = None
 ) -> Gateway | AsyncGateway:
-    """The gateway for a credential: a :class:`Gateway` for a blocking one, an :class:`AsyncGateway` for asyncio."""
+    """The gateway for a credential: a :class:`Gateway` for a blocking one, an :class:`AsyncGateway` for asyncio.
+
+    An agent has one gateway for its life, so every adapter built on the same agent shares it (and its
+    HTTP clients); a token the agent holds for a person gets a gateway of its own.
+    """
+    shared = _agents_own(source, project)
+    if shared is not None:
+        return shared
     if isinstance(source, TokenSource):
         return Gateway(_project(source, project), source)
     if isinstance(source, AsyncTokenSource):  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -48,6 +62,9 @@ def async_gateway_for(source: AsyncTokenSource, project: AsyncAuthFI | None = No
             "this framework runs on asyncio: build the credential from AsyncAuthFI (an AsyncAgentAuth, or the "
             "AsyncDelegatedToken it returns)"
         )
+    shared = _agents_own(source, project)
+    if isinstance(shared, AsyncGateway):
+        return shared
     return AsyncGateway(_project(source, project), source)
 
 
