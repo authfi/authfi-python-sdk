@@ -31,6 +31,9 @@ jobs:
       matrix:
         adapter:
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_api_adapters.py" }
+          - { extras: "langchain", overrides: "langchain-anthropic langsmith", tests: "tests/unit/test_langchain.py" }
+          - { extras: "langgraph", overrides: "langgraph langchain-mcp-adapters mcp", tests: "tests/unit/test_langgraph.py" }
+          - { extras: "openai-agents", overrides: "openai-agents[litellm] mcp", tests: "tests/unit/test_openai_agents.py" }
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
