@@ -4,8 +4,8 @@ The verifier's codes are the kernel's (``constants/http.go`` and package ``dpop`
 platform log, an audit record and this SDK's ``InvalidToken.code`` is one spelling. The kernel is
 read from a local checkout at a pinned tag::
 
-    python scripts/gen_codes.py --kernel ../authfi-regional-kernel            # write the file
-    python scripts/gen_codes.py --kernel ../authfi-regional-kernel --check    # fail if it differs
+    python scripts/gen_codes.py --kernel ../platform-kernel            # write the file
+    python scripts/gen_codes.py --kernel ../platform-kernel --check    # fail if it differs
 
 ``--tag`` overrides the pinned tag. The drift job runs ``--check`` against the newest tag, so a
 kernel release that changes the list is seen before the SDK speaks a stale vocabulary.
@@ -123,7 +123,7 @@ SDK_TOKEN_CODES: Final[tuple[str, ...]] = (
 def main(argv: list[str] | None = None) -> int:
     """Write or check the generated module."""
     parser = argparse.ArgumentParser(description="Generate src/authfi/_codes.py from the kernel.")
-    parser.add_argument("--kernel", type=Path, required=True, help="a checkout of authfi-regional-kernel")
+    parser.add_argument("--kernel", type=Path, required=True, help="a checkout of the platform kernel library")
     parser.add_argument("--tag", default=PINNED_TAG)
     parser.add_argument("--check", action="store_true", help="fail when the committed file differs")
     args = parser.parse_args(argv)
