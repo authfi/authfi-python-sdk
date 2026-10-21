@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -507,6 +508,44 @@ def test_multi_issuer_construction_is_checked(af: AuthFI, platform: Platform) ->
         MultiIssuerVerifier({})
     with pytest.raises(ConfigurationError):
         MultiIssuerVerifier({platform.issuer: v})  # type: ignore[dict-item]
+
+
+# --- refusals are logged with their precise code --------------------------------------------
+
+
+def _refusals(caplog: pytest.LogCaptureFixture) -> list[tuple[int, str]]:
+    return [(r.levelno, r.getMessage()) for r in caplog.records if r.getMessage().startswith("refused")]
+
+
+def test_a_refused_token_is_logged_at_warning_with_its_code(
+    af: AuthFI, platform: Platform, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="authfi")
+    verifier = af.verifier(audience=AUD)
+    assert code_of(verifier.verify, platform.access_token(aud="someone_else")) == "token_audience_mismatch"
+    assert _refusals(caplog) == [(logging.WARNING, "refused a token: token_audience_mismatch")]
+
+
+def test_a_request_with_no_token_is_logged_at_info(
+    af: AuthFI, platform: Platform, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="authfi")
+    assert code_of(af.verifier(audience=AUD).verify_request, None) == "token_missing"
+    assert _refusals(caplog) == [(logging.INFO, "refused a token: token_missing")]
+
+
+def test_the_multi_issuer_pick_logs_an_issuer_it_does_not_accept(
+    af: AuthFI, platform: Platform, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="authfi")
+    verifier = MultiIssuerVerifier({platform.issuer: (af.verifier(audience=AUD), TENANT)})
+    stranger = Platform("https://stranger.authfi.io")
+    assert code_of(verifier.verify, stranger.access_token()) == "token_issuer_not_accepted"
+    assert code_of(verifier.verify_request, "Bearer " + stranger.access_token()) == "token_issuer_not_accepted"
+    assert _refusals(caplog) == [(logging.WARNING, "refused a token: token_issuer_not_accepted")] * 2
+    caplog.clear()
+    assert code_of(verifier.verify_request, None) == "token_missing"
+    assert _refusals(caplog) == [(logging.INFO, "refused a token: token_missing")]
 
 
 # --- async parity ----------------------------------------------------------------------------

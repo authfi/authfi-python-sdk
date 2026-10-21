@@ -4,35 +4,35 @@
 
 ["platform-beta/openid-configuration.json"]
 observed = "GET https://platform-beta.authfi.io/.well-known/openid-configuration, 2026-10-20 (byte-identical to oauth-authorization-server)"
-file = "authfi-regional-kernel oauthmeta.AuthorizationServer, served by authfi-regional-identity"
-commit = "identity aa4db97; kernel v0.58.0"
+file = "the authorization-server metadata the identity service serves"
+commit = "identity service 2026-10-20; kernel library v0.58.0"
 
 ["platform-beta/jwks.json"]
 observed = "GET https://platform-beta.authfi.io/.well-known/jwks.json, 2026-10-20"
-file = "authfi-regional-kms internal/service/kms/service.go PublicKeys"
-commit = "kms edd16b6"
+file = "the key service, its public key set"
+commit = "key service 2026-10-20"
 
 ["platform-beta/agent-configuration.json"]
 observed = "GET https://platform-beta.authfi.io/.well-known/agent-configuration, 2026-10-20"
-file = "authfi-regional-agent-identity internal/http/discovery/controller.go"
-commit = "agent-identity 33a69ec"
+file = "the agent-identity service, its discovery document"
+commit = "agent-identity service 2026-10-20"
 
 ["platform-beta/oauth-protected-resource.json"]
 observed = "GET https://platform-beta.authfi.io/.well-known/oauth-protected-resource, 2026-10-20"
-file = "authfi-regional-mcp resource metadata (RFC 9728)"
-commit = "mcp 3617565"
+file = "the MCP gateway service, its protected-resource metadata (RFC 9728)"
+commit = "MCP gateway service 2026-10-20"
 
 ["mcp/refusal-result.json"]
 observed = "the shape refusal() builds for a refused tools/call (code, error, reason, required_scope in _meta)"
-file = "authfi-regional-mcp internal/http/mcp/dispatch.go refusal()"
-commit = "mcp 3617565"
+file = "the MCP gateway service, the refusal it builds for a refused tools/call"
+commit = "MCP gateway service 2026-10-20"
 
 ["mcp/hold-result.json"]
 observed = "the text the gateway answers for a held tools/call (DecisionApprovalRequired)"
-file = "authfi-regional-mcp internal/http/mcp/dispatch.go, the approval_required case (lines 108-121)"
-commit = "mcp 3617565"
+file = "the MCP gateway service, the answer for a call that needs approval"
+commit = "MCP gateway service 2026-10-20"
 
 ["mcp/tools-list.json"]
 observed = "a tools/list entry with the governance annotation and the scope _meta"
-file = "authfi-regional-mcp internal/http/mcp/controller.go mcpTool, metaScopeKey"
-commit = "mcp 3617565"
+file = "the MCP gateway service, the tool entry it lists"
+commit = "MCP gateway service 2026-10-20"

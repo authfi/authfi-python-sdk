@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 import typing
 
@@ -58,3 +59,19 @@ def test_every_fixture_names_its_source() -> None:
         entry = sources[name]
         for key in ("observed", "file", "commit"):
             assert entry.get(key), f"{name} has no {key} in fixtures/SOURCES.toml"
+
+
+def test_public_files_name_no_private_repository() -> None:
+    """The SDK is public: source, docs and fixtures sources say 'the platform', never a private repo."""
+    root = FIXTURES.parents[1]
+    private = re.compile("authfi-" + "regional|authfi-" + "global|mcp" + r"#\d|authfi-" + "team-skills")
+    names = [*(root / "src").rglob("*.py"), *(root / "scripts").rglob("*.py"), *(root / "docs").rglob("*.md")]
+    names += [root / "README.md", root / "CHANGELOG.md", FIXTURES / "SOURCES.toml"]
+    names += list((root / "examples").rglob("*")) if (root / "examples").is_dir() else []
+    found = [
+        f"{path.relative_to(root)}: {match.group(0)}"
+        for path in names
+        if path.is_file()
+        for match in private.finditer(path.read_text(encoding="utf-8", errors="replace"))
+    ]
+    assert not found, found
