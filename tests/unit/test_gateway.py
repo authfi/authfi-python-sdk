@@ -439,6 +439,19 @@ async def test_the_async_gateway(platform: AgentPlatform, key: AgentKey, clock: 
     assert client.is_closed
 
 
+def test_the_outlook_is_read_from_meta_first_and_survives_mcp_2(agent: AgentAuth) -> None:
+    gateway = agent.gateway()
+    # mcp 2.x drops the annotation key from tools/list; _meta still carries the outlook
+    as_mcp_2 = SimpleNamespace(annotations=None, meta={"io.authfi/governance": "never_allowed"})
+    assert gateway.governance_of(as_mcp_2) == "never_allowed"
+    # _meta wins over a stale annotation, and an old gateway's annotation still counts
+    both = SimpleNamespace(
+        annotations={"io.authfi/governance": "no_policy_restriction"}, meta={"io.authfi/governance": "never_allowed"}
+    )
+    assert gateway.governance_of(both) == "never_allowed"
+    assert gateway.governance_of({"annotations": {"io.authfi/governance": "never_allowed"}}) == "never_allowed"
+
+
 # --- the refusal, whichever MCP SDK raised it ----------------------------------------------------------
 
 
