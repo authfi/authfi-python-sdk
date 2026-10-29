@@ -11,7 +11,7 @@ with ``audience`` = the project's origin and ``expirationSeconds: 600``), or the
 ``AUTHFI_DEVICE_KEY_FILE``. ``AUTHFI_CONFIG_VERSION`` and ``AUTHFI_CONFIG_DIGEST`` name the signed
 configuration the instance runs, and ``AUTHFI_IMAGE_DIGEST`` its image.
 
-Sign-in is challenge, attest, token (``OAuth-Client-Attestation``, ``-PoP`` and ``DPoP`` headers). The token is bound
+Sign-in is challenge and attest, then the token request (``OAuth-Client-Attestation``, ``-PoP`` and ``DPoP`` headers). The token is bound
 to the instance key, so every call carries ``Authorization: DPoP`` and a fresh proof; ``headers()`` does that, and
 the gateway and the exporters call it. The attestation is renewed before it expires.
 
@@ -22,6 +22,7 @@ with the fix; token exchange works.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ from authfi._protocol.instance import (
     parse_challenge,
     pop_claims,
 )
-from authfi._protocol.oauth import parse_token_response
+from authfi._protocol.oauth import b64url, parse_token_response
 from authfi._protocol.urls import origin_of
 from authfi._protocol.verify import unverified_claims
 from authfi.agents.agent import (
@@ -61,7 +62,9 @@ from authfi.tokens import AsyncTokenSource, TokenSource, check_destination
 __all__ = ["AsyncInstanceAuth", "Configuration", "Evidence", "InstanceAuth", "find_evidence"]
 
 K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-_DEVICE_TYP = "authfi-device-evidence+jwt"
+#: What a device key signs, ahead of the nonce, the agent and the instance key (the platform checks these exact bytes).
+_DEVICE_PREFIX = "authfi-agent-attest\n"
+_IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _NONCE_ERROR = "use_dpop_nonce"
 
 
@@ -102,7 +105,9 @@ def _config_from(env: Mapping[str, str]) -> Configuration | None:
 class _InstanceSigner:
     """The instance key as an agent signer: it names the key, and signs nothing an agent key would."""
 
-    alg = "ES256"
+    @property
+    def alg(self) -> str:
+        return _dpop.run_key().alg
 
     @property
     def kid(self) -> str:
@@ -133,6 +138,14 @@ class _Core:
         config: Configuration | None,
         image_digest: str | None,
     ) -> None:
+        if config is None:
+            raise ConfigurationError(
+                "an instance runs one approved configuration: set AUTHFI_CONFIG_VERSION and AUTHFI_CONFIG_DIGEST "
+                "(sha256:<hex>), or pass config=Configuration(version, digest). The platform attests no instance "
+                "without one."
+            )
+        if image_digest is not None and not _IMAGE_DIGEST.fullmatch(image_digest):
+            raise ConfigurationError(f"AUTHFI_IMAGE_DIGEST is sha256: and 64 lowercase hex digits; got {image_digest!r}")
         self.evidence = evidence
         self.agent_id = agent_id
         self.issuer = issuer
@@ -160,7 +173,7 @@ class _Core:
                 "AUTHFI_SERVICE_ACCOUNT_TOKEN_FILE to where it is."
             ) from error
 
-    def evidence_token(self, nonce: str, now: float) -> str:
+    def evidence_token(self, nonce: str) -> str:
         if self.evidence.kind == "device":
             try:
                 device = AgentKey.from_file(self.evidence.path, kid=self.evidence.kid)
@@ -169,7 +182,7 @@ class _Core:
                     f"cannot use the device key {self.evidence.path}: {error}. Set AUTHFI_DEVICE_KEY_FILE to the "
                     "key file the device was bound with and AUTHFI_DEVICE_KEY_KID to its key id."
                 ) from error
-            return _device_proof(device, self.agent_id, self.issuer, nonce, now)
+            return _device_signature(device, self.agent_id, nonce, self.key().thumbprint)
         token = self._read()
         if not token:
             raise ConfigurationError(f"the evidence file {self.evidence.path} is empty")
@@ -207,27 +220,26 @@ class _Core:
         )
         body: dict[str, Any] = {
             "agent_id": self.agent_id,
-            "evidence": {"kind": self.evidence.kind, "token": self.evidence_token(nonce, now)},
-            "run_key": key.public_jwk(),
+            "evidence": {"kind": self.evidence.kind, "token": self.evidence_token(nonce)},
+            "instance_key": key.public_jwk(),
+            "config": {"version": self.config.version, "digest": self.config.digest},
             "proof": proof,
         }
-        if self.config is not None:
-            body["config"] = {"version": self.config.version, "digest": self.config.digest}
         if self.image_digest:
             body["image_digest"] = self.image_digest
         return body
 
-    def pop(self, challenge: str, now: float) -> str:
-        return self.key().sign_jwt(pop_claims(self.agent_id, self.issuer, challenge, now), typ=_POP_TYP)
+    def pop(self, now: float) -> str:
+        return self.key().sign_jwt(pop_claims(self.agent_id, self.issuer, now), typ=_POP_TYP)
 
     def token_request(
-        self, endpoint: str, attestation: Attestation, challenge: str, resource: str | None, clock: Clock
+        self, endpoint: str, attestation: Attestation, resource: str | None, clock: Clock
     ) -> HttpRequest:
-        """The token request: attestation, proof of the key over ``challenge``, and a DPoP proof, fresh per attempt."""
+        """The token request: attestation, proof of the key, and a DPoP proof, fresh per attempt."""
         key = self.key()
 
         def pop() -> str:
-            return self.pop(challenge, clock.time())
+            return self.pop(clock.time())
 
         def dpop() -> str:
             return key.proof("POST", endpoint, now=clock.time(), nonce=_dpop.nonces.get(endpoint))
@@ -235,19 +247,13 @@ class _Core:
         return attested_token_request(endpoint, self.agent_id, attestation, pop=pop, dpop=dpop, resource=resource)
 
 
-def _device_proof(device: Signer, agent_id: str, issuer: str, nonce: str, now: float) -> str:
-    import json
+def _device_signature(device: Signer, agent_id: str, nonce: str, instance_key_thumbprint: str) -> str:
+    """The device key's evidence: its signature over the nonce, the agent and the instance key, base64url.
 
-    from authfi._protocol.oauth import b64url
-
-    header = {"alg": device.alg, "typ": _DEVICE_TYP, "kid": device.kid}
-    claims = {"nonce": nonce, "agent_id": agent_id, "aud": issuer, "iat": int(now), "jti": str(uuid.uuid4())}
-
-    def segment(value: Mapping[str, Any]) -> str:
-        return b64url(json.dumps(value, separators=(",", ":")).encode("utf-8"))
-
-    signing_input = f"{segment(header)}.{segment(claims)}"
-    return f"{signing_input}.{b64url(device.sign(signing_input.encode('ascii')))}"
+    Binding the instance key means a captured signature cannot be spent for an attestation naming another key.
+    """
+    message = f"{_DEVICE_PREFIX}{nonce}\n{agent_id}\n{instance_key_thumbprint}".encode()
+    return b64url(device.sign(message))
 
 
 def _dpop_headers(core: _Core, clock_time: float, method: str, url: str, token: str) -> dict[str, str]:
@@ -359,12 +365,10 @@ class InstanceAuth(AgentAuth):
                 "client_credentials", "This AuthFI project does not offer the client credentials grant."
             )
         attestation = self._attest()
-        origin = self.project.resolve_api_origin()
         endpoint = metadata.token_endpoint
 
         def attested() -> HttpRequest:
-            challenge = parse_challenge(self._send(challenge_request(origin)))
-            return self._core.token_request(endpoint, attestation, challenge, resource, self._clock)
+            return self._core.token_request(endpoint, attestation, resource, self._clock)
 
         response = self._send(attested())
         _dpop.nonces.remember(endpoint, response.header("DPoP-Nonce"))
@@ -373,7 +377,7 @@ class InstanceAuth(AgentAuth):
             _dpop.nonces.remember(endpoint, response.header("DPoP-Nonce"))
         parsed = parse_token_response(response, "the token endpoint")
         self._log.debug("minted an instance token for agent %s", self.agent_id)
-        return self._minted(parsed)
+        return self._minted(parsed, self._core.key())
 
     def headers(self, method: str, url: str) -> dict[str, str]:
         """``Authorization: DPoP <token>`` and a fresh proof of the instance key for ``method url``."""
@@ -465,8 +469,7 @@ class AsyncInstanceAuth(AsyncAgentAuth):
         endpoint = metadata.token_endpoint
 
         async def attested() -> HttpRequest:
-            challenge = parse_challenge(await self._send(challenge_request(origin)))
-            return self._core.token_request(endpoint, attestation, challenge, resource, self._clock)
+            return self._core.token_request(endpoint, attestation, resource, self._clock)
 
         response = await self._send(await attested())
         _dpop.nonces.remember(endpoint, response.header("DPoP-Nonce"))
@@ -475,7 +478,7 @@ class AsyncInstanceAuth(AsyncAgentAuth):
             _dpop.nonces.remember(endpoint, response.header("DPoP-Nonce"))
         parsed = parse_token_response(response, "the token endpoint")
         self._log.debug("minted an instance token for agent %s", self.agent_id)
-        return self._minted(parsed)
+        return self._minted(parsed, self._core.key())
 
     async def headers(self, method: str, url: str) -> dict[str, str]:
         """See :meth:`InstanceAuth.headers`."""

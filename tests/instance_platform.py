@@ -1,6 +1,8 @@
-"""A faithful fake of contract C3: instance sign-in on the agent surface.
+"""A faithful fake of contract C3: instance sign-in on the agent surface (agent-identity #159).
 
-It checks what the platform checks: a challenge that works once, evidence the binding row allows (a
+The attest route reads its body strictly (a field it does not know is a 400), answers a refusal of any kind
+with the same 401 (the reason is kept in ``refused`` for the test, never sent), and replies without a ``data``
+wrapper. It checks what the platform checks: a challenge that works once, evidence the binding row allows (a
 service-account token for the project's origin, ten minutes at most, single use by ``jti``, carrying the
 ``kubernetes.io`` pod claims, from a pod that is live; or the bound device key), the approved configuration, a
 proof signed by the instance key, and then at the token endpoint the attestation chain's signature, the proof of
@@ -12,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,7 +22,9 @@ from typing import Any
 
 import httpx
 import jwt
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils
 
 from tests.agent_platform import AgentPlatform
 from tests.support import json_response
@@ -27,6 +32,9 @@ from tests.support import json_response
 ATTEST = "/apis/regional/v1/ai/agents/attest"
 CHALLENGE = ATTEST + "/challenge"
 CONFIG = {"version": 7, "digest": "sha256:" + "ab" * 32}
+#: The members the attest route reads; any other is a 400.
+ATTEST_FIELDS = {"agent_id", "evidence", "instance_key", "config", "image_digest", "proof"}
+IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def thumbprint(jwk: dict[str, Any]) -> str:
@@ -40,7 +48,6 @@ class InstancePlatform(AgentPlatform):
     """A project whose agent is bound to a workload."""
 
     binding_kind: str = "k8s"
-    envelope: bool = False  # answer {"data": {...}} instead of the bare contract shape
     approved_config: dict[str, Any] = field(default_factory=lambda: dict(CONFIG))
     pod_live: bool = True
     device_jwk: dict[str, Any] | None = None
@@ -54,6 +61,8 @@ class InstancePlatform(AgentPlatform):
     attestation_lifetime: int = 900
     require_dpop_nonce: str | None = None
     token_lifetime: int = 900
+    refused: list[str] = field(default_factory=list[str])  # the reasons, as the platform's tape would hold them
+    unavailable: bool = False  # answer 503 temporarily_unavailable
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -64,7 +73,7 @@ class InstancePlatform(AgentPlatform):
     # --- helpers ---------------------------------------------------------------------------------
 
     def _ok(self, body: dict[str, Any]) -> httpx.Response:
-        return json_response({"data": body} if self.envelope else body)
+        return json_response(body)
 
     def k8s_token(self, *, aud: str | None = None, ttl: int = 600, jti: str | None = None, pod: bool = True) -> str:
         now = int(time.time())
@@ -85,8 +94,12 @@ class InstancePlatform(AgentPlatform):
             }
         return jwt.encode(claims, self.cluster_key, algorithm="EdDSA", headers={"kid": "cluster-1"})
 
-    def refuse_with(self, code: str, status: int = 403) -> httpx.Response:
-        return json_response({"error": code, "error_description": f"refused: {code}"}, status=status)
+    def refuse_with(self, reason: str, status: int = 401) -> httpx.Response:
+        """Every refusal is the same answer: the route is no oracle. The reason goes on the tape."""
+        self.refused.append(reason)
+        if status == 400:
+            return json_response({"error": "invalid_request", "error_description": "malformed JSON body"}, status=400)
+        return json_response({"error": "unauthorized", "error_description": "unauthorized"}, status=401)
 
     # --- challenge and attest ---------------------------------------------------------------------
 
@@ -100,38 +113,57 @@ class InstancePlatform(AgentPlatform):
         return issued is not None and time.time() - issued <= 60
 
     def _attest(self, request: httpx.Request) -> httpx.Response:
-        body: dict[str, Any] = json.loads(request.content)
+        try:
+            body: dict[str, Any] = json.loads(request.content)
+        except ValueError:
+            return self.refuse_with("request_invalid", 400)
+        if not isinstance(body, dict):
+            return self.refuse_with("request_invalid", 400)
         self.attests.append(body)
+        if set(body) - ATTEST_FIELDS:
+            return self.refuse_with("request_invalid", 400)
         if body.get("agent_id") != self.agent_id:
-            return self.refuse_with("binding_not_found", 404)
-        run_jwk: dict[str, Any] = body.get("run_key") or {}
+            return self.refuse_with("agent_unknown")
+        key_jwk: dict[str, Any] = body.get("instance_key") or {}
+        if "d" in key_jwk:
+            return self.refuse_with("instance_key_invalid")
         try:
             proof = jwt.decode(
                 body["proof"],
-                jwt.PyJWK(run_jwk).key,
-                algorithms=["ES256"],
+                jwt.PyJWK(key_jwk).key,
+                algorithms=["EdDSA", "ES256"],
                 audience=self.issuer,
                 options={"verify_exp": False, "verify_iat": False},
             )
-            proof_header = jwt.get_unverified_header(body["proof"])
         except (jwt.PyJWTError, KeyError, ValueError):
-            return self.refuse_with("proof_invalid", 401)
-        if proof_header.get("typ") != "authfi-instance-proof+jwt" or proof.get("agent_id") != self.agent_id:
-            return self.refuse_with("proof_invalid", 401)
+            return self.refuse_with("proof_invalid")
+        if proof.get("agent_id") != self.agent_id or not proof.get("nonce"):
+            return self.refuse_with("proof_invalid")
         if not self._take_nonce(proof.get("nonce")):
-            return self.refuse_with("challenge_invalid", 400)
+            return self.refuse_with("nonce_invalid")
         evidence: dict[str, Any] = body.get("evidence") or {}
         kind: str | None = evidence.get("kind")
-        if kind in ("gcp", "aws"):
-            return self.refuse_with("proof_kind_not_built", 501)
         if kind != self.binding_kind:
             return self.refuse_with("evidence_kind_mismatch")
-        problem = self._k8s(evidence) if kind == "k8s" else self._device(evidence, proof)
+        problem = (
+            self._k8s(evidence) if kind == "k8s" else self._device(evidence, proof["nonce"], thumbprint(key_jwk))
+        )
         if problem is not None:
             return problem
-        if (body.get("config") or {}) != self.approved_config:
-            return self.refuse_with("config_not_approved", 409)
-        return self._ok({"attestation": self._attestation(body, run_jwk)})
+        want = body.get("config") or {}
+        approved = self.approved_config
+        if want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix("sha256:") != str(
+            approved["digest"]
+        ).removeprefix("sha256:"):
+            return self.refuse_with("config_not_approved")
+        image = body.get("image_digest")
+        if image and not IMAGE_DIGEST.fullmatch(image):
+            return self.refuse_with("request_invalid", 400)
+        if self.unavailable:
+            self.refused.append("identity_key_unavailable")
+            return json_response({"error": "temporarily_unavailable"}, status=503)
+        public = {m: key_jwk[m] for m in ("kty", "crv", "x", "y", "n", "e") if m in key_jwk}
+        return self._ok({"attestation": self._attestation(body, public), "expires_in": self.attestation_lifetime})
 
     def _k8s(self, evidence: dict[str, Any]) -> httpx.Response | None:
         try:
@@ -143,34 +175,38 @@ class InstancePlatform(AgentPlatform):
                 options={"verify_iat": False},
             )
         except (jwt.PyJWTError, KeyError):
-            return self.refuse_with("evidence_invalid", 401)
+            return self.refuse_with("token_invalid")
         if claims["exp"] - claims["iat"] > 600:
-            return self.refuse_with("evidence_invalid", 401)
+            return self.refuse_with("token_lifetime_too_long")
         pod = claims.get("kubernetes.io", {})
         if not (pod.get("pod", {}).get("name") and pod.get("pod", {}).get("uid") and pod.get("node")):
-            return self.refuse_with("evidence_invalid", 401)
+            return self.refuse_with("token_not_pod_bound")
         if claims["jti"] in self.evidence_jtis:
-            return self.refuse_with("evidence_replayed", 409)
+            return self.refuse_with("token_reused")
         self.evidence_jtis.add(claims["jti"])
         if not self.pod_live:
             return self.refuse_with("pod_not_live")
         return None
 
-    def _device(self, evidence: dict[str, Any], proof: dict[str, Any]) -> httpx.Response | None:
+    def _device(self, evidence: dict[str, Any], nonce: str, instance_jkt: str) -> httpx.Response | None:
+        """The token is the bound device key's raw signature over the platform's message, base64url."""
         if self.device_jwk is None:
-            return self.refuse_with("binding_not_found", 404)
+            return self.refuse_with("agent_not_bound")
         try:
-            claims = jwt.decode(
-                evidence["token"],
-                jwt.PyJWK(self.device_jwk).key,
-                algorithms=[self.device_jwk["alg"]],
-                audience=self.issuer,
-                options={"verify_exp": False, "verify_iat": False},
-            )
-        except (jwt.PyJWTError, KeyError):
-            return self.refuse_with("evidence_invalid", 401)
-        if claims.get("nonce") != proof.get("nonce"):
-            return self.refuse_with("evidence_invalid", 401)
+            token = evidence["token"]
+            signature = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        except (KeyError, ValueError, TypeError):
+            return self.refuse_with("device_signature_invalid")
+        message = f"authfi-agent-attest\n{nonce}\n{self.agent_id}\n{instance_jkt}".encode()
+        public = jwt.PyJWK(self.device_jwk).key
+        try:
+            if isinstance(public, ed25519.Ed25519PublicKey):
+                public.verify(signature, message)
+            else:  # ES256 signs r and s as two 32-byte integers
+                r_int, s_int = int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")
+                public.verify(utils.encode_dss_signature(r_int, s_int), message, ec.ECDSA(hashes.SHA256()))
+        except (InvalidSignature, ValueError, TypeError):
+            return self.refuse_with("device_signature_invalid")
         return None
 
     def _attestation(self, body: dict[str, Any], run_jwk: dict[str, Any]) -> str:
@@ -228,7 +264,7 @@ class InstancePlatform(AgentPlatform):
             pop = jwt.decode(
                 request.headers["oauth-client-attestation-pop"],
                 jwt.PyJWK(cnf_jwk).key,
-                algorithms=["ES256"],
+                algorithms=["EdDSA", "ES256"],
                 audience=self.issuer,
                 options={"verify_exp": False, "verify_iat": False},
             )
@@ -237,7 +273,7 @@ class InstancePlatform(AgentPlatform):
             return self.refuse("invalid_client", 401)
         if pop_header.get("typ") != "oauth-client-attestation-pop+jwt" or pop["iss"] != self.agent_id:
             return self.refuse("invalid_client", 401)
-        if pop["jti"] in self.pop_jtis or not self._take_nonce(pop.get("challenge")):
+        if pop["jti"] in self.pop_jtis:
             return self.refuse("invalid_client", 401)
         self.pop_jtis.add(pop["jti"])
         refusal = self.check_dpop(request, thumbprint(cnf_jwk), access_token=None)
@@ -270,7 +306,7 @@ class InstancePlatform(AgentPlatform):
             proof = jwt.decode(
                 raw,
                 jwt.PyJWK(header["jwk"]).key,
-                algorithms=["ES256"],
+                algorithms=["EdDSA", "ES256"],
                 options={"verify_exp": False, "verify_iat": False, "verify_aud": False},
             )
         except (jwt.PyJWTError, KeyError):

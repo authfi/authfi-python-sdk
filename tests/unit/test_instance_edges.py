@@ -19,7 +19,7 @@ from authfi._protocol.instance import (
     refusal_with_fix,
 )
 from authfi.errors import APIError, OAuthError
-from authfi.instance import AsyncInstanceAuth, Evidence, InstanceAuth
+from authfi.instance import AsyncInstanceAuth, Configuration, Evidence, InstanceAuth
 from tests.agent_platform import AGENT
 from tests.instance_platform import CONFIG, InstancePlatform
 
@@ -39,7 +39,7 @@ def test_jwk_thumbprint_knows_only_the_keys_this_sdk_makes() -> None:
     assert jwk_thumbprint({"kty": "OKP", "crv": "Ed25519", "x": "a"})
 
 
-def test_a_refusal_without_a_known_fix_is_passed_through() -> None:
+def test_a_refusal_other_than_the_two_the_route_gives_is_passed_through() -> None:
     plain = refusal_with_fix(reply(403, {"error": "something_new", "error_description": "no"}), "the route")
     assert isinstance(plain, APIError) and plain.code == "something_new" and plain.description == "no"
     html = refusal_with_fix(reply(502, None, raw=b"<html>bad gateway</html>"), "the route")
@@ -49,8 +49,8 @@ def test_a_refusal_without_a_known_fix_is_passed_through() -> None:
 def test_the_challenge_and_the_attestation_answers_are_checked() -> None:
     with pytest.raises(OAuthError, match="JSON object"):
         parse_challenge(reply(200, None, raw=b"nope"))
-    with pytest.raises(APIError, match="challenge_invalid"):
-        parse_challenge(reply(400, {"error": "challenge_invalid"}))
+    with pytest.raises(APIError, match="invalid_request"):
+        parse_challenge(reply(400, {"error": "invalid_request"}))
     with pytest.raises(OAuthError, match="no attestation"):
         parse_attestation(reply(200, {}), agent_id=AGENT, key_thumbprint="t", now=time.time())
     with pytest.raises(OAuthError, match="not a JWT"):
@@ -113,9 +113,11 @@ def blocking(platform: InstancePlatform, token_file: Path, **extra: str) -> Inst
 
 
 def test_the_instance_key_signs_nothing_an_agent_key_would(platform: InstancePlatform, token_file: Path) -> None:
+    from authfi import _dpop
+
     agent = blocking(platform, token_file)
-    assert agent.key.alg == "ES256" and agent.key.kid
-    assert agent.key.public_jwk()["kty"] == "EC"
+    assert agent.key.alg == _dpop.run_key().alg and agent.key.kid
+    assert agent.key.public_jwk() == _dpop.run_key().public_jwk()
     with pytest.raises(NotSupportedError, match="token exchange"):
         agent.key.sign(b"x")
     assert repr(agent) == f"InstanceAuth(agent_id='{AGENT}', evidence='k8s')"
@@ -124,17 +126,18 @@ def test_the_instance_key_signs_nothing_an_agent_key_would(platform: InstancePla
 
 def test_unusable_evidence_is_named(platform: InstancePlatform, tmp_path: Path) -> None:
     project = authfi.AuthFI(platform.issuer, http_client=platform.client())
-    missing = InstanceAuth(project, AGENT, Evidence("device", str(tmp_path / "none"), "k"))
+    config = Configuration(CONFIG["version"], CONFIG["digest"])
+    missing = InstanceAuth(project, AGENT, Evidence("device", str(tmp_path / "none"), "k"), config=config)
     with pytest.raises(ConfigurationError, match="AUTHFI_DEVICE_KEY_KID"):
         missing.token()
     empty = tmp_path / "empty"
     empty.write_text("")
     with pytest.raises(ConfigurationError, match="is empty"):
-        InstanceAuth(project, AGENT, Evidence("k8s", str(empty))).token()
+        InstanceAuth(project, AGENT, Evidence("k8s", str(empty)), config=config).token()
     junk = tmp_path / "junk"
     junk.write_text("not a jwt")
     with pytest.raises(ConfigurationError, match="service-account JWT"):
-        InstanceAuth(project, AGENT, Evidence("k8s", str(junk))).token()
+        InstanceAuth(project, AGENT, Evidence("k8s", str(junk)), config=config).token()
     project.close()
 
 
@@ -217,7 +220,9 @@ async def test_the_asyncio_credential_names_what_is_missing(platform: InstancePl
     with pytest.raises(ConfigurationError, match="no evidence"):
         AsyncInstanceAuth.from_environment(project, {"AUTHFI_AGENT_ID": AGENT, "AUTHFI_DEVICE_KEY_FILE": ""})
     platform.discovery["grant_types_supported"] = ["authorization_code"]
-    agent = AsyncInstanceAuth(project, AGENT, Evidence("k8s", str(token_file)))
+    agent = AsyncInstanceAuth(
+        project, AGENT, Evidence("k8s", str(token_file)), config=Configuration(CONFIG["version"], CONFIG["digest"])
+    )
     with pytest.raises(NotSupportedError, match="client credentials"):
         await agent.token()
     with pytest.raises(NotSupportedError):

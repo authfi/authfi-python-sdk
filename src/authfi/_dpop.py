@@ -115,8 +115,12 @@ class DPoPKey:
         return jwt.encode(claims, self._key, algorithm=self.alg, headers={"typ": "dpop+jwt", "jwk": self.public_jwk()})
 
     def sign_jwt(self, claims: dict[str, Any], *, typ: str) -> str:
-        """A compact JWS of ``claims`` with this key (ES256), for the proofs an instance signs besides DPoP."""
-        return jwt.encode(claims, self._key, algorithm="ES256", headers={"typ": typ})
+        """A compact JWS of ``claims`` with this key, in its own algorithm, for the proofs an instance signs.
+
+        The platform refuses a proof whose algorithm is not the one its key implies, so this never signs
+        with another.
+        """
+        return jwt.encode(claims, self._key, algorithm=self.alg, headers={"typ": typ})
 
     def __repr__(self) -> str:
         return f"DPoPKey(alg={self.alg!r}, thumbprint={self.thumbprint!r})"

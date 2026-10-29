@@ -13,7 +13,7 @@ from authfi import AgentKey, ConfigurationError, NotSupportedError
 from authfi.errors import APIError, OAuthError
 from authfi.instance import AsyncInstanceAuth, Evidence, InstanceAuth, find_evidence
 from tests.agent_platform import AGENT
-from tests.instance_platform import ATTEST, CONFIG, InstancePlatform
+from tests.instance_platform import ATTEST, ATTEST_FIELDS, CHALLENGE, CONFIG, InstancePlatform
 from tests.support import FakeClock, json_response
 
 
@@ -65,6 +65,9 @@ def test_connect_signs_in_by_attestation_with_no_key(platform: InstancePlatform,
     body = platform.attests[0]
     assert body["evidence"]["kind"] == "k8s"
     assert body["config"] == CONFIG
+    assert set(body) <= ATTEST_FIELDS, "the route refuses a field it does not know"
+    assert "instance_key" in body and "run_key" not in body
+    assert "d" not in body["instance_key"], "only the public half of the key is sent"
     assert "private" not in str(body).lower()
     request = platform.token_requests[0]
     assert {"oauth-client-attestation", "oauth-client-attestation-pop", "dpop"} <= set(request.headers)
@@ -151,13 +154,45 @@ def test_a_device_key_signs_the_nonce(platform: InstancePlatform, tmp_path: Path
     platform.device_jwk = {**key.public_jwk(), "alg": "EdDSA"}
     env = {"AUTHFI_ISSUER": platform.issuer, "AUTHFI_AGENT_ID": AGENT, "AUTHFI_DEVICE_KEY_FILE": str(path)}
     env["AUTHFI_DEVICE_KEY_KID"] = "dev-1"
-    platform.approved_config = {}
+    env["AUTHFI_CONFIG_VERSION"] = str(CONFIG["version"])
+    env["AUTHFI_CONFIG_DIGEST"] = str(CONFIG["digest"])
     agent = authfi.connect(env, http_client=platform.client())
     assert isinstance(agent, InstanceAuth)
     assert agent.token()
-    assert platform.attests[0]["evidence"]["kind"] == "device"
-    assert "config" not in platform.attests[0]
+    evidence = platform.attests[0]["evidence"]
+    assert evidence["kind"] == "device"
+    assert "." not in evidence["token"], "the evidence is the bare signature, not a JWT"
+    assert platform.attests[0]["config"] == CONFIG
     agent.project.close()
+
+
+def test_the_device_signature_is_over_the_nonce_the_agent_and_the_instance_key(tmp_path: Path) -> None:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    from authfi._protocol.oauth import b64url
+    from authfi.instance import _device_signature  # pyright: ignore[reportPrivateUsage]
+
+    private = ed25519.Ed25519PrivateKey.generate()
+
+    class Device:
+        alg = "EdDSA"
+        kid = "dev-1"
+
+        def sign(self, data: bytes) -> bytes:
+            return private.sign(data)
+
+    token = _device_signature(Device(), "agt_test1", "n-1", "jkt-1")
+    signature = base64_decode(token)
+    private.public_key().verify(signature, b"authfi-agent-attest" + b"\n" + b"n-1\nagt_test1\njkt-1")
+    assert token == b64url(signature)
+    with pytest.raises(Exception, match=""):
+        private.public_key().verify(signature, b"authfi-agent-attest" + b"\n" + b"n-1\nagt_test1\njkt-2")
+
+
+def base64_decode(value: str) -> bytes:
+    import base64
+
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 # --- which credential ----------------------------------------------------------------------------
@@ -205,7 +240,7 @@ def test_a_half_written_configuration_is_refused(platform: InstancePlatform, tok
         authfi.connect(env, http_client=platform.client())
 
 
-# --- every refusal names the fix ------------------------------------------------------------------
+# --- every refusal is the same answer, with what to check -----------------------------------------
 
 
 def _unapproved(p: InstancePlatform) -> None:
@@ -221,47 +256,67 @@ def _bound_to_a_device(p: InstancePlatform) -> None:
 
 
 @pytest.mark.parametrize(
-    ("setup", "code", "fix"),
+    ("setup", "reason"),
     [
-        (_unapproved, "config_not_approved", "Approve"),
-        (_pod_gone, "pod_not_live", "operator"),
-        (_bound_to_a_device, "evidence_kind_mismatch", "binding"),
+        (_unapproved, "config_not_approved"),
+        (_pod_gone, "pod_not_live"),
+        (_bound_to_a_device, "evidence_kind_mismatch"),
     ],
 )
-def test_the_platform_refusals_carry_what_to_do(
-    platform: InstancePlatform,
-    token_file: Path,
-    setup: Callable[[InstancePlatform], None],
-    code: str,
-    fix: str,
+def test_every_platform_refusal_is_one_401_that_says_where_the_reason_is(
+    platform: InstancePlatform, token_file: Path, setup: Callable[[InstancePlatform], None], reason: str
 ) -> None:
     setup(platform)
     agent = connect(platform, token_file)
     with pytest.raises(APIError) as caught:
         agent.token()
-    assert caught.value.code == code
-    assert fix in str(caught.value)
+    assert platform.refused == [reason], "the platform knows why; the answer does not say"
+    assert caught.value.status == 401
+    assert reason not in str(caught.value)
+    assert "audit tape" in str(caught.value)
     assert not platform.token_requests
     agent.project.close()
 
 
-def test_a_replayed_evidence_token_is_refused_with_the_fix(platform: InstancePlatform, tmp_path: Path) -> None:
+def test_a_replayed_evidence_token_is_refused(platform: InstancePlatform, tmp_path: Path) -> None:
     token = platform.k8s_token(jti="same")
     platform.evidence_jtis.add("same")
     path = tmp_path / "t"
     path.write_text(token)
     agent = connect(platform, path)
-    with pytest.raises(APIError, match="works once"):
+    with pytest.raises(APIError) as caught:
         agent.token()
+    assert platform.refused == ["token_reused"]
+    assert caught.value.status == 401
     agent.project.close()
 
 
-def test_a_cloud_workload_is_answered_not_built(platform: InstancePlatform, token_file: Path) -> None:
+def test_a_kind_of_workload_the_agent_is_not_bound_to_is_refused(platform: InstancePlatform, token_file: Path) -> None:
+    config = authfi.instance.Configuration(CONFIG["version"], CONFIG["digest"])
     agent = InstanceAuth(
-        authfi.AuthFI(platform.issuer, http_client=platform.client()), AGENT, Evidence("gcp", str(token_file))
+        authfi.AuthFI(platform.issuer, http_client=platform.client()),
+        AGENT,
+        Evidence("gcp", str(token_file)),
+        config=config,
     )
-    with pytest.raises(APIError, match="not built yet"):
+    with pytest.raises(APIError) as caught:
         agent.token()
+    assert platform.refused == ["evidence_kind_mismatch"]
+    assert caught.value.status == 401
+    agent.project.close()
+
+
+def test_a_platform_that_cannot_decide_is_a_503_that_says_to_sign_in_again(
+    platform: InstancePlatform, token_file: Path
+) -> None:
+    platform.unavailable = True
+    agent = connect(platform, token_file)
+    with pytest.raises(APIError) as caught:
+        agent.token()
+    assert caught.value.code == "temporarily_unavailable"
+    assert caught.value.status == 503
+    assert "Sign in again" in str(caught.value)
+    assert len(platform.attests) == 1, "an attestation that may have spent the evidence is not sent again"
     agent.project.close()
 
 
@@ -339,10 +394,61 @@ def test_a_challenge_without_a_nonce_is_refused(platform: InstancePlatform, toke
     agent.project.close()
 
 
-def test_the_data_envelope_is_read_too(token_file: Path) -> None:
-    platform = InstancePlatform(envelope=True)
-    token_file.write_text(platform.k8s_token())
-    assert connect(platform, token_file).token()
+def test_a_reply_wrapped_in_data_is_not_the_contract_and_is_not_read(platform: InstancePlatform, token_file: Path) -> None:
+    platform.route(
+        "POST",
+        "/apis/regional/v1/ai/agents/attest/challenge",
+        lambda _r: json_response({"data": {"nonce": "n-1"}}),
+    )
+    agent = connect(platform, token_file)
+    with pytest.raises(OAuthError, match="nonce"):
+        agent.token()
+    assert not platform.attests
+    agent.project.close()
+
+
+def test_an_instance_without_its_approved_configuration_is_refused_before_anything_is_sent(
+    platform: InstancePlatform, token_file: Path
+) -> None:
+    env = env_for(platform, token_file)
+    del env["AUTHFI_CONFIG_VERSION"], env["AUTHFI_CONFIG_DIGEST"]
+    with pytest.raises(ConfigurationError, match="AUTHFI_CONFIG_VERSION"):
+        authfi.connect(env, http_client=platform.client())
+    assert not platform.attests
+
+
+@pytest.mark.parametrize("digest", ["sha256:abc", "sha256:" + "AB" * 32, "ab" * 32, "md5:" + "ab" * 16])
+def test_an_image_digest_that_is_not_sha256_hex_is_refused(
+    platform: InstancePlatform, token_file: Path, digest: str
+) -> None:
+    with pytest.raises(ConfigurationError, match="AUTHFI_IMAGE_DIGEST"):
+        authfi.connect(env_for(platform, token_file, AUTHFI_IMAGE_DIGEST=digest), http_client=platform.client())
+
+
+def test_the_proof_and_the_pop_are_signed_in_the_algorithm_of_the_instance_key(
+    platform: InstancePlatform, token_file: Path
+) -> None:
+    from authfi import _dpop
+
+    agent = connect(platform, token_file)
+    agent.token()
+    alg = _dpop.run_key().alg
+    assert jwt.get_unverified_header(platform.attests[0]["proof"])["alg"] == alg
+    pop = platform.token_requests[0].headers["oauth-client-attestation-pop"]
+    assert jwt.get_unverified_header(pop)["alg"] == alg
+    assert "challenge" not in jwt.decode(pop, options={"verify_signature": False})
+    agent.project.close()
+
+
+def test_the_token_request_asks_for_no_challenge_of_its_own(platform: InstancePlatform, token_file: Path) -> None:
+    calls: list[int] = []
+    inner = platform._challenge  # pyright: ignore[reportPrivateUsage]
+    platform.route("POST", CHALLENGE, lambda r: calls.append(1) or inner(r))
+    agent = connect(platform, token_file)
+    agent.token()
+    agent.token(force=True)
+    assert len(calls) == 1, "one challenge, for the attestation; a token request needs none"
+    agent.project.close()
 
 
 # --- what the instance does not do, and what never leaks -------------------------------------------

@@ -60,31 +60,19 @@ MAX_ATTESTATION_LIFETIME = 900
 POP_LIFETIME = 60
 _INSTANCE_ID = re.compile(r"inst_[0-9a-f]{32}")
 
-#: What to do about each refusal the attest route gives, named for the person reading the error.
-_FIXES = {
-    "config_not_approved": (
-        "Approve this configuration version in the console (Agents > the agent > Configuration), or deploy the "
-        "approved version, then restart the instance."
-    ),
-    "proof_kind_not_built": (
-        "Sign-in from this kind of workload (gcp, aws) is not built yet. Run the agent on Kubernetes or on a "
-        "device bound to it."
-    ),
-    "evidence_replayed": (
-        "A service-account token works once. Project a fresh one (expirationSeconds: 600) and let the pod "
-        "rotate it; the SDK never sends the same token twice."
-    ),
-    "evidence_kind_mismatch": (
-        "The agent is bound to a different kind of workload than the evidence found here. Check the binding in "
-        "the console (Agents > the agent > Workloads)."
-    ),
-    "binding_not_found": (
-        "No workload is bound to this agent for this evidence. Bind the namespace and service account (or the "
-        "device) in the console (Agents > the agent > Workloads)."
-    ),
-    "pod_not_live": "The cluster does not report this pod running. Check the operator is connected for the cluster.",
-    "challenge_invalid": "The challenge was used or expired (60 s, single use). Retry; it was not the SDK's last word.",
-}
+#: What the person reading a refusal can do. The attest route gives every refusal the same 401 (it must not say
+#: which agents exist, what they are bound to, or which part of the evidence was wrong), so this cannot name
+#: the cause; the reason is on the project's audit tape as ``agent.attest.refused``.
+_REFUSED = (
+    "The platform refuses every failed sign-in the same way. Its reason is on the audit tape "
+    "(agent.attest.refused): the binding of the agent's workload, the evidence kind, a service-account token "
+    "used once or older than 600 seconds, the approved configuration version and digest, and a pod the cluster "
+    "does not report running are the causes to check."
+)
+_UNAVAILABLE = (
+    "The platform could not decide just now. Sign in again: the SDK asks for a new challenge, and a "
+    "service-account token that may have been spent needs the pod to have rotated to a fresh one."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,12 +108,12 @@ def jwk_thumbprint(jwk: Mapping[str, Any]) -> str | None:
 
 
 def refusal_with_fix(response: HttpResponse, what: str) -> AuthFIError:
-    """The platform's refusal, with the fix appended where this SDK knows one."""
+    """The platform's refusal, with what to check appended to the two answers the attest route gives."""
     error = api_error(response, what)
-    fix = _FIXES.get(error.code or "")
-    if fix is None or not isinstance(error, APIError):
+    hint = _REFUSED if response.status == 401 else _UNAVAILABLE if response.status == 503 else None
+    if hint is None or not isinstance(error, APIError):
         return error
-    named = APIError(error.code, f"{error.description + '. ' if error.description else ''}{fix}", response.status)
+    named = APIError(error.code, f"{error.description + '. ' if error.description else ''}{hint}", response.status)
     named.request_id = error.request_id
     named.run_id = error.run_id
     return named
@@ -135,8 +123,7 @@ def _data(response: HttpResponse, what: str) -> dict[str, Any]:
     body = response.json_object()
     if body is None:
         raise OAuthError("invalid_response", f"{what} did not answer a JSON object", status=response.status)
-    inner = body.get("data")
-    return inner if isinstance(inner, dict) else body  # pyright: ignore[reportUnknownVariableType]
+    return body
 
 
 def challenge_request(api_origin: str) -> HttpRequest:
@@ -230,7 +217,7 @@ def attested_token_request(
     """``client_credentials`` for ``agent_id`` with the attestation, a proof of its key, and a DPoP proof.
 
     The proofs are made fresh for each attempt. The request is not sent again after it may have arrived:
-    its proof carries a single-use challenge.
+    its proof carries a single-use ``jti``.
     """
     form = {"grant_type": "client_credentials", "client_id": agent_id}
     if resource:
@@ -250,7 +237,7 @@ def attested_token_request(
     )
 
 
-def pop_claims(agent_id: str, audience: str, challenge: str, now: float) -> dict[str, Any]:
+def pop_claims(agent_id: str, audience: str, now: float) -> dict[str, Any]:
     """The claims of the proof of possession (``iss`` the agent, ``aud`` the issuer)."""
     issued = int(now)
     return {
@@ -259,5 +246,4 @@ def pop_claims(agent_id: str, audience: str, challenge: str, now: float) -> dict
         "jti": str(uuid.uuid4()),
         "iat": issued,
         "exp": issued + POP_LIFETIME,
-        "challenge": challenge,
     }
