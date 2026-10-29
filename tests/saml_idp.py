@@ -15,7 +15,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from lxml import etree
+from lxml import etree  # pyright: ignore[reportAttributeAccessIssue]
 from xmlsec import constants as C
 
 BASE = "https://acme.authfi.io"
