@@ -230,6 +230,13 @@ def test_an_sha1_signature_is_refused(idp: FakeIdp) -> None:
     assert caught.value.code in ("saml_algorithm_rejected", "saml_signature_invalid")
 
 
+def test_an_attribute_named_twice_is_refused(idp: FakeIdp) -> None:
+    sp = provider(idp)
+    pending = sp.start_sign_in()
+    response = idp.response(now=time.time(), in_response_to=pending.request_id, duplicate_attribute=True)
+    refused(sp, response, pending, "saml_attribute_duplicated")
+
+
 def test_an_assertion_is_accepted_once(idp: FakeIdp) -> None:
     sp = provider(idp)
     pending = sp.start_sign_in()

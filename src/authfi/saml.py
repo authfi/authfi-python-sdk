@@ -476,7 +476,10 @@ class SamlServiceProvider:
             raise SamlAssertionRefused("saml_assertion_invalid", "the response could not be validated") from exc
         if pending is None and response.get_in_response_to() is not None:
             raise SamlAssertionRefused("saml_in_response_to_mismatch", "an unsolicited response answers a request")
-        return self._accept(response, pending, now)
+        try:
+            return self._accept(response, pending, now)
+        except OneLogin_Saml2_ValidationError as exc:
+            raise _refuse(exc) from exc
 
     def _decode(self, saml_response: str) -> bytes:
         given = cast(object, saml_response)
@@ -492,6 +495,7 @@ class SamlServiceProvider:
 
     def _accept(self, response: Any, pending: PendingSamlSignIn | None, now: float) -> SamlSignIn:
         not_on_or_after = self._check_window(response, now)
+        attributes = cast("Mapping[str, Sequence[str]]", response.get_attributes())
         assertion_id = cast(str, response.get_assertion_id())
         name_id = cast("str | None", response.get_nameid())
         if not name_id:
@@ -501,7 +505,6 @@ class SamlServiceProvider:
         for key in keys:
             if not self._replay.remember(key, expires, now):
                 raise SamlAssertionRefused("saml_assertion_replayed", "this response was already used")
-        attributes = cast("Mapping[str, Sequence[str]]", response.get_attributes())
         user = self._user(name_id, cast("str | None", response.get_nameid_format()), attributes, response)
         session_not_on_or_after = response.get_session_not_on_or_after()
         return SamlSignIn(

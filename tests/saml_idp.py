@@ -109,6 +109,7 @@ class FakeIdp:
         status: str = "urn:oasis:names:tc:SAML:2.0:status:Success",
         sign: str | None = "assertion",
         sha1: bool = False,
+        duplicate_attribute: bool = False,
         signer: Signer | None = None,
         tamper: bool = False,
         wrap: bool = False,
@@ -128,6 +129,8 @@ class FakeIdp:
         nb = iso(not_before if not_before is not None else now - 30)
         na = iso(not_on_or_after if not_on_or_after is not None else now + 300)
         cna = iso(confirm_not_on_or_after) if confirm_not_on_or_after is not None else na
+        if duplicate_attribute and attr_xml:
+            attr_xml += attr_xml[: attr_xml.index("</saml:Attribute>") + 17]
         statement = f"<saml:AttributeStatement>{attr_xml}</saml:AttributeStatement>" if attr_xml else ""
         xml = (
             f'<samlp:Response xmlns:samlp="{SAMLP}" xmlns:saml="{SAML}" ID="{rid}" Version="2.0" '
