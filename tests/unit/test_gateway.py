@@ -25,7 +25,7 @@ from authfi import (
 from authfi.agents import AgentAuth
 from authfi.gateway import token_refusal
 from tests.agent_platform import AGENT, AgentPlatform
-from tests.support import FakeClock, fixture_json, json_response
+from tests.support import FakeClock, RpcError, fixture_json, json_response
 
 HOLD_ID = "7f1c2a9e-5d1b-4f3a-9a77-2b0c8e1d4f00"
 
@@ -440,14 +440,6 @@ async def test_the_async_gateway(platform: AgentPlatform, key: AgentKey, clock: 
 
 
 # --- the refusal, whichever MCP SDK raised it ----------------------------------------------------------
-
-
-class RpcError(Exception):
-    """The MCP SDK 2 error: the JSON-RPC ``data`` is on the error itself."""
-
-    def __init__(self, data: Any) -> None:
-        super().__init__("refused")
-        self.data = data
 
 
 def test_a_refusal_is_found_in_the_error_a_newer_sdk_raises_and_in_what_wraps_it() -> None:

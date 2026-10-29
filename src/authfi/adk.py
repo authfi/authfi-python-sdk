@@ -31,7 +31,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -87,6 +86,7 @@ PAYLOAD_KEY = "authfi_approval_id"
 
 #: The google-adk versions whose private MCP seam this module is tested with.
 TESTED = "google-adk 2.12 and 2.13"
+
 
 @dataclass(frozen=True, slots=True)
 class PendingApproval(BasePendingApproval):

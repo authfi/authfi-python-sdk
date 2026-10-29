@@ -43,7 +43,6 @@ import shlex
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 try:

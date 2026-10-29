@@ -342,9 +342,11 @@ def test_the_group_two_factories_build_on_the_same_asyncio_credential(
     assert integration.run_id == "g2-run"
 
 
-@pytest.mark.parametrize("factory", ["pydantic_ai", "crewai", "llama_index"])
+@pytest.mark.parametrize(
+    ("factory", "package"), [("pydantic_ai", "pydantic_ai"), ("crewai", "crewai"), ("llama_index", "llama_index")]
+)
 def test_a_group_two_framework_that_is_not_installed_names_its_extra(
-    platform: Platform, monkeypatch: pytest.MonkeyPatch, factory: str
+    platform: Platform, monkeypatch: pytest.MonkeyPatch, factory: str, package: str
 ) -> None:
     import builtins
     import sys
@@ -353,8 +355,8 @@ def test_a_group_two_framework_that_is_not_installed_names_its_extra(
     real = builtins.__import__
 
     def refuse(name: str, *args: object, **kwargs: object) -> object:
-        if name == module:
-            raise ImportError(f"No module named {module!r}")
+        if name == package or name.startswith(package + "."):
+            raise ImportError(f"No module named {package!r}")
         return real(name, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.delitem(sys.modules, module, raising=False)

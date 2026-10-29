@@ -12,6 +12,7 @@ import pytest
 from authfi import GatewayTokenRefused
 from authfi._holds import MEMORY, Decided, Held, HeldCalls, call_key, guard, text_of, wait_for_decision
 from authfi.gateway import AsyncGateway
+from tests.support import RpcError
 
 HOLD = (
     "Waiting for approval appr-1 (approval_required). A person must approve this action in the AuthFI console. "
@@ -67,6 +68,24 @@ def test_the_oldest_calls_are_forgotten_beyond_the_memory() -> None:
         held.remember("t", {"n": n}, Decided(result=n))
     assert held.get("t", {"n": 0}) is None
     assert held.get("t", {"n": MEMORY + 2}) == Decided(result=MEMORY + 2)
+
+
+def test_a_call_nobody_came_back_for_is_forgotten_after_its_time() -> None:
+    clock = SimpleNamespace(now=0.0)
+    gateway = _gateway()
+    gateway.project.clock = SimpleNamespace(monotonic=lambda: clock.now)
+    held = HeldCalls(gateway, ttl=120.0)
+    held.remember("t", {"a": 1}, Held("appr-1"))
+    clock.now = 100.0
+    assert held.get("t", {"a": 1}) == Held("appr-1")
+    clock.now = 121.0
+    assert held.get("t", {"a": 1}) is None
+    held.remember("t", {"a": 1}, Held("appr-2"))
+    clock.now = 300.0
+    assert held.take("t", {"a": 1}) is None, "an old call is not taken either"
+    held.remember("t", {"a": 2}, Held("appr-3"))
+    held.clear()
+    assert held.get("t", {"a": 2}) is None
 
 
 async def test_a_call_is_sent_and_read_the_way_the_gateway_answers() -> None:

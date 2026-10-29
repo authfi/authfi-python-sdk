@@ -69,11 +69,14 @@ class HeldCalls:
         self._ttl = ttl
         self._calls: OrderedDict[str, tuple[Held | Decided, float]] = OrderedDict()
 
+    def _now(self) -> float:
+        return self.gateway.project.clock.monotonic() if self._ttl is not None else 0.0
+
     def _fresh(self, key: str, found: tuple[Held | Decided, float] | None) -> Held | Decided | None:
         if found is None:
             return None
         entry, at = found
-        if self._ttl is not None and self.gateway.project.clock.monotonic() - at > self._ttl:
+        if self._ttl is not None and self._now() - at > self._ttl:
             self._calls.pop(key, None)
             return None
         return entry
@@ -91,7 +94,7 @@ class HeldCalls:
     def remember(self, tool: str, args: Mapping[str, Any], entry: Held | Decided) -> None:
         """Keep ``entry`` for the call, forgetting the oldest beyond :data:`MEMORY`."""
         key = call_key(tool, args)
-        self._calls[key] = (entry, self.gateway.project.clock.monotonic())
+        self._calls[key] = (entry, self._now())
         self._calls.move_to_end(key)
         while len(self._calls) > MEMORY:
             self._calls.popitem(last=False)
