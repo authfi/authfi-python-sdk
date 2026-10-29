@@ -171,7 +171,7 @@ def test_the_client_sends_the_credential_ids_and_no_redirects(
     client.post(gateway.mcp_url, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     sent = server.seen[0]
     assert sent.headers["authorization"].startswith("Bearer ")
-    assert sent.headers["x-request-id"].startswith("afr-")
+    assert sent.headers["x-request-id"].startswith("run-")  # the agent's run, then the call's number
     assert "traceparent" in sent.headers
     assert sent.headers["user-agent"].startswith("authfi-python/")
     assert client.get(platform.issuer + "/elsewhere").status_code == 302  # not followed

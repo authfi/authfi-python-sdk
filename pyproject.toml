@@ -49,6 +49,8 @@ langgraph = [
 ]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
 claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
+# Steps to AuthFI over OTLP/HTTP (authfi.otel); the SDK and the exporter are the OpenTelemetry project's.
+otel = ["opentelemetry-sdk>=1.30,<2", "opentelemetry-exporter-otlp-proto-http>=1.30,<2"]
 # litellm 1.92 releases import orjson without requiring it, and 1.106 needs a newer mcp than google-adk 2.12
 # allows: the range excludes both, and the adapters job installs the newest version inside it.
 adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
@@ -97,6 +99,8 @@ dev = [
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
     "google-adk>=2.12,<2.13",
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
 ]
 
 [tool.pytest.ini_options]
