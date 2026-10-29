@@ -154,6 +154,8 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 - [Signing people in to a web app](docs/signin.md)
 - [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
 - [Machine clients](docs/machine.md)
+- [Organizations, users and roles from your backend](docs/admin.md)
+- [Verifying webhooks](docs/webhooks.md)
 - [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
 - [The AuthFI gateways: tools, models, cloud credentials](docs/gateway.md)
 - [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK, Claude Agent SDK, Google ADK](docs/frameworks.md)
