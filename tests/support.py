@@ -206,3 +206,11 @@ def form_of(request: httpx.Request) -> dict[str, str]:
     from urllib.parse import parse_qsl
 
     return dict(parse_qsl(request.content.decode("utf-8")))
+
+
+class RpcError(Exception):
+    """The MCP SDK 2 error: the JSON-RPC ``data`` is on the error itself."""
+
+    def __init__(self, data: Any) -> None:
+        super().__init__("refused")
+        self.data = data

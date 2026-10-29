@@ -31,9 +31,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-from collections import OrderedDict
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -60,6 +58,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
+from authfi._holds import Held, HeldCalls
 from authfi.errors import ConfigurationError, GatewayTokenRefused, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,
@@ -73,6 +72,8 @@ from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import TracerProvider
+
     from authfi.client import AsyncAuthFI
 
 __all__ = ["ADKIntegration", "AuthFILiteLlm", "PendingApproval"]
@@ -84,10 +85,7 @@ CONFIRMATION_CALL = "adk_request_confirmation"
 PAYLOAD_KEY = "authfi_approval_id"
 
 #: The google-adk versions whose private MCP seam this module is tested with.
-TESTED = "google-adk 2.12"
-
-#: How many held calls the integration remembers until they are confirmed and run again.
-MEMORY = 10_000
+TESTED = "google-adk 2.12 and 2.13"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,10 +93,6 @@ class PendingApproval(BasePendingApproval):
     """A call the gateway holds until a person approves it; ``call_id`` is ADK's confirmation request."""
 
     call_id: str
-
-
-def _key(tool: str, args: Mapping[str, Any]) -> str:
-    return tool + "\x00" + json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
 
 
 class AuthFILiteLlm(LiteLlm):
@@ -176,7 +170,7 @@ class ADKIntegration:
         self.source = source
         self.gateway = async_gateway_for(source, project)
         self.agent_id = agent_id_of(source)
-        self._held: OrderedDict[str, str] = OrderedDict()
+        self._held = HeldCalls(self.gateway)
 
     # --- model and tools --------------------------------------------------------------------------------
 
@@ -219,12 +213,6 @@ class ADKIntegration:
 
     # --- the callbacks -----------------------------------------------------------------------------------
 
-    def _remember(self, key: str, approval_id: str) -> None:
-        self._held[key] = approval_id
-        self._held.move_to_end(key)
-        while len(self._held) > MEMORY:
-            self._held.popitem(last=False)
-
     async def before_tool_callback(
         self, tool: BaseTool, args: dict[str, Any], tool_context: ToolContext
     ) -> dict[str, Any] | None:
@@ -235,13 +223,13 @@ class ADKIntegration:
         clean = self.gateway.strip_approval_argument(args)
         args.clear()
         args.update(clean)
-        key = _key(tool.name, clean)
         confirmation = tool_context.tool_confirmation
         payload: object = confirmation.payload if confirmation is not None else None
         given = cast(Mapping[str, Any], payload).get(PAYLOAD_KEY) if isinstance(payload, Mapping) else None
-        approval_id = self._held.get(key) or (given if isinstance(given, str) else None)
+        held = self._held.get(tool.name, clean)
+        approval_id = held.approval_id if isinstance(held, Held) else (given if isinstance(given, str) else None)
         if confirmation is not None and not confirmation.confirmed:
-            self._held.pop(key, None)
+            self._held.take(tool.name, clean)
             return {"error": "Not run: the action was not approved."}
         if approval_id:
             args.update(self.gateway.with_approval({}, approval_id))
@@ -261,18 +249,17 @@ class ADKIntegration:
         if isinstance(error, str) and TOKEN_REFUSED_MESSAGE in error:
             raise GatewayTokenRefused(self.gateway.mcp_url, None)
         clean = self.gateway.strip_approval_argument(args)
-        key = _key(tool.name, clean)
         outcome = self.gateway.read_result(tool_response)
         logger = self.gateway.project.logger
         if not isinstance(outcome, ToolApprovalRequired | ToolRefused):
-            self._held.pop(key, None)
+            self._held.take(tool.name, clean)
             return None
         if isinstance(outcome, ToolRefused):
-            self._held.pop(key, None)
+            self._held.take(tool.name, clean)
             logger.info("the gateway refused %s: %s", tool.name, outcome.code or outcome.error)
             return {"error": outcome.model_text}
         approval_id = outcome.approval_id
-        self._remember(key, approval_id)
+        self._held.remember(tool.name, clean, Held(approval_id))
         logger.info("%s waits for approval %s", tool.name, approval_id)
         if tool_context.tool_confirmation is None:
             tool_context.request_confirmation(
@@ -350,15 +337,32 @@ class ADKIntegration:
         Turning content on is the tenant's policy decision.
         """
         os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true" if capture_content else "false"
-        if capture_content:
-            os.environ.pop("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", None)
-        else:
-            os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "NO_CONTENT"
-        if self.agent_id:
-            attributes = [
-                a
-                for a in (os.environ.get("OTEL_RESOURCE_ATTRIBUTES") or "").split(",")
-                if a and not a.startswith("authfi.agent_id=")
-            ]
-            attributes.append(f"authfi.agent_id={self.agent_id}")
-            os.environ["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(attributes)
+        # google-adk 2.13 puts content on its inference spans only in a span-bearing mode.
+        mode = "SPAN_ONLY" if capture_content else "NO_CONTENT"
+        os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = mode
+        ours = {"authfi.agent_id": self.agent_id} if self.agent_id else {}
+        ours["authfi.run_id"] = self.run_id
+        attributes = [
+            a
+            for a in (os.environ.get("OTEL_RESOURCE_ATTRIBUTES") or "").split(",")
+            if a and a.split("=", 1)[0] not in ours
+        ]
+        attributes.extend(f"{name}={value}" for name, value in ours.items())
+        os.environ["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(attributes)
+
+    @property
+    def run_id(self) -> str:
+        """The credential's run: on every gateway call (``X-Request-Id``) and every exported step."""
+        return cast(str, getattr(self.source, "run_id", None) or "")
+
+    def export_steps(self, *, capture_content: bool = False, **options: Any) -> TracerProvider:
+        """Send this agent's steps to AuthFI (extra ``otel``): ADK's own OpenTelemetry spans, content off.
+
+        ADK traces through the global OpenTelemetry provider, so this registers the AuthFI exporter on it
+        (see :func:`authfi.otel.register`) and calls :meth:`configure_tracing`. Call it once, before the runner.
+        """
+        from authfi import otel
+
+        provider = otel.register(self.source, capture_content=capture_content, **options)
+        self.configure_tracing(capture_content=capture_content)
+        return provider

@@ -10,6 +10,23 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- Extras cover each framework's major version (`google-adk` 2.x, `mcp` 2.x where the framework allows it,
+  `litellm` 1.x). `authfi[langchain]` installs only `langchain-core`; the Claude model is
+  `authfi[langchain-anthropic]`. LangSmith is never required, and `configure_tracing()` does nothing without it.
+- `authfi.connect()` and `connect_async()`: the credential the environment names (`AUTHFI_AGENT_ID` with a
+  key, or `AUTHFI_CLIENT_ID` with `AUTHFI_CLIENT_SECRET`), with `langchain()`, `langgraph()`,
+  `openai_agents()`, `claude_agent()` and `adk()` building the integrations. `client_credentials_from_env()`
+  on both project clients. A machine client has a gateway of its own (`m2m.gateway()`) that every
+  integration built on it shares.
+- A run id on every credential (`run_id`, `start_run()`): `X-Request-Id: <run id>.<n>` on every gateway call,
+  `authfi_run_id` in the metadata of LangChain and OpenAI Agents runs, `authfi.run_id` in the trace resource
+  attributes of ADK and Claude Code. The `User-Agent` of a machine client's gateway calls says
+  `authfi-credential/client-credentials`.
+- `authfi.otel` (extra `otel`): an OTLP/HTTP exporter to `<issuer origin>/otlp/v1/traces` that authenticates
+  with the credential's current token on every export, removes GenAI content unless allowed, and tags spans
+  with `authfi.agent_id` and `authfi.run_id`; `export_steps()` on the LangChain, LangGraph, OpenAI Agents and
+  ADK integrations, and `export_steps=True` on the Claude Agent SDK's options, wire it into each framework's
+  own tracing.
 - `AuthFI` and `AsyncAuthFI`: the project client, configured by its issuer alone, with discovery
   (RFC 8414 / OpenID), the key set, and one HTTP transport shared by every area.
 - Timeouts on every request (connect, read, and a deadline per call), and retries only where

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, cast
@@ -360,7 +361,7 @@ def test_a_blocking_credential_is_refused(fake: FakeGateway, key: AgentKey) -> N
 
 def test_run_config_names_the_agent(integration: OpenAIAgentsIntegration) -> None:
     config = integration.run_config(trace_metadata={"case": "1"})
-    assert config.trace_metadata == {"case": "1", "authfi_agent_id": AGENT}
+    assert config.trace_metadata == {"case": "1", "authfi_agent_id": AGENT, "authfi_run_id": integration.run_id}
     assert config.trace_include_sensitive_data is False
 
 
@@ -530,3 +531,86 @@ def test_there_is_one_pending_approval_vocabulary() -> None:
 
     assert issubclass(PendingApproval, Base)
     assert [f for f in PendingApproval.__dataclass_fields__] == ["approval_id", "tool", "args", "item"]
+
+
+async def test_export_steps_sends_the_agents_steps_to_authfi_without_the_words(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    integration.export_steps(tracer_provider=provider)
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config(capture_content=True))
+    integration.configure_tracing()
+    await asyncio.to_thread(provider.force_flush)
+    await asyncio.to_thread(provider.shutdown)
+
+    steps = fake.exported_spans()
+    names = [s["name"] for s in steps]
+    assert any(n.startswith("workflow ") for n in names)
+    assert any(n.startswith("invoke_agent ") for n in names)
+    assert any(n.startswith("execute_tool ") for n in names)
+    assert any(n.startswith("chat ") for n in names)
+    for step in steps:
+        assert step["attributes"]["authfi.agent_id"] == AGENT
+        assert step["attributes"]["authfi.run_id"] == integration.run_id
+        assert step["headers"]["authorization"].startswith("Bearer tok-minted-")
+    posted = b"".join(r["body"] for r in fake.requests if r["path"] == "/otlp/v1/traces")
+    assert b"ada@example.com" not in posted  # the bridge never reads the words
+    assert not any(t.encode() in posted for t in fake.minted)
+    execute = next(s for s in steps if s["name"].startswith("execute_tool "))
+    chat = next(s for s in steps if s["name"].startswith("chat "))
+    assert execute["attributes"]["gen_ai.operation.name"] == "execute_tool"
+    assert execute["name"] == f"execute_tool {execute['attributes']['gen_ai.tool.name']}"
+    assert execute["attributes"]["gen_ai.tool.name"] == ALLOWED
+    assert chat["attributes"]["gen_ai.operation.name"] == "chat"
+
+
+def test_the_steps_processor_names_every_kind_of_step() -> None:
+    from agents.tracing.span_data import (
+        AgentSpanData,
+        FunctionSpanData,
+        GenerationSpanData,
+        GuardrailSpanData,
+        HandoffSpanData,
+        MCPListToolsSpanData,
+    )
+
+    from authfi.openai_agents import _step  # pyright: ignore[reportPrivateUsage]
+
+    assert _step(AgentSpanData(name="a")) == (
+        "invoke_agent a",
+        {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "a"},
+    )
+    assert _step(FunctionSpanData(name="t", input="secret", output="secret"))[0] == "execute_tool t"
+    name, attrs = _step(GenerationSpanData(model="m", usage={"input_tokens": 3, "output_tokens": 4, "other": 1}))
+    assert name == "chat m"
+    assert attrs == {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.request.model": "m",
+        "gen_ai.usage.input_tokens": 3,
+        "gen_ai.usage.output_tokens": 4,
+    }
+    assert _step(HandoffSpanData("a", "b"))[0] == "handoff a to b"
+    assert _step(HandoffSpanData(None, None))[0] == "handoff ? to ?"
+    assert _step(GuardrailSpanData(name="g", triggered=True)) == ("guardrail g", {"authfi.guardrail.triggered": True})
+    assert _step(MCPListToolsSpanData(server="s"))[0] == "mcp_tools"
+
+
+def test_the_steps_processor_survives_spans_it_never_saw_start() -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from authfi.openai_agents import AuthFIStepsProcessor, _nanos  # pyright: ignore[reportPrivateUsage]
+
+    processor = AuthFIStepsProcessor(TracerProvider())
+    processor._end("never-started", None)  # pyright: ignore[reportPrivateUsage]
+    processor.force_flush()
+    processor.shutdown()
+    assert _nanos(None) is None
+    assert _nanos("not a time") is None
+    assert _nanos("2026-10-29T10:00:00+00:00") == 1_793_268_000_000_000_000
