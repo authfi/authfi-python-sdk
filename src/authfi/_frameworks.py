@@ -19,9 +19,12 @@ from authfi.errors import ConfigurationError
 if TYPE_CHECKING:
     from authfi.adk import ADKIntegration
     from authfi.claude_agent import ClaudeAgentIntegration
+    from authfi.crewai import CrewAIIntegration
     from authfi.langchain import LangChainIntegration
     from authfi.langgraph import LangGraphIntegration
+    from authfi.llama_index import LlamaIndexIntegration
     from authfi.openai_agents import OpenAIAgentsIntegration
+    from authfi.pydantic_ai import PydanticAIIntegration
 
 __all__ = ["FrameworkCredential", "new_run_id", "valid_run_id"]
 
@@ -124,3 +127,21 @@ class FrameworkCredential:
     def adk(self, **options: Any) -> ADKIntegration:
         """The Google ADK integration (extra ``adk``); needs the asyncio credential."""
         return cast("ADKIntegration", _adapter("authfi.adk", "adk").ADKIntegration(self, **options))
+
+    def pydantic_ai(self, **options: Any) -> PydanticAIIntegration:
+        """The Pydantic AI integration (extra ``pydantic-ai``); needs the asyncio credential."""
+        return cast(
+            "PydanticAIIntegration",
+            _adapter("authfi.pydantic_ai", "pydantic-ai").PydanticAIIntegration(self, **options),
+        )
+
+    def crewai(self, **options: Any) -> CrewAIIntegration:
+        """The CrewAI integration (extra ``crewai``); needs the asyncio credential."""
+        return cast("CrewAIIntegration", _adapter("authfi.crewai", "crewai").CrewAIIntegration(self, **options))
+
+    def llama_index(self, **options: Any) -> LlamaIndexIntegration:
+        """The LlamaIndex integration (extra ``llama-index``); needs the asyncio credential."""
+        return cast(
+            "LlamaIndexIntegration",
+            _adapter("authfi.llama_index", "llama-index").LlamaIndexIntegration(self, **options),
+        )
