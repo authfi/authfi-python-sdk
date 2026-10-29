@@ -14,7 +14,9 @@ The exporter sends OTLP/HTTP protobuf with the credential's *current* token on e
 that is renewed is never stale in a header. AuthFI keeps each span as the token's agent's, whatever
 the payload says, and drops the content attributes; this module drops them first unless
 ``capture_content`` is set (the tenant's policy decision). Each span is tagged ``authfi.agent_id`` (or
-``authfi.client_id``) and ``authfi.run_id``. A gateway call made inside a span carries that span's
+``authfi.client_id``) and ``authfi.run_id``, and carries LangSmith's run type and trace name
+(:mod:`authfi.tracing`), so the same spans go to LangSmith and to AuthFI. A secret never leaves in a span, with
+content capture on or off. A gateway call made inside a span carries that span's
 ``traceparent``, so the gateway's record and the steps share a trace id.
 """
 
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING, Any, cast
 from authfi._protocol.urls import origin_of
 from authfi.errors import ConfigurationError
 from authfi.tokens import AsyncTokenSource, TokenSource
+from authfi.tracing import LangSmithAttributes, redact_span
 
 try:
     import requests
@@ -156,7 +159,7 @@ class AuthFISpanExporter(SpanExporter):
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Send ``spans``; a failure (including a token that could not be renewed) is logged and reported."""
-        batch = list(spans) if self._capture_content else [_without_content(s) for s in spans]
+        batch = [redact_span(s if self._capture_content else _without_content(s)) for s in spans]
         try:
             return self._inner.export(batch)
         except Exception as error:  # a span exporter must not raise into the application
@@ -251,6 +254,7 @@ def register(
     if source in done:
         return provider
     provider.add_span_processor(StepAttributes(source))
+    provider.add_span_processor(LangSmithAttributes(source))
     provider.add_span_processor(BatchSpanProcessor(exporter(source, capture_content=capture_content, loop=loop)))
     done.add(source)
     return provider

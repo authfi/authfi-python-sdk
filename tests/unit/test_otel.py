@@ -331,7 +331,7 @@ def test_register_adds_the_exporter_to_the_given_provider_once(platform: Platfor
         provider = TracerProvider()
         assert authfi_otel.register(m2m, tracer_provider=provider) is provider
         processors = len(provider._active_span_processor._span_processors)
-        assert processors == 2
+        assert processors == 3  # step attributes, LangSmith mapping, the exporter
         assert authfi_otel.register(m2m, tracer_provider=provider) is provider
         assert len(provider._active_span_processor._span_processors) == processors
         provider.shutdown()

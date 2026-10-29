@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import httpx
 
+from authfi._decision_span import record_decision
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
     CLOUD_PATH,
@@ -229,8 +230,13 @@ class _GatewayBase:
 
     @staticmethod
     def read_result(result: object) -> ToolOutcome:
-        """What the gateway did with one tool call (see :class:`ToolOutcome`)."""
-        return read_result(result)
+        """What the gateway did with one tool call (see :class:`ToolOutcome`).
+
+        The decision is also recorded as a child span of the current OpenTelemetry span, when there is one.
+        """
+        outcome = read_result(result)
+        record_decision(outcome)
+        return outcome
 
     @staticmethod
     def with_approval(arguments: Mapping[str, Any] | None, approval_id: str) -> dict[str, Any]:

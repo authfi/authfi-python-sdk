@@ -67,6 +67,10 @@ class DPoPKey:
             claims["nonce"] = nonce
         return jwt.encode(claims, self._key, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": self.public_jwk()})
 
+    def sign_jwt(self, claims: dict[str, Any], *, typ: str) -> str:
+        """A compact JWS of ``claims`` with this key (ES256), for the proofs an instance signs besides DPoP."""
+        return jwt.encode(claims, self._key, algorithm="ES256", headers={"typ": typ})
+
     def __repr__(self) -> str:
         return f"DPoPKey(thumbprint={self.thumbprint!r})"
 

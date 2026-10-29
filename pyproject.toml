@@ -54,6 +54,8 @@ langgraph = [
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
+# Auth for a graph deployed on LangSmith Deployment (authfi.langgraph_auth): the deployment already has langgraph-sdk.
+langgraph-auth = ["langgraph-sdk>=0.2,<1"]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
 claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2"]
 # Steps to AuthFI over OTLP/HTTP (authfi.otel); the SDK and the exporter are the OpenTelemetry project's.
