@@ -1,0 +1,57 @@
+# Publishes the package to PyPI when a GitHub release is published. PyPI trusts this workflow by
+# OpenID Connect (trusted publishing): there is no API token anywhere, and every file carries a
+# provenance attestation. The trusted publisher on pypi.org names this repository, this file and the
+# `pypi` environment, so a copy of the workflow elsewhere cannot publish.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  # Built without the publishing permission, so nothing the build runs can obtain the PyPI token.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+      - run: uv build --sdist --wheel --out-dir dist
+      # The release tag is the version: v1.2.3 publishes 1.2.3 and nothing else, so a tag on the wrong
+      # commit fails here instead of putting another version on PyPI, where it can never be replaced.
+      - name: The built version is the tag's
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          want="${TAG#v}"
+          ls dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              authfi-"$want".tar.gz|authfi-"$want"-*.whl) ;;
+              *) echo "::error::$f is not version $want (tag $TAG)"; exit 1 ;;
+            esac
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/authfi/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
