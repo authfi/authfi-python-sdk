@@ -350,10 +350,9 @@ class ADKIntegration:
         Turning content on is the tenant's policy decision.
         """
         os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true" if capture_content else "false"
-        if capture_content:
-            os.environ.pop("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", None)
-        else:
-            os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "NO_CONTENT"
+        # google-adk 2.13 puts content on its inference spans only in a span-bearing mode.
+        mode = "SPAN_ONLY" if capture_content else "NO_CONTENT"
+        os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = mode
         if self.agent_id:
             attributes = [
                 a

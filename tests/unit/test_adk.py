@@ -256,8 +256,9 @@ def test_tracing_has_no_content_unless_asked(adk: ADKIntegration, monkeypatch: p
     assert os.environ["OTEL_RESOURCE_ATTRIBUTES"] == f"service.name=x,authfi.agent_id={AGENT}"
     adk.configure_tracing(capture_content=True)
     assert os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] == "true"
-    assert "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT" not in os.environ
+    assert os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "SPAN_ONLY"
     monkeypatch.delenv("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS")
+    monkeypatch.delenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
 
 
 @pytest.fixture(scope="module")

@@ -38,6 +38,8 @@ authfi = "authfi.cli:main"
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
+# mcp stays below 2: its 2.x needs an httpx2 client factory where these adapters pass an httpx one (the OpenAI Agents
+# SDK refuses it outright), and langchain-mcp-adapters 0.3 itself requires mcp<2.
 # A framework extra covers the framework's major version, so a pip resolve is not held back for a minor release; where
 # an adapter reaches into the framework (no public seam), it checks that seam when it is imported and raises
 # IntegrationError naming the version it is tested with. The adapters job installs each extra at its lowest and its
@@ -45,17 +47,16 @@ flask = ["flask>=3.0,<4"]
 langchain = ["langchain-core>=1.0,<2"]
 # The ready-made Claude model. Its private seam is pinned to the tested minor.
 langchain-anthropic = ["authfi[langchain]", "langchain-anthropic>=1.7,<1.8"]
-# langchain-mcp-adapters 0.3 itself requires mcp<2, so this extra cannot allow mcp 2 until it does.
 langgraph = [
     "authfi[langchain]",
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
-openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<3"]
-claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<3"]
+openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
+claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2"]
 # litellm 1.92 releases import orjson without requiring it: the range excludes them.
-adk = ["google-adk>=2.12,<3", "litellm>=1.83,!=1.92.*,<2", "mcp>=1.30,<3"]
+adk = ["google-adk>=2.12,<3", "litellm>=1.83,!=1.92.*,<2", "mcp>=1.30,<2"]
 
 [project.urls]
 Homepage = "https://authfi.io"
