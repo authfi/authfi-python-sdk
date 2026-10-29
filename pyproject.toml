@@ -1,0 +1,197 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "authfi"
+dynamic = ["version"]
+description = "AuthFI SDK: sign people in, protect APIs, machine clients and AI agents on one OAuth core"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "AuthFI" }]
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28,<1",
+    "PyJWT[crypto]>=2.10,<3",
+    "cryptography>=44",
+    "typing_extensions>=4.12",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+[project.scripts]
+authfi = "authfi.cli:main"
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.115,<1"]
+flask = ["flask>=3.0,<4"]
+# Each framework extra pins the range its adapter is tested with: an adapter reaches into the
+# framework where it has no public seam, and checks that seam when it is imported.
+langchain = ["langchain-anthropic>=1.7,<1.8", "langsmith>=0.14,<1"]
+langgraph = [
+    "authfi[langchain]",
+    "langgraph>=1.2,<2",
+    "langchain-mcp-adapters>=0.3.2,<0.4",
+    "mcp>=1.30,<2",
+]
+openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
+claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
+# litellm 1.92 releases import orjson without requiring it, and 1.106 needs a newer mcp than google-adk 2.12
+# allows: the range excludes both, and the adapters job installs the newest version inside it.
+adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
+
+[project.urls]
+Homepage = "https://authfi.io"
+Documentation = "https://authfi.io/docs"
+Source = "https://github.com/authfi/authfi-python-sdk"
+Changelog = "https://github.com/authfi/authfi-python-sdk/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/authfi/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/authfi"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/authfi", "tests", "conformance", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
+
+[dependency-groups]
+# What the adapters job installs beside one extra, at that extra's lowest and newest versions.
+test = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.25,<2",
+    "hypothesis>=6.120,<7",
+    "sentry-sdk>=2.20,<3",
+    "rich>=13.9,<15",
+]
+# The weekly mutation run (Linux only): a surviving mutant is a missing test.
+mutation = ["mutmut==3.8.0"]
+dev = [
+    { include-group = "test" },
+    "pytest-cov>=6,<8",
+    "mypy>=1.15,<2",
+    "pyright>=1.1.390,<2",
+    "ruff>=0.9,<1",
+    "fastapi>=0.115,<1",
+    "flask>=3.0,<4",
+    "anthropic>=1.0,<2",
+    "openai>=3.0,<4",
+    "langchain-anthropic>=1.7,<1.8",
+    "langsmith>=0.14,<1",
+    "langgraph>=1.2,<2",
+    "langchain-mcp-adapters>=0.3.2,<0.4",
+    "mcp>=1.30,<2",
+    "openai-agents[litellm]>=0.24,<0.25",
+    "claude-agent-sdk>=0.2.168,<0.3",
+    "google-adk>=2.12,<2.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+markers = ["live: runs against a real AuthFI project; needs AUTHFI_LIVE_* settings"]
+filterwarnings = [
+    "error::authfi.errors.AuthFIDeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    # openai-agents 0.24 opens MCP sessions with the client mcp renamed
+    "ignore:Use `streamable_http_client` instead:DeprecationWarning",
+    # The fork-safety tests fork on purpose, after the adapter tests' local servers have started threads
+    "ignore:This process .* is multi-threaded, use of fork:DeprecationWarning",
+    # google-adk 2.12 announces its own experimental features and renames on every use
+    'ignore:\[EXPERIMENTAL\] feature:UserWarning',
+    "ignore:MCPTool class is deprecated:DeprecationWarning",
+]
+
+[tool.mutmut]
+# Every module is copied so the package imports; the weekly job selects which mutants run.
+source_paths = ["src/authfi/"]
+pytest_add_cli_args_test_selection = ["tests/unit/"]
+
+[tool.coverage.run]
+branch = true
+source = ["authfi"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src/authfi", "tests", "scripts", "examples"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["tests.compat.*"]
+warn_unreachable = false
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry", "opentelemetry.*"]
+ignore_missing_imports = true
+
+[tool.pyright]
+include = ["src/authfi", "tests", "scripts", "examples"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingModuleSource = false
+executionEnvironments = [
+    { root = "tests", extraPaths = ["."], reportPrivateUsage = false },
+    { root = "src" },
+    { root = "scripts" },
+    # Framework signatures carry unparameterised generics (LangGraph's Command), which strict mode
+    # reports on every call an example makes; the examples' own code is still checked in full.
+    { root = "examples", reportUnknownMemberType = false },
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "UP", "S", "D", "ANN", "ASYNC", "PT", "RUF", "TID", "I"]
+ignore = [
+    "D105",   # magic methods document themselves
+    "D107",   # the class docstring documents construction
+    "ANN401", # Any is used where a JSON value really is any JSON value
+    "D401",   # docstrings name what a function returns, as the standard library's do
+    "S105",   # "token" names a domain concept here, not a password; secrets are held in Secret
+    "S106",
+    "S107",
+    "ASYNC109", # the async clients take timeout= as the blocking ones do: one signature for both
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S101", "ANN", "PT011", "PT018"]
+"tests/compat/test_main_*.py" = ["PT009", "PT027"]  # main's unittest style, kept as written
+"scripts/**" = ["S603", "S607"]
+"examples/**" = ["T201", "INP001"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"

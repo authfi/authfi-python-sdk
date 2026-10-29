@@ -1,162 +1,173 @@
 # AuthFI Python SDK
 
-Official Python SDK for [AuthFI](https://authfi.io) — the identity control plane.
+The AuthFI SDK for Python: one OAuth core for every way your code meets AuthFI.
+
+- **People** sign in to your app.
+- **APIs** verify the tokens that reach them.
+- **Machine clients** call APIs with their own token.
+- **AI agents** hold their own key, act for a person with consent, and go through the AuthFI
+  gateways.
+
+Every area is made from one project client, so they share one discovery document, one key set
+and one HTTP connection pool.
 
 ## Install
 
+The package is installed from this repository until it is published:
+
 ```bash
-pip install authfi
+pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
 ```
 
-For RS256 signature verification (recommended for production):
-```bash
-pip install authfi PyJWT[crypto]
-```
+Python 3.11 or later. The dependencies are httpx, PyJWT and cryptography.
 
-## Quick Start (Flask)
+## The project client
 
 ```python
 from authfi import AuthFI
 
-auth = AuthFI(tenant='acme', api_key='sk_live_...')
+af = AuthFI("https://acme.authfi.io")   # your project's address; or AuthFI.from_env() reads AUTHFI_ISSUER
 
-@app.route('/api/users')
-@auth.require('read:users')
-def get_users():
-    user = auth.current_user()
-    return jsonify(users)
-
-# On startup
-auth.sync()
+metadata = af.metadata()                 # the discovery document, cached for its lifetime
+print(metadata.token_endpoint)
 ```
 
-## Quick Start (FastAPI)
+The issuer is the one required setting. Everything else is read from the project's discovery
+document. Create one client per project and share it: it owns the caches. In asyncio code, use
+`AsyncAuthFI`, which has the same methods as coroutines; create one per event loop.
+
+## Sign people in
+
+```python
+web = af.web_app(
+    client_id="app_web",
+    client_secret=Secret(os.environ["AUTHFI_CLIENT_SECRET"]),
+    redirect_uri="https://app.example.com/callback",
+    state_key=Secret(os.environ["AUTHFI_STATE_KEY"]),   # 32 random bytes, base64
+)
+
+pending = web.start_sign_in()                      # /login: redirect to pending.url,
+cookie = pending.dump()                            # and keep this encrypted blob in a cookie
+
+signed_in = web.finish_sign_in(callback_url, web.load_pending(cookie))   # /callback
+signed_in.user.email, signed_in.tokens
+```
+
+The code flow with PKCE, `state`, `nonce` and the callback's `iss` (RFC 9207), with the ID token
+verified. Refresh is one request per refresh token, shared; sign-out revokes the refresh token. See
+[docs/signin.md](docs/signin.md).
+
+## Protect an API
+
+```python
+from fastapi import Depends, FastAPI
+from authfi import AccessToken, AsyncAuthFI
+from authfi.fastapi import AuthFIBearer
+
+auth = AuthFIBearer(AsyncAuthFI.from_env().verifier(audience=["api_orders"]))
+app = FastAPI()
+auth.install(app)
+
+@app.get("/orders")
+async def orders(token: AccessToken = Depends(auth.require(permissions=["orders:read"]))):
+    return {"for": str(token.principal)}
+```
+
+`audience` is your API's client id (and your front ends' client ids, if your people call the API
+with their own tokens). Every token is checked for its type, issuer, audience, expiry and tenant;
+a refused one gets an opaque 401, and the precise reason goes to your log. Flask is supported as
+`authfi.flask.AuthFIFlask`. See [docs/verify.md](docs/verify.md).
+
+## Call an API as a machine client
+
+```python
+from authfi import AuthFI, Secret
+
+af = AuthFI.from_env()
+credential = af.client_credentials(
+    "app_reports", Secret(os.environ["AUTHFI_CLIENT_SECRET"]),
+    resource="api_orders", send_to=["https://api.example.com"],
+)
+httpx.Client(auth=credential.httpx_auth()).get("https://api.example.com/orders")
+```
+
+The token is reused and renewed before it expires, and is sent only to `send_to`. See
+[docs/machine.md](docs/machine.md).
+
+## Give an AI agent its own identity
+
+```bash
+authfi keygen --out agent.key      # register the printed public key on the agent in the console
+```
 
 ```python
 from authfi import AuthFI
-from fastapi import Depends
 
-auth = AuthFI(tenant='acme', api_key='sk_live_...')
-
-@app.get('/api/users')
-async def get_users(user=Depends(auth.require('read:users'))):
-    return users
+agent = AuthFI.from_env().agent_from_env()     # AUTHFI_AGENT_ID, AUTHFI_AGENT_KEY_FILE, AUTHFI_AGENT_KID
+httpx.Client(auth=agent.httpx_auth())          # its own token, for the AuthFI gateway
 ```
 
-## Agent authentication (AuthFI Agent Profile)
+The agent signs a short assertion with a key that never leaves the process; its token is reused
+and renewed before it expires. See [docs/agents.md](docs/agents.md).
 
-An AuthFI agent holds its **own** Ed25519 keypair. It authenticates by signing a short
-assertion (`private_key_jwt`, RFC 7523 §2.2) — the private half never leaves the process
-and is never sent to AuthFI. There is no client secret to leak, because an agent
-registered with a public JWK is issued none.
-
-### 1. Make a key, register the public half
+## Act for a person
 
 ```python
-from authfi import AgentKey
+# A caller with no browser approves on their own phone (CIBA):
+request = agent.request_user_token("priya@acme.com", binding_message="Refund order 4411")
+as_priya = agent.await_user_token(request)
 
-key = AgentKey.generate("k1")
-
-open("/run/secrets/agent.key", "w").write(key.private_pem())   # chmod 600, never sent
-print(key.public_jwk())   # {"kty":"OKP","crv":"Ed25519","x":"...","kid":"k1"}
+# A person signed in to your app (token exchange):
+as_her = agent.exchange(Secret(her_access_token))
 ```
 
-Register the agent with that **public** JWK and its `kid`. If you build a JWK by hand,
-run it through `assert_public_jwk(jwk)` first: a `d` where a public key belongs means the
-private key has been sent somewhere, and the key is burned rather than fixable.
+Each is a token whose subject is the person and whose actor is the agent. It never prints and
+never pickles.
 
-### 2. Authenticate
+## Errors
+
+Every error is an `authfi.AuthFIError`. Branch on its `code`, never on the message:
 
 ```python
-from authfi import AgentAuth, AgentKey
+from authfi import AuthFIError, OAuthError
 
-agent = AgentAuth(
-    agent_id="agt_...",
-    key=AgentKey.from_file("/run/secrets/agent.key", key_id="k1"),
-    platform_url="https://acme.authfi.io",   # your project's authfi.io address
-    audience="https://api.acme.com",   # optional — RFC 8707 resource
-)
-
-if agent.can("send_email_external"):
-    requests.post(url, headers=agent.auth_header(), json=payload)
+try:
+    metadata = af.metadata()
+except OAuthError as e:
+    match e.code:
+        case "invalid_client":
+            ...
+        case _:
+            raise
 ```
 
-Or from the environment — `AgentAuth.from_env()`:
+A code is an open set: keep a default arm, because the platform adds codes between releases.
 
-| Variable | |
-|---|---|
-| `AUTHFI_AGENT_ID` | the agent id (`agt_…`) |
-| `AUTHFI_AGENT_KEY_FILE` | path to the private key — **preferred** |
-| `AUTHFI_AGENT_KID` | the registered `kid` |
-| `AUTHFI_AGENT_PRIVATE_KEY` | PEM inline — fallback, warns |
-| `AUTHFI_PLATFORM_URL` | your project's authfi.io address, for example `https://acme.authfi.io` |
-| `AUTHFI_AGENT_AUDIENCE` | optional resource the token is for |
+## Secrets
 
-Prefer the file. A private key in an environment variable is visible in `ps`, inherited by
-every child process and captured in crash dumps.
+Client secrets, tokens and keys are held in `authfi.Secret`. It prints as `Secret('…')`, refuses
+to be pickled or serialised, and gives its value only through `reveal()`.
 
-Endpoints are read from `/.well-known/agent-configuration`, not hard-coded — the token
-endpoint moves with the project's origin, and the assertion's `aud` is built from the same
-document the server checks it against.
+## Documentation
 
-`agent.token()` caches and refreshes 60s before expiry. A refusal raises `AgentAuthError`
-carrying the registered OAuth code (`err.error` — `invalid_client`, `invalid_target`, …)
-and is **not** retried.
+- [The core: the project client, timeouts and retries, errors, secrets, credentials](docs/core.md)
+- [Signing people in to a web app](docs/signin.md)
+- [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
+- [Machine clients](docs/machine.md)
+- [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
+- [The AuthFI gateways: tools, models, cloud credentials](docs/gateway.md)
+- [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK, Claude Agent SDK, Google ADK](docs/frameworks.md)
+- Examples: [sign people in](examples/sign-in-web), [protect an API](examples/protect-an-api), [machine to machine](examples/machine-to-machine),
+  [agent identity](examples/agent-identity), [a caller with no browser](examples/agent-for-a-person-voice),
+  [a person signed in to your app](examples/agent-for-a-signed-in-user), [the action gate](examples/action-gate),
+  [models through the AI gateway](examples/agent-model-gateway),
+  [a LangChain model](examples/langchain-model), [approvals in LangGraph](examples/approvals-langgraph),
+  [approvals in the OpenAI Agents SDK](examples/approvals-openai-agents),
+  [approvals in the Claude Agent SDK](examples/approvals-claude-agent),
+  [approvals in Google ADK](examples/approvals-adk)
+- [Moving from 0.1](docs/migration-0.2.md)
+- [Changelog](CHANGELOG.md)
 
-`agent.capabilities()` is a set of capability **names**. Any constraint on a capability
-lives on the server-side grant record and is checked when the capability executes.
+## Licence
 
-### 3. Acting on a person's behalf (CIBA)
-
-The agent asks; the person approves out of band on a channel the agent does not hold.
-
-```python
-token = agent.token_as_user(
-    "priya@acme.com",
-    binding_message="Send the Q3 summary to the board?",
-    scope="send_email_external",
-)
-token["subject"]        # "user:priya@acme.com" — the PERSON
-token["access_token"]   # sub = the person, act.sub = this agent (RFC 8693 §4.1)
-```
-
-Split the two halves when the agent should not block:
-
-```python
-approval = agent.request_user_approval("priya@acme.com", binding_message="Send it?")
-# ... approval["auth_req_id"] is a bearer handle — store it like a credential ...
-token = agent.await_user_token(approval, timeout=300)
-```
-
-The poll honours the server's `interval` and widens it on `slow_down`. `access_denied`,
-`expired_token` and `invalid_grant` are decisions and stop it immediately.
-
-## Features
-
-- JWKS + RS256 verification (via PyJWT when installed)
-- `@auth.require("read:users")` — decorator for Flask/FastAPI
-- `@auth.require_role("admin")` — role-based access
-- Permission auto-sync on `sync()`
-- Agent authentication — `private_key_jwt` with Ed25519, discovery-driven
-- CIBA — an agent acting as a person who approved out of band
-- Cloud credentials (GCP/AWS/Azure/OCI)
-- Cloud token exchange
-- Works with Flask, FastAPI, Django, any WSGI/ASGI framework
-
-## Cloud Credentials (AuthFI Connect)
-
-```python
-creds = auth.cloud_credentials(user_token, 'aws', role_arn='arn:aws:iam::123:role/deploy')
-```
-
-## Running Tests
-
-```bash
-python -m unittest test_authfi -v
-```
-
-65 unit tests — all passing.
-
-## License
-
-MIT
+Apache-2.0. See [LICENSE](LICENSE).

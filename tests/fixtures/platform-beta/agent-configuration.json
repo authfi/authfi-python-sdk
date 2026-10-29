@@ -1,0 +1,45 @@
+{
+  "agent_id_scheme": "spiffe",
+  "algorithms": [
+    "EdDSA",
+    "ES256",
+    "PS256"
+  ],
+  "approval_methods": [
+    "ciba",
+    "authfi_hitl"
+  ],
+  "backchannel_authentication_endpoint": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize",
+  "backchannel_token_delivery_modes_supported": [
+    "poll"
+  ],
+  "backchannel_user_code_parameter_supported": false,
+  "default_location": "https://platform-beta.authfi.io/mcp",
+  "endpoints": {
+    "approval": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/approvals/{id}",
+    "authorize": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/authorize",
+    "backchannel_authorize": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/backchannel-authorize",
+    "register": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/register",
+    "request_approval": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/request-approval",
+    "token": "https://platform-beta.authfi.io/apis/regional/v1/ai/auth/token"
+  },
+  "grant_types_supported": [
+    "client_credentials",
+    "urn:openid:params:grant-type:ciba"
+  ],
+  "issuer": "https://platform-beta.authfi.io",
+  "jwks_uri": "https://platform-beta.authfi.io/.well-known/jwks.json",
+  "modes": [
+    "delegated",
+    "autonomous"
+  ],
+  "token_endpoint_auth_methods_supported": [
+    "private_key_jwt"
+  ],
+  "token_endpoint_auth_signing_alg_values_supported": [
+    "EdDSA",
+    "ES256",
+    "PS256"
+  ],
+  "version": "1.0"
+}

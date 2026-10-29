@@ -1,0 +1,11 @@
+{
+  "tools": [
+    {
+      "name": "deepwiki__read_wiki_structure",
+      "description": "Get a list of documentation topics for a GitHub repository",
+      "inputSchema": {"type": "object", "properties": {"repoName": {"type": "string"}}},
+      "annotations": {"io.authfi/governance": "no_policy_restriction"},
+      "_meta": {"io.authfi/scope": "mcp:deepwiki.read_wiki_structure"}
+    }
+  ]
+}

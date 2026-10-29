@@ -1,0 +1,421 @@
+"""Credentials: ``TokenSource``, the one interface every credential answers, and the person's ``TokenSet``.
+
+A machine client, an agent, a token an agent holds for a person, and a person's session are all
+a :class:`TokenSource` (or, in asyncio code, an :class:`AsyncTokenSource`). Framework adapters,
+the gateway helpers and HTTP clients take any of them. Each source knows where its credential may
+go (:attr:`TokenSource.send_to`), and refuses to put it anywhere else.
+
+``token()`` and ``headers()`` are the two places a credential leaves its :class:`~authfi.Secret`.
+Call them inside the request that needs the value, and keep no reference to what they return.
+"""
+
+from __future__ import annotations
+
+import abc
+import asyncio
+import hashlib
+import threading
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from types import ModuleType
+from typing import Any, ClassVar, Literal, NoReturn, Protocol, overload, runtime_checkable
+
+import httpx
+
+from authfi._cache import AsyncCache, SyncCache
+from authfi._clock import Clock
+from authfi._protocol.oauth import TokenResponse
+from authfi._protocol.urls import origin_of, validate_origin
+from authfi.errors import ConfigurationError
+from authfi.secret import Secret
+
+__all__ = [
+    "AsyncInMemoryTokenStore",
+    "AsyncTokenSource",
+    "AsyncTokenStore",
+    "Destinations",
+    "InMemoryTokenStore",
+    "TokenSet",
+    "TokenSource",
+    "TokenStore",
+]
+
+
+def check_destination(url: str, send_to: Sequence[str]) -> None:
+    """Refuse to send a credential to ``url`` unless its origin is one of ``send_to``."""
+    origin = origin_of(url)
+    if origin not in send_to:
+        raise ConfigurationError(
+            f"refusing to send this credential to {origin}: it may go only to {', '.join(send_to) or 'nowhere'}. "
+            "Name the API's origin in send_to when you create the credential.",
+            code="destination_not_allowed",
+        )
+
+
+def normalise_send_to(values: Sequence[str]) -> tuple[str, ...]:
+    """``values`` as exact origins, each checked; a bare string is refused."""
+    if isinstance(values, str):
+        raise ConfigurationError("send_to is a sequence of origins, such as ('https://api.example.com',)")
+    return tuple(dict.fromkeys(validate_origin(v) for v in values))
+
+
+class _Project(Protocol):
+    """What a destination rule reads from the project."""
+
+    def names_authfi(self, value: str | None) -> bool: ...
+
+    @property
+    def authfi_origins(self) -> tuple[str, ...]: ...
+
+
+class Destinations:
+    """Where one credential may be sent, decided when the credential is made.
+
+    A credential for AuthFI itself (no resource, ``<issuer>/mcp``, the console) may go to the
+    issuer and the API origin, plus any ``send_to`` given. A credential for a customer's API may go
+    only to ``send_to``, which is then required: its audience is that API, so it has no business
+    anywhere else, AuthFI included.
+    """
+
+    __slots__ = ("_extra", "_own", "_project")
+
+    def __init__(self, project: _Project, resource: str | None, send_to: Sequence[str]) -> None:
+        self._project = project
+        self._own = project.names_authfi(resource)
+        self._extra = normalise_send_to(send_to)
+        if not self._own and not self._extra:
+            raise ConfigurationError(
+                f"send_to is required with resource={resource!r}: name the API's origin, such as "
+                'send_to=["https://api.example.com"], so the credential can go nowhere else.'
+            )
+
+    @property
+    def origins(self) -> tuple[str, ...]:
+        """The allowed origins, now (the API origin may be learned from discovery)."""
+        if self._own:
+            return tuple(dict.fromkeys((*self._project.authfi_origins, *self._extra)))
+        return self._extra
+
+
+class TokenSource(abc.ABC):
+    """A credential that blocking code sends: ``token()``, ``headers()``, and an ``httpx.Auth``.
+
+    Subclass it to plug in a credential of your own. It is a nominal base class, not a protocol:
+    an :class:`AsyncTokenSource` is never an instance of it, so code that receives either can
+    dispatch on ``isinstance`` (or on :attr:`is_async`) without calling a coroutine as if it were
+    a function.
+    """
+
+    __slots__ = ()
+
+    is_async: ClassVar[Literal[False]] = False
+
+    @property
+    @abc.abstractmethod
+    def send_to(self) -> tuple[str, ...]:
+        """The origins this credential may be sent to."""
+
+    @abc.abstractmethod
+    def token(self, *, force: bool = False) -> str:
+        """The current token, renewed when due (or now, with ``force``). A reveal point: keep it brief."""
+
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        """The headers that carry this credential to ``url``. Refuses an origin not in :attr:`send_to`."""
+        check_destination(url, self.send_to)
+        return {"Authorization": "Bearer " + self.token()}
+
+    @overload
+    def httpx_auth(self) -> httpx.Auth: ...
+
+    @overload
+    def httpx_auth(self, module: ModuleType) -> Any: ...
+
+    def httpx_auth(self, module: ModuleType | None = None) -> Any:
+        """An ``httpx.Auth`` for ``httpx.Client``: a current credential on every request, origin-checked.
+
+        ``module`` is the httpx package the client comes from: ``httpx`` by default, or ``httpx2``,
+        which newer provider SDKs (``anthropic``, ``openai``) are built on.
+        """
+        if module is None or module is httpx:
+            return _SyncSourceAuth(self)
+        return _auth_class(module, blocking=True)(self)
+
+
+class AsyncTokenSource(abc.ABC):
+    """A credential that asyncio code sends. The same as :class:`TokenSource`, with coroutines."""
+
+    __slots__ = ()
+
+    is_async: ClassVar[Literal[True]] = True
+
+    @property
+    @abc.abstractmethod
+    def send_to(self) -> tuple[str, ...]:
+        """The origins this credential may be sent to."""
+
+    @abc.abstractmethod
+    async def token(self, *, force: bool = False) -> str:
+        """See :meth:`TokenSource.token`."""
+
+    async def headers(self, method: str, url: str) -> dict[str, str]:
+        """See :meth:`TokenSource.headers`."""
+        check_destination(url, self.send_to)
+        return {"Authorization": "Bearer " + await self.token()}
+
+    @overload
+    def httpx_auth(self) -> httpx.Auth: ...
+
+    @overload
+    def httpx_auth(self, module: ModuleType) -> Any: ...
+
+    def httpx_auth(self, module: ModuleType | None = None) -> Any:
+        """An ``httpx.Auth`` for ``httpx.AsyncClient``: a current credential on every request, origin-checked.
+
+        ``module`` is as in :meth:`TokenSource.httpx_auth`.
+        """
+        if module is None or module is httpx:
+            return _AsyncSourceAuth(self)
+        return _auth_class(module, blocking=False)(self)
+
+
+class _SyncSourceAuth(httpx.Auth):
+    def __init__(self, source: TokenSource) -> None:
+        self._source = source
+
+    def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers.update(self._source.headers(request.method, str(request.url)))
+        yield request
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        raise ConfigurationError(
+            "this credential is for blocking code; with httpx.AsyncClient use the AsyncAuthFI version of it"
+        )
+        yield request  # type: ignore[unreachable]  # pragma: no cover - makes this an async generator
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._source!r})"
+
+
+class _AsyncSourceAuth(httpx.Auth):
+    def __init__(self, source: AsyncTokenSource) -> None:
+        self._source = source
+
+    def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        raise ConfigurationError(
+            "this credential is for asyncio code; with httpx.Client use the AuthFI (blocking) version of it"
+        )
+        yield request  # type: ignore[unreachable]  # pragma: no cover - makes this a generator
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        request.headers.update(await self._source.headers(request.method, str(request.url)))
+        yield request
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self._source!r})"
+
+
+_auth_classes: dict[tuple[str, bool], type] = {}
+
+
+def _auth_class(module: ModuleType, *, blocking: bool) -> type:
+    """The auth class for another httpx package (httpx2): the same flows on that package's ``Auth``."""
+    key = (module.__name__, blocking)
+    if key not in _auth_classes:
+        base: type = getattr(module, "Auth")  # noqa: B009 - the package is chosen at run time
+        source_class = _SyncSourceAuth if blocking else _AsyncSourceAuth
+        namespace = {
+            "__init__": source_class.__init__,
+            "sync_auth_flow": source_class.sync_auth_flow,
+            "async_auth_flow": source_class.async_auth_flow,
+            "__repr__": source_class.__repr__,
+        }
+        _auth_classes[key] = type(f"{source_class.__name__}_{module.__name__}", (base,), namespace)
+    return _auth_classes[key]
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class TokenSet:
+    """A person's tokens from the token endpoint.
+
+    The tokens are :class:`~authfi.Secret`; the set does not pickle (a checkpoint stores a session
+    id, never tokens). Two sets are equal when they hold the same access and refresh tokens,
+    compared in constant time.
+    """
+
+    access_token: Secret
+    expires_at: datetime
+    refresh_token: Secret | None = None
+    id_token: Secret | None = None
+    scope: frozenset[str] = field(default_factory=frozenset[str])
+    token_type: str = "Bearer"
+
+    @classmethod
+    def from_response(cls, response: TokenResponse, now: float, previous: TokenSet | None = None) -> TokenSet:
+        """A set from a token answer received at wall-clock ``now``.
+
+        ``previous`` supplies what a refresh answer may leave out: the refresh token when it was not
+        rotated, the ID token, and the scope.
+        """
+        lifetime = response.expires_in if response.expires_in is not None else 0
+        return cls(
+            access_token=response.access_token,
+            expires_at=datetime.fromtimestamp(now + lifetime, UTC),
+            refresh_token=response.refresh_token or (previous.refresh_token if previous else None),
+            id_token=response.id_token or (previous.id_token if previous else None),
+            scope=response.scope if response.scope is not None else (previous.scope if previous else frozenset()),
+            token_type=response.token_type,
+        )
+
+    def expires_within(self, seconds: float, now: float) -> bool:
+        """``True`` when the access token expires within ``seconds`` of wall-clock ``now``."""
+        return self.expires_at.timestamp() - seconds <= now
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TokenSet):
+            return NotImplemented
+        return self.access_token == other.access_token and self.refresh_token == other.refresh_token
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        refresh = "yes" if self.refresh_token else "no"
+        return f"TokenSet(expires_at={self.expires_at.isoformat()}, scope={sorted(self.scope)!r}, refresh={refresh})"
+
+    def __copy__(self) -> TokenSet:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> TokenSet:
+        return self
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("A TokenSet cannot be pickled: store a session id, and keep the tokens in a TokenStore.")
+
+
+@runtime_checkable
+class TokenStore(Protocol):
+    """Where a person's :class:`TokenSet` lives between requests, shared by every worker.
+
+    ``compare_and_set`` makes a refresh atomic across workers: only the worker that replaces the
+    set it read stores its result; the others load the winner's. A refresh token is single-use,
+    so two workers refreshing the same one would sign the person out.
+    """
+
+    def load(self, key: str) -> TokenSet | None:
+        """The set stored under ``key``, or ``None``."""
+        ...
+
+    def compare_and_set(self, key: str, old: TokenSet | None, new: TokenSet) -> bool:
+        """Store ``new`` if the current value is ``old`` (``None``: absent). ``True`` when stored."""
+        ...
+
+
+@runtime_checkable
+class AsyncTokenStore(Protocol):
+    """The asyncio form of :class:`TokenStore`."""
+
+    async def load(self, key: str) -> TokenSet | None:
+        """See :meth:`TokenStore.load`."""
+        ...
+
+    async def compare_and_set(self, key: str, old: TokenSet | None, new: TokenSet) -> bool:
+        """See :meth:`TokenStore.compare_and_set`."""
+        ...
+
+
+class InMemoryTokenStore:
+    """A :class:`TokenStore` in this process's memory: for one process only (tests, a single worker)."""
+
+    def __init__(self) -> None:
+        self._sets: dict[str, TokenSet] = {}
+        self._lock = threading.Lock()
+
+    def load(self, key: str) -> TokenSet | None:
+        """See :meth:`TokenStore.load`."""
+        with self._lock:
+            return self._sets.get(key)
+
+    def compare_and_set(self, key: str, old: TokenSet | None, new: TokenSet) -> bool:
+        """See :meth:`TokenStore.compare_and_set`."""
+        with self._lock:
+            current = self._sets.get(key)
+            if current is not old and current != old:
+                return False
+            self._sets[key] = new
+            return True
+
+    def __repr__(self) -> str:
+        return f"InMemoryTokenStore({len(self._sets)} sets)"
+
+
+class AsyncInMemoryTokenStore:
+    """An :class:`AsyncTokenStore` in this process's memory: for one process only."""
+
+    def __init__(self) -> None:
+        self._sets: dict[str, TokenSet] = {}
+        self._lock = asyncio.Lock()
+
+    async def load(self, key: str) -> TokenSet | None:
+        """See :meth:`TokenStore.load`."""
+        async with self._lock:
+            return self._sets.get(key)
+
+    async def compare_and_set(self, key: str, old: TokenSet | None, new: TokenSet) -> bool:
+        """See :meth:`TokenStore.compare_and_set`."""
+        async with self._lock:
+            current = self._sets.get(key)
+            if current is not old and current != old:
+                return False
+            self._sets[key] = new
+            return True
+
+    def __repr__(self) -> str:
+        return f"AsyncInMemoryTokenStore({len(self._sets)} sets)"
+
+
+# A finished refresh is not remembered. Callers that overlap share one refresh; a caller that comes
+# later with the spent refresh token goes to the server, which refuses it (invalid_grant), because a
+# replayed refresh token is never answered from memory.
+_REMEMBER_REFRESH = 0.0
+
+
+def _refresh_key(refresh_token: Secret) -> str:
+    return hashlib.sha256(refresh_token.reveal().encode("utf-8")).hexdigest()
+
+
+class RefreshGate:
+    """One refresh per refresh token at a time across threads, and its result shared with the callers waiting."""
+
+    def __init__(self, clock: Clock) -> None:
+        self._cache: SyncCache[TokenSet] = SyncCache(clock, max_entries=1024)
+
+    def run(self, refresh_token: Secret, refresh: Callable[[], TokenSet]) -> TokenSet:
+        """``refresh()`` once for ``refresh_token``; callers that overlap in time get its result.
+
+        A caller that arrives after it finished runs ``refresh`` itself: the refresh token is spent,
+        and the server's refusal, not an earlier answer, is what it is told.
+        """
+        return self._cache.get(_refresh_key(refresh_token), lambda: (refresh(), _REMEMBER_REFRESH))
+
+    def after_fork(self) -> None:
+        """See :meth:`authfi._cache.SyncCache.after_fork`."""
+        self._cache.after_fork()
+
+
+class AsyncRefreshGate:
+    """One refresh per refresh token at a time across tasks, and its result shared with the tasks waiting."""
+
+    def __init__(self, clock: Clock) -> None:
+        self._cache: AsyncCache[TokenSet] = AsyncCache(clock, max_entries=1024)
+
+    async def run(self, refresh_token: Secret, refresh: Callable[[], Awaitable[TokenSet]]) -> TokenSet:
+        """See :meth:`RefreshGate.run`; ``refresh`` is a coroutine function."""
+
+        async def fetch() -> tuple[TokenSet, float]:
+            return await refresh(), _REMEMBER_REFRESH
+
+        return await self._cache.get(_refresh_key(refresh_token), fetch)
+
+    def after_fork(self) -> None:
+        """See :meth:`authfi._cache.AsyncCache.after_fork`."""
+        self._cache.after_fork()
