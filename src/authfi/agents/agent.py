@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, cast, overload
 
 from typing_extensions import deprecated
 
+from authfi import _dpop
 from authfi._cache import AsyncCache, SyncCache
 from authfi._protocol.agent import (
     CIBA_GRANT,
@@ -38,6 +39,7 @@ from authfi._protocol.agent import (
     AgentEndpoints,
     ApprovalRecord,
     CibaStart,
+    TaskPending,
     approval_request,
     authorize_request,
     ciba_poll_flow,
@@ -48,8 +50,10 @@ from authfi._protocol.agent import (
     parse_agent_configuration,
     parse_approval,
     parse_ciba_start,
+    parse_task_start,
     parse_transaction_token,
     read_approval_request,
+    task_request,
     transaction_token_request,
 )
 from authfi._protocol.discovery import ServerMetadata, ttl_from_headers
@@ -57,17 +61,19 @@ from authfi._protocol.http import DOCUMENT_LIMIT, HttpRequest, HttpResponse, Ret
 from authfi._protocol.oauth import ClientAuth, TokenResponse, client_credentials_request, parse_token_response
 from authfi.agents._legacy import LegacyAgentMixin, is_legacy_agent, legacy_agent_arguments
 from authfi.agents.keys import Signer, client_assertion
+from authfi.agents.task import AsyncTask, Task, refuse_nested
 from authfi.errors import (
     AuthFIDeprecationWarning,
     ConfigurationError,
     ConsentExpired,
     DiscoveryError,
     NotSupportedError,
+    OAuthError,
     WaitTimeout,
 )
-from authfi.gateway import AsyncGateway, Gateway
+from authfi.gateway import AsyncCloudAccess, AsyncGateway, CloudAccess, Gateway
 from authfi.secret import Secret
-from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
+from authfi.tokens import AsyncTokenSource, Destinations, TokenSource, check_destination
 from authfi.verify import Principal
 
 if TYPE_CHECKING:
@@ -174,6 +180,8 @@ class _Minted:
     access_token: Secret
     capabilities: frozenset[str]
     expires_at: float
+    #: The key the token is bound to (``cnf.jkt``), or ``None`` for a Bearer token.
+    key: _dpop.DPoPKey | None = None
 
 
 def _capabilities(response: TokenResponse) -> frozenset[str]:
@@ -259,6 +267,7 @@ class _AgentBase:
         send_to: Sequence[str],
         refresh_skew: float,
         legacy: bool = False,
+        dpop: bool = True,
     ) -> None:
         agent = str(agent_id or "").strip()
         if not agent:
@@ -277,10 +286,14 @@ class _AgentBase:
             self._refuse_customer_resource(project, send_to)
         self._destinations = Destinations(project, self.resource, send_to)
         self.refresh_skew = float(refresh_skew)
+        #: ``False`` for a credential handed to a process that cannot hold this one's key (a Bearer token).
+        self.dpop = bool(dpop)
         self._project_ref = project
         self._auth = ClientAuth.private_key_jwt(agent, self._assertion)
         self._clock = project.clock
         self._log = project.logger
+        #: The key of the token whose headers were last made: what a gateway call signs its proof with.
+        self._last_key: _dpop.DPoPKey | None = None
 
     def _refuse_customer_resource(self, project: AuthFI | AsyncAuthFI, send_to: Sequence[str]) -> None:
         """The agent's own token is for AuthFI; a customer API's token is ``for_resource(...)``.
@@ -310,10 +323,70 @@ class _AgentBase:
     def _resource(self, resource: str | None) -> str | None:
         return resource.strip() if resource else self.resource
 
-    def _minted(self, response: TokenResponse) -> tuple[_Minted, float]:
+    def _minted(self, response: TokenResponse, key: _dpop.DPoPKey | None) -> tuple[_Minted, float]:
         lifetime = float(response.expires_in or 300)
-        minted = _Minted(response.access_token, _capabilities(response), self._clock.time() + lifetime)
+        minted = _Minted(response.access_token, _capabilities(response), self._clock.time() + lifetime, key)
         return minted, max(1.0, lifetime - self.refresh_skew)
+
+    def _proof_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
+        """The run key to bind a token for ``resource`` to: this process's, if the project accepts its algorithm.
+
+        Only a token for AuthFI itself is bound. One for a customer's API is a Bearer token: that API verifies it,
+        and an API verifying with this SDK does not take a proof.
+        """
+        if not self.dpop or not self._project_ref.names_authfi(resource):
+            return None
+        key = _dpop.key_for(metadata.dpop_signing_alg_values_supported)
+        if key is None:
+            self._log.info("the project accepts no DPoP algorithm this process has: agent tokens stay Bearer")
+        return key
+
+    def _signer(self, key: _dpop.DPoPKey | None) -> Callable[[str, str, str | None], str] | None:
+        return _dpop.signer(key, self._clock.time) if key is not None else None
+
+    def _bearing(
+        self, minted: _Minted, method: str, url: str, send_to: Sequence[str] | None = None
+    ) -> _dpop.AuthHeaders:
+        """The headers that send ``minted`` to ``url``: a proof of its key when it is bound.
+
+        ``send_to`` is where the token may go: AuthFI's origins unless it is for a customer's API.
+        """
+        check_destination(url, self.send_to if send_to is None else send_to)
+        self._last_key = minted.key
+        return _dpop.authorization_headers(
+            minted.access_token.reveal(), minted.key, method, url, clock=self._clock.time
+        )
+
+    def _task_actor(self, key: _dpop.DPoPKey) -> Callable[[str], str]:
+        """Signs the actor assertion of a task's start: the agent's, naming the key that will hold the task."""
+
+        def sign(audience: str) -> str:
+            return client_assertion(
+                self.key, self.agent_id, audience, now=self._clock.time(), confirmation={"jkt": key.thumbprint}
+            )
+
+        return sign
+
+    def _task_key(self, metadata: ServerMetadata) -> _dpop.DPoPKey:
+        _exchange_supported(metadata)
+        key = _dpop.key_for(metadata.dpop_signing_alg_values_supported)
+        if key is None:
+            raise NotSupportedError(
+                "dpop", "This AuthFI project accepts no DPoP key this process can make, so it cannot hold a task."
+            )
+        return key
+
+    def _task_root(self, response: TokenResponse, key: _dpop.DPoPKey) -> _dpop.DPoPKey:
+        held = _dpop.bound_key(response, key)
+        if held is None:
+            raise OAuthError(
+                "invalid_response", "the token endpoint answered a task that no key holds: it is not usable", 200
+            )
+        return held
+
+    def _pending_task(self, pending: TaskPending) -> TaskPending:
+        self._log.info("agent %s asked a person to approve task %s", self.agent_id, pending.mandate_id)
+        return pending
 
     def _ciba_request(self, start: CibaStart, now: float) -> CibaRequest:
         return CibaRequest(
@@ -352,6 +425,22 @@ class _AgentResource(TokenSource):
         """The agent's token for this resource."""
         return self._agent.token(resource=self._resource, force=force)
 
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        """The token for this resource to ``url``, with a proof of its key when it is bound."""
+        check_destination(url, self.send_to)
+        minted = self._agent._own(self._resource, False)  # pyright: ignore[reportPrivateUsage]
+        return self._agent._bearing(minted, method, url, self.send_to)  # pyright: ignore[reportPrivateUsage]
+
+    def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if self._agent._own(self._resource, False).key is not None and _dpop.learn_nonce(  # pyright: ignore[reportPrivateUsage]
+            url, status, www_authenticate, nonce
+        ):
+            return self.headers(method, url)
+        return None
+
     def __repr__(self) -> str:
         return f"AgentAuth.for_resource({self._resource!r})"
 
@@ -377,10 +466,11 @@ class DelegatedToken(TokenSource):
         via: Literal["ciba", "exchange"],
         agent_id: str,
         destinations: Destinations,
-        renew: Callable[[], TokenResponse] | None,
+        renew: Callable[[], tuple[TokenResponse, _dpop.DPoPKey | None]] | None,
         refresh_skew: float,
         time: Callable[[], float],
         project: Any = None,
+        key: _dpop.DPoPKey | None = None,
     ) -> None:
         #: The project that issued the token: what the gateway helpers and adapters attach to.
         self.project = project
@@ -392,14 +482,14 @@ class DelegatedToken(TokenSource):
         self._lock = threading.Lock()
         self.subject: Principal
         self.actor: Principal
-        self._current: tuple[Secret, float, frozenset[str]]
-        self._take(response, agent_id)
+        self._current: tuple[Secret, float, frozenset[str], _dpop.DPoPKey | None]
+        self._take(response, key, agent_id)
 
-    def _take(self, response: TokenResponse, agent_id: str) -> None:
+    def _take(self, response: TokenResponse, key: _dpop.DPoPKey | None, agent_id: str) -> None:
         subject, actor, scopes = _labels(response.access_token.reveal(), agent_id)
         self.subject, self.actor = subject, actor
         lifetime = float(response.expires_in or 300)
-        self._current = (response.access_token, self._time() + lifetime, response.scope or scopes)
+        self._current = (response.access_token, self._time() + lifetime, response.scope or scopes, key)
 
     @property
     def send_to(self) -> tuple[str, ...]:
@@ -419,7 +509,7 @@ class DelegatedToken(TokenSource):
     def token(self, *, force: bool = False) -> str:
         """The current token; renewed (exchange) or refused (:class:`ConsentExpired`) near its expiry."""
         with self._lock:
-            token, expires_at, _ = self._current
+            token, expires_at, *_ = self._current
             if not force and self._time() < expires_at - self._skew:
                 return token.reveal()
             if self._renew is None:
@@ -427,8 +517,26 @@ class DelegatedToken(TokenSource):
                     "expired_token",
                     f"the token acting for {self.subject} has run out, and only they can approve again",
                 )
-            self._take(self._renew(), self.actor.id)
+            self._take(*self._renew(), self.actor.id)
             return self._current[0].reveal()
+
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        """The token to ``url``, with a proof of its key when it is bound to one."""
+        check_destination(url, self.send_to)
+        token = self.token()
+        return _dpop.authorization_headers(token, self._current[3], method, url, clock=self._time)
+
+    def bound_key(self) -> _dpop.DPoPKey | None:
+        """The key the token is bound to, or ``None`` for a Bearer token."""
+        return self._current[3]
+
+    def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if self._current[3] is not None and _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return self.headers(method, url)
+        return None
 
     def __repr__(self) -> str:
         return (
@@ -461,10 +569,11 @@ class AsyncDelegatedToken(AsyncTokenSource):
         via: Literal["ciba", "exchange"],
         agent_id: str,
         destinations: Destinations,
-        renew: Callable[[], Awaitable[TokenResponse]] | None,
+        renew: Callable[[], Awaitable[tuple[TokenResponse, _dpop.DPoPKey | None]]] | None,
         refresh_skew: float,
         time: Callable[[], float],
         project: Any = None,
+        key: _dpop.DPoPKey | None = None,
     ) -> None:
         #: The project that issued the token: what the gateway helpers and adapters attach to.
         self.project = project
@@ -476,14 +585,14 @@ class AsyncDelegatedToken(AsyncTokenSource):
         self._lock = asyncio.Lock()
         self.subject: Principal
         self.actor: Principal
-        self._current: tuple[Secret, float, frozenset[str]]
-        self._take(response, agent_id)
+        self._current: tuple[Secret, float, frozenset[str], _dpop.DPoPKey | None]
+        self._take(response, key, agent_id)
 
-    def _take(self, response: TokenResponse, agent_id: str) -> None:
+    def _take(self, response: TokenResponse, key: _dpop.DPoPKey | None, agent_id: str) -> None:
         subject, actor, scopes = _labels(response.access_token.reveal(), agent_id)
         self.subject, self.actor = subject, actor
         lifetime = float(response.expires_in or 300)
-        self._current = (response.access_token, self._time() + lifetime, response.scope or scopes)
+        self._current = (response.access_token, self._time() + lifetime, response.scope or scopes, key)
 
     @property
     def send_to(self) -> tuple[str, ...]:
@@ -503,7 +612,7 @@ class AsyncDelegatedToken(AsyncTokenSource):
     async def token(self, *, force: bool = False) -> str:
         """See :meth:`DelegatedToken.token`."""
         async with self._lock:
-            token, expires_at, _ = self._current
+            token, expires_at, *_ = self._current
             if not force and self._time() < expires_at - self._skew:
                 return token.reveal()
             if self._renew is None:
@@ -511,8 +620,26 @@ class AsyncDelegatedToken(AsyncTokenSource):
                     "expired_token",
                     f"the token acting for {self.subject} has run out, and only they can approve again",
                 )
-            self._take(await self._renew(), self.actor.id)
+            self._take(*(await self._renew()), self.actor.id)
             return self._current[0].reveal()
+
+    async def headers(self, method: str, url: str) -> dict[str, str]:
+        """See :meth:`DelegatedToken.headers`."""
+        check_destination(url, self.send_to)
+        token = await self.token()
+        return _dpop.authorization_headers(token, self._current[3], method, url, clock=self._time)
+
+    def bound_key(self) -> _dpop.DPoPKey | None:
+        """The key the token is bound to, or ``None`` for a Bearer token."""
+        return self._current[3]
+
+    async def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if self._current[3] is not None and _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return await self.headers(method, url)
+        return None
 
     def __repr__(self) -> str:
         return (
@@ -553,6 +680,14 @@ def _subject_value(subject_token: TokenSource | Secret) -> str:
     raise ConfigurationError("subject_token must be a TokenSource or a Secret, never a plain string")
 
 
+async def _async_subject_value(subject_token: AsyncTokenSource | Secret) -> str:
+    if isinstance(subject_token, Secret):
+        return subject_token.reveal()
+    if isinstance(subject_token, AsyncTokenSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return await subject_token.token()
+    raise ConfigurationError("subject_token must be an AsyncTokenSource or a Secret, never a plain string")
+
+
 class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
     """An AI agent, for blocking code. Make it with :meth:`authfi.AuthFI.agent`.
 
@@ -569,6 +704,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         *,
         resource: str | None = None,
         refresh_skew: float = 60.0,
+        dpop: bool = True,
     ) -> None: ...
 
     @overload
@@ -605,9 +741,17 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         send_to: Sequence[str] = (),
         refresh_skew: float = 60.0,
         legacy: bool = False,
+        dpop: bool = True,
     ) -> None:
         super().__init__(
-            project, agent_id, key, resource=resource, send_to=send_to, refresh_skew=refresh_skew, legacy=legacy
+            project,
+            agent_id,
+            key,
+            resource=resource,
+            send_to=send_to,
+            refresh_skew=refresh_skew,
+            legacy=legacy,
+            dpop=dpop,
         )
         self.project = project
         self._tokens: SyncCache[_Minted] = SyncCache(project.clock, max_entries=32)
@@ -622,10 +766,14 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
     def _mint(self, resource: str | None) -> tuple[_Minted, float]:
         metadata = self.project.metadata()
         _check_agent_grant(metadata, self.key)
-        request = client_credentials_request(metadata.token_endpoint, self._auth, resource=resource)
+        key = self._proof_key(metadata, resource)
+        request = client_credentials_request(
+            metadata.token_endpoint, self._auth, resource=resource, dpop=self._signer(key)
+        )
         response = parse_token_response(self._send(request), "the token endpoint")
-        self._log.debug("minted a token for agent %s", self.agent_id)
-        return self._minted(response)
+        held = _dpop.bound_key(response, key)
+        self._log.debug("minted a %s token for agent %s", "DPoP-bound" if held else "Bearer", self.agent_id)
+        return self._minted(response, held)
 
     def _own(self, resource: str | None, force: bool) -> _Minted:
         chosen = self._resource(resource)
@@ -652,6 +800,23 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             )
             resource = resource or audience
         return self._own(resource, force).access_token.reveal()
+
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        """The agent's credential to ``url``: ``Authorization: DPoP`` and a fresh proof when its token is bound."""
+        check_destination(url, self.send_to)  # before a token is minted for nowhere
+        return self._bearing(self._own(None, False), method, url)
+
+    def bound_key(self) -> _dpop.DPoPKey | None:
+        """The key the agent's token is bound to, or ``None`` for a Bearer token."""
+        return self._own(None, False).key
+
+    def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if self.bound_key() is not None and _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return self.headers(method, url)
+        return None
 
     def capabilities(self, *, resource: str | None = None) -> frozenset[str]:
         """The capability names granted to the agent, as its token carries them."""
@@ -747,6 +912,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         chosen = self._resource(resource)
         destinations = self._check_destination_args(chosen, send_to)
         metadata = self.project.metadata()
+        key = self._proof_key(metadata, chosen)
         flow = ciba_poll_flow(
             metadata.token_endpoint,
             self._auth,
@@ -756,6 +922,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             request_deadline=request.deadline,
             now=self._clock.monotonic,
             resource=chosen,
+            dpop=self._signer(key),
         )
         response = self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
         self._log.info("agent %s now acts for a person (CIBA)", self.agent_id)
@@ -768,6 +935,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            key=_dpop.bound_key(response, key),
         )
 
     def token_as_user(
@@ -809,8 +977,9 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         destinations = self._check_destination_args(chosen, send_to)
         metadata = self.project.metadata()
         _exchange_supported(metadata)
+        key = self._proof_key(metadata, chosen)
 
-        def mint() -> TokenResponse:
+        def mint() -> tuple[TokenResponse, _dpop.DPoPKey | None]:
             if isinstance(subject_token, Secret) and not _secret_alive(subject_token, self._clock.time()):
                 raise ConsentExpired("expired_token", "the person's own token has expired; they must sign in again")
             request = exchange_request(
@@ -819,11 +988,15 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
                 actor_token=self._authfi_bearer(),
                 resource=chosen,
                 scope=scope,
+                dpop=self._signer(key),
             )
-            return parse_token_response(self._send(request), "the token endpoint")
+            response = parse_token_response(self._send(request), "the token endpoint")
+            return response, _dpop.bound_key(response, key)
 
+        first, held = mint()
         delegated = DelegatedToken(
-            response=mint(),
+            response=first,
+            key=held,
             via="exchange",
             agent_id=self.agent_id,
             destinations=destinations,
@@ -834,6 +1007,94 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
+
+    # --- tasks ---------------------------------------------------------------------------------------
+
+    def request_task(
+        self,
+        template: str,
+        *,
+        subject_token: TokenSource | Secret,
+        params: Mapping[str, Any] | None = None,
+        ttl_seconds: int | None = None,
+    ) -> Task | TaskPending:
+        """Ask for a task: a person's authority for one piece of work, bounded by a template of the project's.
+
+        ``subject_token`` is the person's token from an app linked to this agent (their session, a
+        :class:`~authfi.TokenSource`, or their access token as a :class:`~authfi.Secret`). The answer is
+        the :class:`~authfi.Task`, or a :class:`~authfi.TaskPending` when the person must approve first:
+        show them ``approval_url`` and wait with :meth:`await_task`. A task is one level deep: this is refused
+        inside one.
+        """
+        refuse_nested()
+        metadata = self.project.metadata()
+        key = self._task_key(metadata)
+        request = task_request(
+            metadata.token_endpoint,
+            subject_token=_subject_value(subject_token),
+            actor_assertion=self._task_actor(key),
+            template=template,
+            params=params,
+            ttl_seconds=ttl_seconds,
+            resource=None,
+            dpop=_dpop.signer(key, self._clock.time),
+        )
+        started = parse_task_start(self._send(request))
+        if isinstance(started, TaskPending):
+            return self._pending_task(started)
+        task = Task(self, started, self._task_root(started, key), self._clock.time)
+        self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
+        return task
+
+    def await_task(self, pending: TaskPending, *, timeout: float = 300.0, poll_interval: float | None = None) -> Task:
+        """Wait for the person's decision on a task, then return it.
+
+        As :meth:`await_user_token`: :class:`~authfi.ConsentDenied` when they refuse,
+        :class:`~authfi.ConsentExpired` when it ran out, :class:`~authfi.WaitTimeout` when ``timeout``
+        passes first (the request stays open, and waiting again continues it).
+        """
+        refuse_nested()
+        metadata = self.project.metadata()
+        key = self._task_key(metadata)
+        flow = ciba_poll_flow(
+            metadata.token_endpoint,
+            self._auth,
+            auth_req_id=pending.auth_req_id,
+            interval=_ciba_interval(pending.interval, poll_interval),
+            wait_deadline=self._clock.monotonic() + timeout,
+            request_deadline=math.inf,
+            now=self._clock.monotonic,
+            resource=None,
+            dpop=_dpop.signer(key, self._clock.time),
+        )
+        response = self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
+        task = Task(self, response, self._task_root(response, key), self._clock.time)
+        self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
+        return task
+
+    def task(
+        self,
+        template: str,
+        *,
+        subject_token: TokenSource | Secret,
+        params: Mapping[str, Any] | None = None,
+        ttl_seconds: int | None = None,
+        timeout: float = 300.0,
+    ) -> Task:
+        """A task, waiting for the person's approval when it needs one. Use it as ``with agent.task(...) as task:``.
+
+        The task is a credential: give it to an adapter in place of the agent (``LangGraphIntegration(task)``),
+        or take ``task.gateway()``. Leaving the ``with`` forgets it.
+        """
+        started = self.request_task(template, subject_token=subject_token, params=params, ttl_seconds=ttl_seconds)
+        if isinstance(started, TaskPending):
+            return self.await_task(started, timeout=timeout)
+        return started
+
+    @property
+    def cloud(self) -> CloudAccess:
+        """Short-lived cloud credentials through the gateway: ``agent.cloud.credentials(account, role)``."""
+        return self._gateway.cloud
 
     # --- the gateways --------------------------------------------------------------------------------
 
@@ -971,8 +1232,9 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         *,
         resource: str | None = None,
         refresh_skew: float = 60.0,
+        dpop: bool = True,
     ) -> None:
-        super().__init__(project, agent_id, key, resource=resource, send_to=(), refresh_skew=refresh_skew)
+        super().__init__(project, agent_id, key, resource=resource, send_to=(), refresh_skew=refresh_skew, dpop=dpop)
         self.project = project
         self._tokens: AsyncCache[_Minted] = AsyncCache(project.clock, max_entries=32)
         self._endpoints: AsyncCache[AgentEndpoints] = AsyncCache(project.clock, max_entries=1)
@@ -984,10 +1246,14 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
     async def _mint(self, resource: str | None) -> tuple[_Minted, float]:
         metadata = await self.project.metadata()
         _check_agent_grant(metadata, self.key)
-        request = client_credentials_request(metadata.token_endpoint, self._auth, resource=resource)
+        key = self._proof_key(metadata, resource)
+        request = client_credentials_request(
+            metadata.token_endpoint, self._auth, resource=resource, dpop=self._signer(key)
+        )
         response = parse_token_response(await self._send(request), "the token endpoint")
-        self._log.debug("minted a token for agent %s", self.agent_id)
-        return self._minted(response)
+        held = _dpop.bound_key(response, key)
+        self._log.debug("minted a %s token for agent %s", "DPoP-bound" if held else "Bearer", self.agent_id)
+        return self._minted(response, held)
 
     async def _own(self, resource: str | None, force: bool) -> _Minted:
         chosen = self._resource(resource)
@@ -1000,6 +1266,23 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
     async def token(self, *, resource: str | None = None, force: bool = False) -> str:
         """See :meth:`AgentAuth.token`."""
         return (await self._own(resource, force)).access_token.reveal()
+
+    async def headers(self, method: str, url: str) -> dict[str, str]:
+        """See :meth:`AgentAuth.headers`."""
+        check_destination(url, self.send_to)  # before a token is minted for nowhere
+        return self._bearing(await self._own(None, False), method, url)
+
+    def bound_key(self) -> _dpop.DPoPKey | None:
+        """The key of the headers last made, or ``None`` for a Bearer token."""
+        return self._last_key
+
+    async def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if self.bound_key() is not None and _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return await self.headers(method, url)
+        return None
 
     async def capabilities(self, *, resource: str | None = None) -> frozenset[str]:
         """See :meth:`AgentAuth.capabilities`."""
@@ -1048,6 +1331,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         chosen = self._resource(resource)
         destinations = self._check_destination_args(chosen, send_to)
         metadata = await self.project.metadata()
+        key = self._proof_key(metadata, chosen)
         flow = ciba_poll_flow(
             metadata.token_endpoint,
             self._auth,
@@ -1057,6 +1341,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             request_deadline=request.deadline,
             now=self._clock.monotonic,
             resource=chosen,
+            dpop=self._signer(key),
         )
         response = await self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
         self._log.info("agent %s now acts for a person (CIBA)", self.agent_id)
@@ -1069,6 +1354,7 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            key=_dpop.bound_key(response, key),
         )
 
     async def token_as_user(
@@ -1104,8 +1390,9 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         destinations = self._check_destination_args(chosen, send_to)
         metadata = await self.project.metadata()
         _exchange_supported(metadata)
+        key = self._proof_key(metadata, chosen)
 
-        async def mint() -> TokenResponse:
+        async def mint() -> tuple[TokenResponse, _dpop.DPoPKey | None]:
             if isinstance(subject_token, Secret):
                 if not _secret_alive(subject_token, self._clock.time()):
                     raise ConsentExpired("expired_token", "the person's own token has expired; they must sign in again")
@@ -1120,11 +1407,15 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
                 actor_token=await self._authfi_bearer(),
                 resource=chosen,
                 scope=scope,
+                dpop=self._signer(key),
             )
-            return parse_token_response(await self._send(request), "the token endpoint")
+            response = parse_token_response(await self._send(request), "the token endpoint")
+            return response, _dpop.bound_key(response, key)
 
+        first, held = await mint()
         delegated = AsyncDelegatedToken(
-            response=await mint(),
+            response=first,
+            key=held,
             via="exchange",
             agent_id=self.agent_id,
             destinations=destinations,
@@ -1135,6 +1426,96 @@ class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
+
+    # --- tasks ---------------------------------------------------------------------------------------
+
+    async def request_task(
+        self,
+        template: str,
+        *,
+        subject_token: AsyncTokenSource | Secret,
+        params: Mapping[str, Any] | None = None,
+        ttl_seconds: int | None = None,
+    ) -> AsyncTask | TaskPending:
+        """Ask for a task: a person's authority for one piece of work, bounded by a template of the project's.
+
+        ``subject_token`` is the person's token from an app linked to this agent (their session, a
+        :class:`~authfi.TokenSource`, or their access token as a :class:`~authfi.Secret`). The answer is
+        the :class:`~authfi.AsyncTask`, or a :class:`~authfi.TaskPending` when the person must approve first:
+        show them ``approval_url`` and wait with :meth:`await_task`. A task is one level deep: this is refused
+        inside one.
+        """
+        refuse_nested()
+        metadata = await self.project.metadata()
+        key = self._task_key(metadata)
+        request = task_request(
+            metadata.token_endpoint,
+            subject_token=await _async_subject_value(subject_token),
+            actor_assertion=self._task_actor(key),
+            template=template,
+            params=params,
+            ttl_seconds=ttl_seconds,
+            resource=None,
+            dpop=_dpop.signer(key, self._clock.time),
+        )
+        started = parse_task_start(await self._send(request))
+        if isinstance(started, TaskPending):
+            return self._pending_task(started)
+        task = AsyncTask(self, started, self._task_root(started, key), self._clock.time)
+        self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
+        return task
+
+    async def await_task(
+        self, pending: TaskPending, *, timeout: float = 300.0, poll_interval: float | None = None
+    ) -> AsyncTask:
+        """Wait for the person's decision on a task, then return it.
+
+        As :meth:`await_user_token`: :class:`~authfi.ConsentDenied` when they refuse,
+        :class:`~authfi.ConsentExpired` when it ran out, :class:`~authfi.WaitTimeout` when ``timeout``
+        passes first (the request stays open, and waiting again continues it).
+        """
+        refuse_nested()
+        metadata = await self.project.metadata()
+        key = self._task_key(metadata)
+        flow = ciba_poll_flow(
+            metadata.token_endpoint,
+            self._auth,
+            auth_req_id=pending.auth_req_id,
+            interval=_ciba_interval(pending.interval, poll_interval),
+            wait_deadline=self._clock.monotonic() + timeout,
+            request_deadline=math.inf,
+            now=self._clock.monotonic,
+            resource=None,
+            dpop=_dpop.signer(key, self._clock.time),
+        )
+        response = await self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
+        task = AsyncTask(self, response, self._task_root(response, key), self._clock.time)
+        self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
+        return task
+
+    async def task(
+        self,
+        template: str,
+        *,
+        subject_token: AsyncTokenSource | Secret,
+        params: Mapping[str, Any] | None = None,
+        ttl_seconds: int | None = None,
+        timeout: float = 300.0,
+    ) -> AsyncTask:
+        """A task, waiting for the person's approval when it needs one. Use it as ``with agent.task(...) as task:``.
+
+        The task is a credential: give it to an adapter in place of the agent (``LangGraphIntegration(task)``),
+        or take ``task.gateway()``. Leaving the ``with`` forgets it.
+        """
+        started = await self.request_task(template, subject_token=subject_token, params=params, ttl_seconds=ttl_seconds)
+        if isinstance(started, TaskPending):
+            return await self.await_task(started, timeout=timeout)
+        return started
+
+    @property
+    def cloud(self) -> AsyncCloudAccess:
+        """Short-lived cloud credentials through the gateway: ``agent.cloud.credentials(account, role)``."""
+        return self._gateway.cloud
 
     def gateway(self) -> AsyncGateway:
         """See :meth:`AgentAuth.gateway`."""
@@ -1263,6 +1644,20 @@ class _AsyncAgentResource(AsyncTokenSource):
     async def token(self, *, force: bool = False) -> str:
         """The agent's token for this resource."""
         return await self._agent.token(resource=self._resource, force=force)
+
+    async def headers(self, method: str, url: str) -> dict[str, str]:
+        """See :meth:`_AgentResource.headers`."""
+        check_destination(url, self.send_to)
+        minted = await self._agent._own(self._resource, False)  # pyright: ignore[reportPrivateUsage]
+        return self._agent._bearing(minted, method, url, self.send_to)  # pyright: ignore[reportPrivateUsage]
+
+    async def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """The one retry a server nonce asks for."""
+        if _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return await self.headers(method, url)
+        return None
 
     def __repr__(self) -> str:
         return f"AsyncAgentAuth.for_resource({self._resource!r})"

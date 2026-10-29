@@ -69,6 +69,7 @@ LEGACY_POSITIONAL = {("AgentAuth", "token", "force"), ("AgentAuth", "await_user_
 # Methods that build or describe and do no I/O: plain functions on both sides.
 PLAIN_ON_BOTH = {
     "agent",
+    "bound_key",
     "agent_from_env",
     "client_credentials",
     "for_resource",

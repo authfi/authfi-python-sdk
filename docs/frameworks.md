@@ -14,6 +14,17 @@ Any credential works: the agent itself (`af.agent(...)`), or a token it holds fo
 asyncio objects. Every adapter built on the same agent shares the agent's one gateway
 (`agent.gateway()`) and its HTTP client, so making adapters does not make connections.
 
+Every adapter proves the key the agent's token is bound to (DPoP) on each call, and answers the server's
+nonce, with nothing to write.
+
+A task (`agent.task(...)`, see [agents](agents.md#tasks-authority-for-one-piece-of-work)) is a credential too,
+and an adapter takes it in the agent's place: `LangGraphIntegration(task)`, `OpenAIAgentsIntegration(task)`,
+`ADKIntegration(task)`. The gateway then holds every tool and model call to the task, and a refusal reaches the
+model with what it can still do. Nothing swaps the agent's token for the task's behind your back: a framework may
+keep a session open from before the task, and a call through it would go with the agent's wider token.
+`ClaudeAgentIntegration` does not take a task: Claude Code makes its own model calls through a helper process that
+cannot hold the key, so they could not be held to it.
+
 Each extra pins the framework versions the adapter is tested with. Where a framework has no public
 setting for its HTTP client, the adapter checks the one it uses when it is imported, and raises
 `IntegrationError` naming the tested range rather than send a call without the token.

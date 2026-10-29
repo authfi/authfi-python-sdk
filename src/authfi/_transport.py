@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from authfi import _dpop
 from authfi._clock import Clock
 from authfi._log import warn_once
 from authfi._protocol.http import Attempt, Effect, HttpRequest, HttpResponse, Retry, Sleep, merge_headers
@@ -157,8 +158,19 @@ class _Base:
     def _headers(self, request: HttpRequest, attempt: Attempt, rid: str) -> dict[str, str]:
         base = {"User-Agent": self.agent, "X-Request-Id": rid}
         headers = merge_headers(base, request.headers, attempt.headers)
+        if request.dpop is not None:
+            proof = request.dpop(request.method, request.url, _dpop.nonces.get(request.url))
+            headers = merge_headers(headers, {"DPoP": proof})
         inject_traceparent(headers)
         return headers
+
+    @staticmethod
+    def _wants_nonce(request: HttpRequest, response: HttpResponse, asked: bool) -> bool:
+        """Keep the nonce a DPoP request's answer carries; ``True`` once when it was refused for want of one."""
+        if request.dpop is None:
+            return False
+        _dpop.nonces.remember(request.url, response.header(_dpop.NONCE_HEADER))
+        return not asked and _dpop.is_nonce_challenge(response)
 
     def _build(
         self, client: httpx.Client | httpx.AsyncClient, request: HttpRequest, rid: str, deadline: float
@@ -207,7 +219,7 @@ class _Base:
 
     @staticmethod
     def _dropped(sent: httpx.Request, response: HttpResponse) -> str | None:
-        if "dpop" in sent.headers and response.status == 401:
+        if "dpop" in sent.headers and response.status == 401 and not _dpop.is_nonce_challenge(response):
             challenge = (response.header("WWW-Authenticate") or "").lower()
             if "dpop" in challenge or "token_dpop_proof_required" in challenge:
                 return "DPoP"
@@ -293,6 +305,7 @@ class SyncTransport(_Base):
         rid = request_id()
         deadline = self._deadline()
         attempt = 0
+        asked = False
         while True:
             sent = self._build(self.client, request, rid, deadline)
             try:
@@ -317,6 +330,9 @@ class SyncTransport(_Base):
             finally:
                 raw.close()
             response = self._answer(sent, raw, body, rid)
+            if self._wants_nonce(request, response, asked):
+                asked = True
+                continue
             delay = self.policy.after_response(request, response, attempt, self.clock.time())
             if delay is None:
                 return response
@@ -417,6 +433,7 @@ class AsyncTransport(_Base):
         rid = request_id()
         deadline = self._deadline()
         attempt = 0
+        asked = False
         while True:
             sent = self._build(self.client, request, rid, deadline)
             try:
@@ -441,6 +458,9 @@ class AsyncTransport(_Base):
             finally:
                 await raw.aclose()
             response = self._answer(sent, raw, body, rid)
+            if self._wants_nonce(request, response, asked):
+                asked = True
+                continue
             delay = self.policy.after_response(request, response, attempt, self.clock.time())
             if delay is None or self.clock.monotonic() + delay >= deadline:
                 return response

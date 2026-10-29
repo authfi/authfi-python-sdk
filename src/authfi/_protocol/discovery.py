@@ -83,6 +83,7 @@ class ServerMetadata:
     code_challenge_methods_supported: tuple[str, ...] = ()
     acr_values_supported: tuple[str, ...] = ()
     scopes_supported: tuple[str, ...] = ()
+    dpop_signing_alg_values_supported: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=lambda: types.MappingProxyType({}), repr=False)
 
     def supports_grant(self, grant: str) -> bool:
@@ -123,6 +124,7 @@ def parse_metadata(issuer: str, doc: object) -> ServerMetadata:
         code_challenge_methods_supported=_strings(body, "code_challenge_methods_supported"),
         acr_values_supported=_strings(body, "acr_values_supported"),
         scopes_supported=_strings(body, "scopes_supported"),
+        dpop_signing_alg_values_supported=_strings(body, "dpop_signing_alg_values_supported"),
         raw=types.MappingProxyType(dict(body)),
     )
 

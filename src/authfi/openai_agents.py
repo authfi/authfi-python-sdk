@@ -78,7 +78,14 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
 from authfi.errors import ConfigurationError
-from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolApprovalRequired, ToolRefused, token_refusal
+from authfi.gateway import (
+    HOLD_MESSAGE,
+    AsyncGateway,
+    ToolApprovalRequired,
+    ToolRefused,
+    asked_for_nonce,
+    token_refusal,
+)
 from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
@@ -267,28 +274,37 @@ class AuthFIModel(LitellmModel):
     async def get_response(
         self, system_instructions: str | None, input: Any, model_settings: ModelSettings, *args: Any, **kwargs: Any
     ) -> Any:
-        settings = await self._with_token(model_settings)
-        try:
-            return await super().get_response(system_instructions, input, settings, *args, **kwargs)
-        except Exception as error:
-            refused = token_refusal(error)
-            if refused is not None:
-                raise refused from error
-            raise
+        for attempt in (1, 2):
+            settings = await self._with_token(model_settings)
+            try:
+                return await super().get_response(system_instructions, input, settings, *args, **kwargs)
+            except Exception as error:
+                if attempt == 1 and asked_for_nonce(error):  # the gateway wants its nonce: once more, with it
+                    continue
+                refused = token_refusal(error)
+                if refused is not None:
+                    raise refused from error
+                raise
 
     @override
     async def stream_response(
         self, system_instructions: str | None, input: Any, model_settings: ModelSettings, *args: Any, **kwargs: Any
     ) -> AsyncIterator[Any]:
-        settings = await self._with_token(model_settings)
-        try:
-            async for event in super().stream_response(system_instructions, input, settings, *args, **kwargs):
-                yield event
-        except Exception as error:
-            refused = token_refusal(error)
-            if refused is not None:
-                raise refused from error
-            raise
+        for attempt in (1, 2):
+            settings = await self._with_token(model_settings)
+            started = False
+            try:
+                async for event in super().stream_response(system_instructions, input, settings, *args, **kwargs):
+                    started = True
+                    yield event
+                return
+            except Exception as error:
+                if attempt == 1 and not started and asked_for_nonce(error):  # asked before any event: once more
+                    continue
+                refused = token_refusal(error)
+                if refused is not None:
+                    raise refused from error
+                raise
 
 
 @dataclass(frozen=True, slots=True)

@@ -88,6 +88,9 @@ class HttpRequest:
     retry: Retry = Retry.SAFE
     max_bytes: int = API_LIMIT
     per_attempt: Callable[[], Attempt] | None = None
+    #: ``(method, url, nonce) -> proof``: signs the ``DPoP`` header of every attempt, and a request the
+    #: server refuses for want of its nonce is sent once more with it (RFC 9449 section 8).
+    dpop: Callable[[str, str, str | None], str] | None = None
 
     def __repr__(self) -> str:
         parts = urlsplit(self.url)

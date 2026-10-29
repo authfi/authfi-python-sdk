@@ -170,12 +170,19 @@ def _thumbprint(jwk: Mapping[str, str]) -> str:
 
 
 def client_assertion(
-    signer: Signer, client_id: str, audience: str, *, now: float, lifetime: int = ASSERTION_LIFETIME
+    signer: Signer,
+    client_id: str,
+    audience: str,
+    *,
+    now: float,
+    lifetime: int = ASSERTION_LIFETIME,
+    confirmation: Mapping[str, str] | None = None,
 ) -> str:
     """An RFC 7523 §2.2 client assertion: ``iss`` = ``sub`` = the client, a fresh ``jti``, at most 300 s.
 
     ``audience`` is the endpoint that checks it, so an assertion signed for one endpoint is refused
-    at another.
+    at another. ``confirmation`` is a ``cnf`` claim (``{"jkt": thumbprint}``) naming the DPoP key that
+    will hold what the assertion asks for, as a task's start does.
     """
     if not client_id or not audience:
         raise ConfigurationError("a client assertion needs the client id and the audience")
@@ -183,7 +190,7 @@ def client_assertion(
         raise ConfigurationError(f"an assertion lives at most {ASSERTION_LIFETIME} seconds")
     issued = int(now)
     header = {"alg": signer.alg, "typ": "JWT", "kid": signer.kid}
-    claims = {
+    claims: dict[str, Any] = {
         "iss": client_id,
         "sub": client_id,
         "aud": audience,
@@ -191,6 +198,8 @@ def client_assertion(
         "iat": issued,
         "exp": issued + lifetime,
     }
+    if confirmation:
+        claims["cnf"] = dict(confirmation)
 
     def segment(value: Mapping[str, Any]) -> str:
         return b64url(json.dumps(value, separators=(",", ":")).encode("utf-8"))
