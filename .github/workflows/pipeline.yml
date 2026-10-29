@@ -94,6 +94,7 @@ jobs:
           - { extras: "openai-agents", tests: "tests/unit/test_openai_agents.py" }
           - { extras: "claude-agent", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
           - { extras: "adk", tests: "tests/unit/test_adk.py" }
+          - { extras: "saml", tests: "tests/unit/test_saml.py" }
           - { extras: "fastapi,flask", tests: "tests/unit/test_signin.py" }
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
