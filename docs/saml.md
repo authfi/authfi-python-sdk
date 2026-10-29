@@ -5,7 +5,7 @@ the service-provider side: it reads the project's metadata, sends the browser to
 returned assertion into the same user model the OpenID Connect sign-in gives.
 
 ```bash
-pip install "authfi[saml]"
+pip install "authfi[saml] @ git+https://github.com/authfi/authfi-python-sdk@main"
 ```
 
 Register the app in your project first: its entity id and its assertion consumer URL (ACS). Then:

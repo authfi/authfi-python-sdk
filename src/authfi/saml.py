@@ -1,7 +1,10 @@
 """SAML 2.0 sign-in for a standard app: AuthFI is the identity provider, your app the service provider.
 
-Install the extra (``pip install "authfi[saml]"``), register the app in the project with its entity id
-and assertion consumer URL, and read the project's metadata::
+Install the extra::
+
+    pip install "authfi[saml] @ git+https://github.com/authfi/authfi-python-sdk@main"
+
+Register the app in the project with its entity id and assertion consumer URL, and read the project's metadata::
 
     from authfi import AuthFI
     from authfi.saml import SamlServiceProvider
@@ -55,7 +58,9 @@ try:
     from onelogin.saml2.settings import OneLogin_Saml2_Settings  # pyright: ignore[reportMissingImports]
     from onelogin.saml2.xml_utils import OneLogin_Saml2_XML  # pyright: ignore[reportMissingImports]
 except ImportError as exc:  # pragma: no cover - exercised by the missing-extra test through a stub
-    raise IntegrationError('authfi.saml needs the saml extra: pip install "authfi[saml]"') from exc
+    raise IntegrationError(
+        "authfi.saml needs python3-saml: pip install 'authfi[saml] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+    ) from exc
 
 __all__ = [
     "InMemoryReplayStore",
