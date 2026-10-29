@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from authfi.agents import AgentAuth, AsyncAgentAuth
 from authfi.errors import ConfigurationError
 from authfi.gateway import AsyncGateway, Gateway
+from authfi.machine import AsyncClientCredentials, ClientCredentials
 from authfi.tokens import AsyncTokenSource, TokenSource
 
 if TYPE_CHECKING:
@@ -30,7 +31,9 @@ def _project(source: object, project: object) -> Any:
 
 
 def _agents_own(source: object, project: object) -> Gateway | AsyncGateway | None:
-    if isinstance(source, AgentAuth | AsyncAgentAuth) and (project is None or project is source.project):
+    if isinstance(source, AgentAuth | AsyncAgentAuth | ClientCredentials | AsyncClientCredentials) and (
+        project is None or project is source.project
+    ):
         return source.gateway()
     return None
 
@@ -40,8 +43,9 @@ def gateway_for(
 ) -> Gateway | AsyncGateway:
     """The gateway for a credential: a :class:`Gateway` for a blocking one, an :class:`AsyncGateway` for asyncio.
 
-    An agent has one gateway for its life, so every adapter built on the same agent shares it (and its
-    HTTP clients); a token the agent holds for a person gets a gateway of its own.
+    An agent or a machine client (client credentials) has one gateway for its life, so every adapter built on
+    the same credential shares it (and its HTTP clients, and its run); a token the agent holds for a person
+    gets a gateway of its own.
     """
     shared = _agents_own(source, project)
     if shared is not None:
@@ -89,8 +93,15 @@ def httpx_of(module_name: str) -> ModuleType:
 
 
 def configure_langsmith(*, capture_content: bool, **client_kwargs: Any) -> Any:
-    """Install the LangSmith client traces go to, hiding inputs and outputs unless ``capture_content``."""
-    import langsmith
+    """Install the LangSmith client traces go to, hiding inputs and outputs unless ``capture_content``.
+
+    LangSmith is optional: when it is not importable nothing is traced to it, so there is nothing to hide
+    and this returns ``None``.
+    """
+    try:
+        import langsmith
+    except ImportError:
+        return None
 
     hide = not capture_content
     client = langsmith.Client(hide_inputs=hide, hide_outputs=hide, **client_kwargs)

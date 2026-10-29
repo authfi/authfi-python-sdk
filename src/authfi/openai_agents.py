@@ -41,9 +41,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from typing_extensions import override
@@ -57,9 +59,12 @@ try:
     from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
     from agents.tracing import TracingProcessor, set_trace_processors, set_tracing_disabled
     from agents.tracing.span_data import (
+        AgentSpanData,
         CustomSpanData,
         FunctionSpanData,
         GenerationSpanData,
+        GuardrailSpanData,
+        HandoffSpanData,
         ResponseSpanData,
         SpeechGroupSpanData,
         SpeechSpanData,
@@ -90,11 +95,15 @@ from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.trace import Span as OtelSpan
+
     from authfi.client import AsyncAuthFI
 
 __all__ = [
     "AuthFIMCPServer",
     "AuthFIModel",
+    "AuthFIStepsProcessor",
     "AuthFITraceProcessor",
     "OpenAIAgentsIntegration",
     "PendingApproval",
@@ -118,6 +127,11 @@ class OpenAIAgentsIntegration:
         self.source = source
         self.gateway = async_gateway_for(source, project)
         self.agent_id = agent_id_of(source)
+
+    @property
+    def run_id(self) -> str:
+        """The credential's run: on every gateway call (``X-Request-Id``) and every exported step."""
+        return cast(str, getattr(self.source, "run_id", None) or "")
 
     def model(self, model: str, *, api: Literal["anthropic", "openai"] = "anthropic") -> Model:
         """A model on the AI gateway, called with the agent's token.
@@ -146,6 +160,7 @@ class OpenAIAgentsIntegration:
         metadata = dict(kwargs.pop("trace_metadata", None) or {})
         if self.agent_id:
             metadata["authfi_agent_id"] = self.agent_id
+        metadata["authfi_run_id"] = self.run_id
         kwargs.setdefault("trace_include_sensitive_data", capture_content)
         return RunConfig(trace_metadata=metadata or None, **kwargs)
 
@@ -174,6 +189,21 @@ class OpenAIAgentsIntegration:
         set_tracing_disabled(not wrapped)
         return wrapped
 
+    def export_steps(
+        self, processors: Sequence[TracingProcessor] = (), *, capture_content: bool = False, **options: Any
+    ) -> TracerProvider:
+        """Send this agent's steps to AuthFI (extra ``otel``): the SDK's trace as OpenTelemetry GenAI spans.
+
+        Like :meth:`configure_tracing`, which it calls, this replaces the SDK's default exporter; ``processors``
+        are kept beside the AuthFI one. The spans name the agent, each tool and each model call with timings,
+        status and usage, and never the words. Call it once, before the first run.
+        """
+        from authfi import otel
+
+        provider = otel.register(self.source, capture_content=capture_content, **options)
+        self.configure_tracing([*processors, AuthFIStepsProcessor(provider)], capture_content=capture_content)
+        return provider
+
 
 #: Settings that can carry a credential or a user's data, dropped from a span's ``model_config``.
 _MODEL_CONFIG_SECRETS = ("extra_headers", "extra_args", "extra_query")
@@ -183,6 +213,110 @@ def _without_secrets(model_config: Mapping[str, Any] | None) -> dict[str, Any] |
     if model_config is None:
         return None
     return {k: v for k, v in model_config.items() if k not in _MODEL_CONFIG_SECRETS}
+
+
+def _nanos(stamp: str | None) -> int | None:
+    if not stamp:
+        return None
+    try:
+        return int(datetime.fromisoformat(stamp).timestamp() * 1_000_000_000)
+    except ValueError:
+        return None
+
+
+_USAGE = (("input_tokens", "gen_ai.usage.input_tokens"), ("output_tokens", "gen_ai.usage.output_tokens"))
+
+
+def _step(data: object) -> tuple[str, dict[str, str | int | bool]]:
+    """The OpenTelemetry GenAI name and attributes of one SDK span: the step, never its words."""
+    attrs: dict[str, str | int | bool] = {}
+    if isinstance(data, AgentSpanData):
+        attrs["gen_ai.operation.name"] = "invoke_agent"
+        attrs["gen_ai.agent.name"] = data.name
+        return f"invoke_agent {data.name}", attrs
+    if isinstance(data, FunctionSpanData):
+        attrs["gen_ai.operation.name"] = "execute_tool"
+        attrs["gen_ai.tool.name"] = data.name
+        return f"execute_tool {data.name}", attrs
+    if isinstance(data, GenerationSpanData | ResponseSpanData):
+        attrs["gen_ai.operation.name"] = "chat"
+        model = data.model if isinstance(data, GenerationSpanData) else None
+        if model:
+            attrs["gen_ai.request.model"] = model
+        for source, target in _USAGE:
+            value = (data.usage or {}).get(source)
+            if isinstance(value, int):
+                attrs[target] = value
+        return f"chat {model}" if model else "chat", attrs
+    if isinstance(data, HandoffSpanData):
+        attrs["gen_ai.operation.name"] = "handoff"
+        return f"handoff {data.from_agent or '?'} to {data.to_agent or '?'}", attrs
+    if isinstance(data, GuardrailSpanData):
+        attrs["authfi.guardrail.triggered"] = data.triggered
+        return f"guardrail {data.name}", attrs
+    return str(getattr(data, "type", "span")), attrs
+
+
+class AuthFIStepsProcessor(TracingProcessor):
+    """The Agents SDK's trace as OpenTelemetry GenAI spans on ``provider``: the agent's steps, never its words.
+
+    No input, output, prompt or tool argument is read, so none can reach a span. A span is a child of the
+    span the SDK says is its parent, so the trace id of a gateway call made inside it joins the steps.
+    """
+
+    def __init__(self, provider: TracerProvider) -> None:
+        self._tracer = provider.get_tracer("authfi.openai_agents")
+        self._open: dict[str, OtelSpan] = {}
+        self._lock = threading.Lock()
+
+    def _begin(self, key: str, parent: str | None, name: str, attrs: Mapping[str, Any], started: int | None) -> None:
+        with self._lock:
+            parent_span = self._open.get(parent) if parent else None
+        from opentelemetry.trace import set_span_in_context
+
+        context = set_span_in_context(parent_span) if parent_span is not None else None
+        span = self._tracer.start_span(name, context=context, attributes=dict(attrs), start_time=started)
+        with self._lock:
+            self._open[key] = span
+
+    def _end(self, key: str, ended: int | None, error: object = None) -> None:
+        with self._lock:
+            span = self._open.pop(key, None)
+        if span is None:
+            return
+        if error:
+            from opentelemetry.trace import Status, StatusCode
+
+            span.set_status(Status(StatusCode.ERROR))
+        span.end(end_time=ended)
+
+    @override
+    def on_trace_start(self, trace: Trace) -> None:
+        self._begin(trace.trace_id, None, f"workflow {trace.name}", {"gen_ai.operation.name": "invoke_workflow"}, None)
+
+    @override
+    def on_trace_end(self, trace: Trace) -> None:
+        self._end(trace.trace_id, None)
+
+    @override
+    def on_span_start(self, span: Span[Any]) -> None:
+        name, attrs = _step(span.span_data)
+        self._begin(span.span_id, span.parent_id or span.trace_id, name, attrs, _nanos(span.started_at))
+
+    @override
+    def on_span_end(self, span: Span[Any]) -> None:
+        self._end(span.span_id, _nanos(span.ended_at), span.error)
+
+    @override
+    def shutdown(self) -> None:
+        with self._lock:
+            leftover, self._open = list(self._open.values()), {}
+        for span in leftover:
+            span.end()
+
+    @override
+    def force_flush(self) -> None:
+        return
 
 
 class AuthFITraceProcessor(TracingProcessor):

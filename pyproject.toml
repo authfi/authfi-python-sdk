@@ -38,20 +38,40 @@ authfi = "authfi.cli:main"
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
-# Each framework extra pins the range its adapter is tested with: an adapter reaches into the
-# framework where it has no public seam, and checks that seam when it is imported.
-langchain = ["langchain-anthropic>=1.7,<1.8", "langsmith>=0.14,<1"]
+# mcp stays below 2: its 2.x needs an httpx2 client factory where these adapters pass an httpx one (the OpenAI Agents
+# SDK refuses it outright), and langchain-mcp-adapters 0.3 itself requires mcp<2. litellm 1.106 imports a type only
+# mcp 2 has, so litellm stays below it while mcp does.
+# A framework extra covers the framework's major version, so a pip resolve is not held back for a minor release; where
+# an adapter reaches into the framework (no public seam), it checks that seam when it is imported and raises
+# IntegrationError naming the version it is tested with. The adapters job installs each extra at its lowest and its
+# newest version. LangSmith is never required: tracing redaction applies only when it is installed.
+langchain = ["langchain-core>=1.0,<2"]
+# The ready-made Claude model. Its private seam is pinned to the tested minor.
+langchain-anthropic = ["authfi[langchain]", "langchain-anthropic>=1.7,<1.8"]
 langgraph = [
     "authfi[langchain]",
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
-openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
-claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
-# litellm 1.92 releases import orjson without requiring it, and 1.106 needs a newer mcp than google-adk 2.12
-# allows: the range excludes both, and the adapters job installs the newest version inside it.
-adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
+openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
+claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2"]
+# Steps to AuthFI over OTLP/HTTP (authfi.otel); the SDK and the exporter are the OpenTelemetry project's.
+otel = ["opentelemetry-sdk>=1.30,<2", "opentelemetry-exporter-otlp-proto-http>=1.30,<2"]
+# mcp 2 drops the gateway's governance annotation from tools/list (its ToolAnnotations keeps no extras), so the
+# adapters stay on mcp 1 until the platform sends governance where mcp 2 keeps it.
+pydantic-ai = ["pydantic-ai-slim[anthropic,mcp]>=2.60,<2.64", "mcp>=1.30,<2"]
+crewai = ["crewai[anthropic]>=1.15,<1.16", "mcp>=1.30,<2"]
+# llama-index-llms-anthropic builds its messages from anthropic 1.x types, which anthropic 2 turned into unions.
+llama-index = [
+    "anthropic>=0.75,<2",
+    "llama-index-core>=0.14,<0.15",
+    "llama-index-llms-anthropic>=0.12,<0.13",
+    "llama-index-tools-mcp>=0.4.6,<0.5",
+    "mcp>=1.30,<2",
+]
+# litellm 1.92 releases import orjson without requiring it: the range excludes them.
+adk = ["google-adk>=2.12,<3", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -83,12 +103,14 @@ dev = [
     { include-group = "test" },
     "pytest-cov>=6,<8",
     "mypy>=1.15,<2",
-    "pyright>=1.1.390,<2",
+    # the [nodejs] extra ships Node in the wheel, so pyright does not download it at run time
+    "pyright[nodejs]>=1.1.390,<2",
     "ruff>=0.9,<1",
     "fastapi>=0.115,<1",
     "flask>=3.0,<4",
     "anthropic>=1.0,<2",
     "openai>=3.0,<4",
+    "langchain-core>=1.0,<2",
     "langchain-anthropic>=1.7,<1.8",
     "langsmith>=0.14,<1",
     "langgraph>=1.2,<2",
@@ -96,7 +118,28 @@ dev = [
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
-    "google-adk>=2.12,<2.13",
+    "google-adk>=2.12,<3",
+    "pydantic-ai-slim[anthropic,mcp]>=2.60,<2.64",
+    "llama-index-core>=0.14,<0.15",
+    "llama-index-llms-anthropic>=0.12,<0.13",
+    "llama-index-tools-mcp>=0.4.6,<0.5",
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+]
+
+[tool.uv]
+# CrewAI pins anthropic 0.73 and openai 2, which the other framework extras (and the dev group) cannot share,
+# so it is installed on its own: `uv sync --extra crewai --no-group dev`.
+conflicts = [
+    [{ extra = "crewai" }, { group = "dev" }],
+    [{ extra = "crewai" }, { extra = "langchain" }],
+    [{ extra = "crewai" }, { extra = "langchain-anthropic" }],
+    [{ extra = "crewai" }, { extra = "langgraph" }],
+    [{ extra = "crewai" }, { extra = "openai-agents" }],
+    [{ extra = "crewai" }, { extra = "claude-agent" }],
+    [{ extra = "crewai" }, { extra = "adk" }],
+    [{ extra = "crewai" }, { extra = "pydantic-ai" }],
+    [{ extra = "crewai" }, { extra = "llama-index" }],
 ]
 
 [tool.pytest.ini_options]
@@ -126,6 +169,8 @@ pytest_add_cli_args_test_selection = ["tests/unit/"]
 [tool.coverage.run]
 branch = true
 source = ["authfi"]
+# CrewAI cannot be installed beside the dev group (see [tool.uv] conflicts): the crewai job measures it.
+omit = ["src/authfi/crewai.py"]
 
 [tool.coverage.report]
 show_missing = true
@@ -141,6 +186,10 @@ exclude_also = [
 strict = true
 python_version = "3.11"
 files = ["src/authfi", "tests", "scripts", "examples"]
+# CrewAI cannot be installed beside the type checkers (see [tool.uv] conflicts): the crewai job checks these.
+exclude = ["src/authfi/crewai[.]py", "tests/unit/test_crewai[.]py"]
+# Lets the numpy override below apply to numpy's stub files too.
+follow_imports_for_stubs = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
@@ -149,11 +198,29 @@ module = ["tests.compat.*"]
 warn_unreachable = false
 
 [[tool.mypy.overrides]]
-module = ["opentelemetry", "opentelemetry.*"]
+module = ["opentelemetry", "opentelemetry.*", "llama_index.tools.mcp", "llama_index.tools.mcp.*"]
 ignore_missing_imports = true
+
+# LlamaIndex re-exports its instrumentation API without __all__ and ships its MCP package untyped.
+[[tool.mypy.overrides]]
+module = ["authfi.llama_index"]
+disallow_subclassing_any = false
+warn_return_any = false
+
+[[tool.mypy.overrides]]
+module = ["llama_index.core.instrumentation", "llama_index.core.instrumentation.*"]
+implicit_reexport = true
+
+# numpy (a LlamaIndex dependency) ships stubs in Python 3.12 syntax, which mypy rejects when checking for 3.11.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*", "deprecated", "deprecated.*"]
+follow_imports = "skip"
 
 [tool.pyright]
 include = ["src/authfi", "tests", "scripts", "examples"]
+exclude = ["**/crewai.py", "**/test_crewai.py"]
+# Lets the numpy override below apply to numpy's stub files too.
+follow_imports_for_stubs = true
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 reportMissingModuleSource = false

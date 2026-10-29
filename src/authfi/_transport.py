@@ -408,6 +408,11 @@ class AsyncTransport(_Base):
         self._client = client
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    @property
+    def bound_loop(self) -> asyncio.AbstractEventLoop | None:
+        """The event loop this transport belongs to, once something has used it."""
+        return self._loop
+
     def check_loop(self) -> None:
         """Bind to the running loop on first use; refuse any other loop afterwards."""
         loop = asyncio.get_running_loop()

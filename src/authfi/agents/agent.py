@@ -33,6 +33,7 @@ from typing_extensions import deprecated
 
 from authfi import _dpop
 from authfi._cache import AsyncCache, SyncCache
+from authfi._frameworks import FrameworkCredential
 from authfi._protocol.agent import (
     CIBA_GRANT,
     TOKEN_EXCHANGE_GRANT,
@@ -688,7 +689,7 @@ async def _async_subject_value(subject_token: AsyncTokenSource | Secret) -> str:
     raise ConfigurationError("subject_token must be an AsyncTokenSource or a Secret, never a plain string")
 
 
-class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
+class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
     """An AI agent, for blocking code. Make it with :meth:`authfi.AuthFI.agent`.
 
     It is a :class:`~authfi.TokenSource` for its own token (``<issuer>/mcp`` unless ``resource``
@@ -1221,7 +1222,7 @@ class AgentAuth(LegacyAgentMixin, _AgentBase, TokenSource):
             self._clock.sleep(poll_interval)
 
 
-class AsyncAgentAuth(_AgentBase, AsyncTokenSource):
+class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
     """An AI agent, for asyncio code. Make it with :meth:`authfi.AsyncAuthFI.agent`. See :class:`AgentAuth`."""
 
     def __init__(

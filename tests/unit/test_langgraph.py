@@ -79,7 +79,7 @@ async def test_an_allowed_call_carries_the_agents_token(fake: FakeGateway, langg
     assert fake.tool_calls == [(ALLOWED, {"repoName": "pallets/flask"})]
     for headers, _ in fake.tool_requests():
         assert headers["authorization"].startswith("Bearer tok-minted-")
-        assert headers["x-request-id"].startswith("afr-")
+        assert headers["x-request-id"].startswith(f"{langgraph.run_id}.")
     (answer,) = _tool_messages(state)
     assert answer.status == "success"
     assert "answered for pallets/flask" in str(answer.content)
@@ -280,3 +280,21 @@ def test_tracing_is_langchains(langgraph: LangGraphIntegration) -> None:
     from authfi.langchain import LangChainIntegration
 
     assert langgraph.configure_tracing is LangChainIntegration.configure_tracing
+
+
+async def test_export_steps_is_the_langchain_integrations_and_the_run_is_shared(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    import langsmith
+    from opentelemetry.sdk.trace import TracerProvider
+
+    assert langgraph.run_id == langgraph.langchain.run_id
+    assert langgraph.run_id.startswith("run-")
+    provider = TracerProvider()
+    try:
+        assert langgraph.export_steps(tracer_provider=provider) is provider
+    finally:
+        langsmith.configure(client=None, enabled=None)
+        provider.shutdown()

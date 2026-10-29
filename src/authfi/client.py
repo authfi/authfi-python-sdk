@@ -219,6 +219,17 @@ def _agent_settings(env: Mapping[str, str] | None, resource: str | None) -> tupl
     return agent_id, key, resource or source.get("AUTHFI_AGENT_RESOURCE", "").strip() or None
 
 
+def _client_settings(env: Mapping[str, str] | None, resource: str | None) -> tuple[str, Secret, str | None]:
+    source = os.environ if env is None else env
+    client_id = source.get("AUTHFI_CLIENT_ID", "").strip()
+    if not client_id:
+        raise ConfigurationError("AUTHFI_CLIENT_ID is not set: set it to the machine client's id")
+    secret = source.get("AUTHFI_CLIENT_SECRET", "").strip()
+    if not secret:
+        raise ConfigurationError("AUTHFI_CLIENT_SECRET is not set: set it to the machine client's secret")
+    return client_id, Secret(secret), resource or source.get("AUTHFI_CLIENT_RESOURCE", "").strip() or None
+
+
 def _register(instance: AuthFI | AsyncAuthFI) -> None:
     with _instances_lock:
         _instances.add(instance)
@@ -468,6 +479,18 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         agent_id, key, chosen = _agent_settings(env, resource)
         return self.agent(agent_id, key, resource=chosen, dpop=dpop)
 
+    def client_credentials_from_env(
+        self, env: Mapping[str, str] | None = None, *, resource: str | None = None
+    ) -> ClientCredentials:
+        """The machine client the environment names, for AuthFI's own gateways.
+
+        ``AUTHFI_CLIENT_ID`` and ``AUTHFI_CLIENT_SECRET``; ``AUTHFI_CLIENT_RESOURCE`` (or ``resource``)
+        names what its token is for, ``<issuer>/mcp`` (the AuthFI gateway) when absent. For a customer's
+        API, call :meth:`client_credentials` with ``resource`` and ``send_to``.
+        """
+        client_id, secret, chosen = _client_settings(env, resource)
+        return self.client_credentials(client_id, secret, resource=chosen or self.issuer + "/mcp")
+
     def check(
         self,
         credential: TokenSource | Secret,
@@ -669,6 +692,13 @@ class AsyncAuthFI(_Project):
         """See :meth:`AuthFI.agent_from_env`."""
         agent_id, key, chosen = _agent_settings(env, resource)
         return self.agent(agent_id, key, resource=chosen, dpop=dpop)
+
+    def client_credentials_from_env(
+        self, env: Mapping[str, str] | None = None, *, resource: str | None = None
+    ) -> AsyncClientCredentials:
+        """See :meth:`AuthFI.client_credentials_from_env`."""
+        client_id, secret, chosen = _client_settings(env, resource)
+        return self.client_credentials(client_id, secret, resource=chosen or self.issuer + "/mcp")
 
     async def check(
         self,

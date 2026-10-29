@@ -15,13 +15,15 @@ The token is cached and renewed at two thirds of its lifetime; concurrent caller
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from authfi._cache import AsyncCache, SyncCache
+from authfi._frameworks import CredentialKind, FrameworkCredential
 from authfi._log import warn_once
 from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.oauth import ClientAuth, client_credentials_request, parse_token_response
 from authfi.errors import ConfigurationError, NotSupportedError
+from authfi.gateway import AsyncGateway, Gateway
 from authfi.secret import Secret
 from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
 
@@ -103,8 +105,10 @@ class _Config:
         return self.destinations.origins
 
 
-class ClientCredentials(TokenSource):
+class ClientCredentials(FrameworkCredential, TokenSource):
     """A machine client's own token, for blocking code. Make it with :meth:`AuthFI.client_credentials`."""
+
+    credential_kind: ClassVar[CredentialKind] = "client_credentials"
 
     def __init__(
         self,
@@ -130,6 +134,7 @@ class ClientCredentials(TokenSource):
         )
         self.project = project
         self._cache: SyncCache[Secret] = SyncCache(project.clock, max_entries=1)
+        self._gateway: Gateway | None = None
 
     @property
     def client_id(self) -> str:
@@ -162,12 +167,23 @@ class ClientCredentials(TokenSource):
 
         return self._cache.get(self._config.key, mint, refresh=force).reveal()
 
+    def gateway(self) -> Gateway:
+        """The AuthFI gateways (MCP tools, models) with this client's token, one per credential.
+
+        The gateway labels its calls ``client-credentials``, so the console tells a machine client from an agent.
+        """
+        if self._gateway is None:
+            self._gateway = Gateway(self.project, self)
+        return self._gateway
+
     def __repr__(self) -> str:
         return f"ClientCredentials(client_id={self.client_id!r}, resource={self.resource!r})"
 
 
-class AsyncClientCredentials(AsyncTokenSource):
+class AsyncClientCredentials(FrameworkCredential, AsyncTokenSource):
     """A machine client's own token, for asyncio code. Make it with :meth:`AsyncAuthFI.client_credentials`."""
+
+    credential_kind: ClassVar[CredentialKind] = "client_credentials"
 
     def __init__(
         self,
@@ -193,6 +209,7 @@ class AsyncClientCredentials(AsyncTokenSource):
         )
         self.project = project
         self._cache: AsyncCache[Secret] = AsyncCache(project.clock, max_entries=1)
+        self._gateway: AsyncGateway | None = None
 
     @property
     def client_id(self) -> str:
@@ -224,6 +241,12 @@ class AsyncClientCredentials(AsyncTokenSource):
             return response.access_token, lifetime_for(response)
 
         return (await self._cache.get(self._config.key, mint, refresh=force)).reveal()
+
+    def gateway(self) -> AsyncGateway:
+        """See :meth:`ClientCredentials.gateway`."""
+        if self._gateway is None:
+            self._gateway = AsyncGateway(self.project, self)
+        return self._gateway
 
     def __repr__(self) -> str:
         return f"AsyncClientCredentials(client_id={self.client_id!r}, resource={self.resource!r})"

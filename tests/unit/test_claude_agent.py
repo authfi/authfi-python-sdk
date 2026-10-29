@@ -6,6 +6,7 @@ The gateway is the real-HTTP stand-in; Claude Code itself is not started.
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -268,8 +269,8 @@ async def test_options_that_would_bypass_the_integration(
 def test_tracing_records_the_agent_and_not_content(
     claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import langsmith
-    import langsmith.integrations.claude_agent_sdk as integration  # pyright: ignore[reportMissingTypeStubs]
+    langsmith = pytest.importorskip("langsmith")  # optional: the claude-agent extra does not install it
+    integration = pytest.importorskip("langsmith.integrations.claude_agent_sdk")
 
     seen: dict[str, Any] = {}
 
@@ -285,6 +286,14 @@ def test_tracing_records_the_agent_and_not_content(
     finally:
         langsmith.configure(client=None)
     assert seen == {"metadata": {"case": "1", "authfi_agent_id": AGENT}, "project_name": "p"}
+
+
+def test_tracing_without_langsmith_is_a_no_op_that_says_so(
+    claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "langsmith", None)
+    monkeypatch.setitem(sys.modules, "langsmith.integrations.claude_agent_sdk", None)
+    assert claude.configure_tracing() is False
 
 
 # --- the caller cannot redirect the agent's token, and the parent's credentials do not reach Claude Code ---
@@ -429,3 +438,63 @@ async def test_the_helper_is_not_pinned_to_an_api_origin_when_there_is_nothing_t
 ) -> None:
     options = await claude.options(model="claude-haiku-5-5")
     assert "AUTHFI_API_ORIGIN" not in dict(options.env)
+
+
+# --- the agent's steps ----------------------------------------------------------------------------------
+
+
+async def test_without_export_steps_claude_code_exports_nothing_to_authfi(claude: ClaudeAgentIntegration) -> None:
+    options = await claude.options(model="claude-haiku-5-5")
+    env = dict(options.env)
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == f"authfi.agent_id={AGENT},authfi.run_id={claude.run_id}"
+    assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in env
+    assert "otelHeadersHelper" not in json.loads(str(options.settings))
+
+
+async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshing_token(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    env = dict(options.env)
+    assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == fake.issuer + "/otlp/v1/traces"
+    assert env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
+    assert env["OTEL_TRACES_EXPORTER"] == "otlp"
+    assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+    assert env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
+    # another system's OTLP credential, inherited from the environment, must not go to AuthFI
+    assert env["OTEL_EXPORTER_OTLP_HEADERS"] == ""
+    assert env["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] == ""
+    assert all(env[name] == "0" for name in CONTENT_SWITCHES)  # prompts and tool content stay off
+    settings = json.loads(str(options.settings))
+    assert settings["otelHeadersHelper"].endswith("-m authfi headers")  # run again on every refresh
+    assert "tok-" not in json.dumps({"env": env, "settings": settings}, default=str)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_TRACES_EXPORTER",
+        "CLAUDE_CODE_ENABLE_TELEMETRY",
+    ],
+)
+async def test_with_export_steps_the_trace_settings_are_the_integrations(
+    claude: ClaudeAgentIntegration, name: str
+) -> None:
+    for spelled in (name, name.lower()):
+        with pytest.raises(ConfigurationError, match="set by the integration"):
+            await claude.options(model="claude-haiku-5-5", export_steps=True, env={spelled: "x"})
+        with pytest.raises(ConfigurationError, match="set by the integration"):
+            await claude.options(model="claude-haiku-5-5", export_steps=True, settings={"env": {spelled: "x"}})
+    # without export_steps they are the caller's own
+    options = await claude.options(model="claude-haiku-5-5", env={name: "mine"})
+    assert dict(options.env)[name] == "mine"
+
+
+async def test_export_steps_owns_the_headers_helper(claude: ClaudeAgentIntegration) -> None:
+    with pytest.raises(ConfigurationError, match="otelHeadersHelper"):
+        await claude.options(model="claude-haiku-5-5", export_steps=True, settings={"otelHeadersHelper": "/bin/x"})
+    options = await claude.options(model="claude-haiku-5-5", settings={"otelHeadersHelper": "/bin/mine"})
+    assert json.loads(str(options.settings))["otelHeadersHelper"] == "/bin/mine"
