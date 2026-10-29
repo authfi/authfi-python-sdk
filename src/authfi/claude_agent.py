@@ -41,10 +41,8 @@ import json
 import os
 import shlex
 import sys
-from collections import OrderedDict
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 try:
@@ -72,6 +70,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
+from authfi._holds import Decided, Held, HeldCalls
 from authfi._protocol.urls import origin_of
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
 from authfi.errors import ConfigurationError, GatewayTokenRefused, NotSupportedError
@@ -133,9 +132,6 @@ _TRACE_SWITCHES = {
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "",
 }
 
-#: How many held or decided calls the integration remembers until Claude Code runs them.
-MEMORY = 10_000
-
 #: How long it remembers one. A call nobody ran is forgotten, so a later identical call is sent afresh.
 MEMORY_SECONDS = 120.0
 
@@ -144,20 +140,6 @@ WaitForDecision = Callable[["PendingApproval"], object]
 CanUseTool = Callable[
     [str, dict[str, Any], ToolPermissionContext], Awaitable[PermissionResultAllow | PermissionResultDeny]
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class _Held:
-    approval_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class _Decided:
-    answer: dict[str, Any]
-
-
-def _key(tool: str, args: Mapping[str, Any]) -> str:
-    return tool + "\x00" + json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _text(text: str) -> dict[str, Any]:
@@ -211,7 +193,7 @@ class ClaudeAgentIntegration:
         self.prefix = f"mcp__{server_name}__"
         #: The gateway's refusal of the token, once it happened: the run was stopped.
         self.token_refused: GatewayTokenRefused | None = None
-        self._calls: OrderedDict[str, tuple[_Held | _Decided, float]] = OrderedDict()
+        self._calls = HeldCalls(self.gateway, ttl=MEMORY_SECONDS)
         self._other: CanUseTool | None = None
 
     # --- the gateway's tools --------------------------------------------------------------------------
@@ -249,7 +231,7 @@ class ClaudeAgentIntegration:
         self.token_refused = refused
         return refused
 
-    async def _send(self, tool: str, args: dict[str, Any], approval_id: str | None) -> _Held | _Decided:
+    async def _send(self, tool: str, args: dict[str, Any], approval_id: str | None) -> Held | Decided:
         sent = self.gateway.with_approval(args, approval_id) if approval_id else args
         try:
             async with self._session() as session:
@@ -259,29 +241,12 @@ class ClaudeAgentIntegration:
         outcome = self.gateway.read_result(result)
         if isinstance(outcome, ToolApprovalRequired):
             self.gateway.project.logger.info("%s waits for approval %s", tool, outcome.approval_id)
-            return _Held(outcome.approval_id)
+            return Held(outcome.approval_id)
         if isinstance(outcome, ToolRefused):
             self.gateway.project.logger.info("the gateway refused %s: %s", tool, outcome.code or outcome.error)
-            return _Decided(_text(outcome.model_text))
+            return Decided(_text(outcome.model_text))
         content = [block.model_dump(by_alias=True, exclude_none=True) for block in result.content]
-        return _Decided({"content": content, "is_error": bool(result.isError)})
-
-    def _remember(self, key: str, entry: _Held | _Decided) -> None:
-        self._calls[key] = (entry, self.gateway.project.clock.monotonic())
-        self._calls.move_to_end(key)
-        while len(self._calls) > MEMORY:
-            self._calls.popitem(last=False)
-
-    def _recall(self, key: str, *, take: bool = False) -> _Held | _Decided | None:
-        """What was remembered for this call, unless it is older than :data:`MEMORY_SECONDS`."""
-        found = self._calls.pop(key, None) if take else self._calls.get(key)
-        if found is None:
-            return None
-        entry, at = found
-        if self.gateway.project.clock.monotonic() - at > MEMORY_SECONDS:
-            self._calls.pop(key, None)
-            return None
-        return entry
+        return Decided({"content": content, "is_error": bool(result.isError)})
 
     def reset(self) -> None:
         """Forget every remembered call. Call it when a run ends, so the next run never inherits an answer."""
@@ -290,18 +255,17 @@ class ClaudeAgentIntegration:
     def _handler(self, tool: str) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
         async def run(arguments: dict[str, Any]) -> dict[str, Any]:
             args = self.gateway.strip_approval_argument(arguments)
-            key = _key(tool, args)
-            known = self._recall(key, take=True)
-            if isinstance(known, _Decided):  # can_use_tool sent it and the gateway decided
-                return known.answer
+            known = self._calls.take(tool, args)
+            if isinstance(known, Decided):  # can_use_tool sent it and the gateway decided
+                return cast(dict[str, Any], known.result)
             try:
-                entry = await self._send(tool, args, known.approval_id if known else None)
+                entry = await self._send(tool, args, known.approval_id if isinstance(known, Held) else None)
             except GatewayTokenRefused as refused:
                 return _text(str(refused))
-            if isinstance(entry, _Held):
-                self._remember(key, entry)
+            if isinstance(entry, Held):
+                self._calls.remember(tool, args, entry)
                 return _text(HOLD_MESSAGE)
-            return entry.answer
+            return cast(dict[str, Any], entry.result)
 
         return run
 
@@ -339,20 +303,19 @@ class ClaudeAgentIntegration:
             )
         tool = tool_name[len(self.prefix) :]
         args = self.gateway.strip_approval_argument(tool_input)
-        key = _key(tool, args)
-        known = self._recall(key)
+        known = self._calls.get(tool, args)
         try:
-            if not isinstance(known, _Decided):
-                known = await self._send(tool, args, known.approval_id if known else None)
-            if isinstance(known, _Held) and self.wait_for_decision is not None:
+            if not isinstance(known, Decided):
+                known = await self._send(tool, args, known.approval_id if isinstance(known, Held) else None)
+            if isinstance(known, Held) and self.wait_for_decision is not None:
                 decided = self.wait_for_decision(PendingApproval(known.approval_id, tool, args))
                 if inspect.isawaitable(decided):
                     await decided
                 known = await self._send(tool, args, known.approval_id)
         except GatewayTokenRefused as refused:
             return PermissionResultDeny(message=str(refused), interrupt=True)
-        self._remember(key, known)
-        if isinstance(known, _Held):
+        self._calls.remember(tool, args, known)
+        if isinstance(known, Held):
             return PermissionResultDeny(message=HOLD_MESSAGE)
         return PermissionResultAllow(updated_input=args)
 

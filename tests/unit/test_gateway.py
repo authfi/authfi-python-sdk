@@ -25,7 +25,7 @@ from authfi import (
 from authfi.agents import AgentAuth
 from authfi.gateway import token_refusal
 from tests.agent_platform import AGENT, AgentPlatform
-from tests.support import FakeClock, fixture_json, json_response
+from tests.support import FakeClock, RpcError, fixture_json, json_response
 
 HOLD_ID = "7f1c2a9e-5d1b-4f3a-9a77-2b0c8e1d4f00"
 
@@ -437,3 +437,38 @@ async def test_the_async_gateway(platform: AgentPlatform, key: AgentKey, clock: 
             AsyncGateway(aaf, "token")  # type: ignore[arg-type]
         assert "AsyncGateway(" in repr(gateway)
     assert client.is_closed
+
+
+# --- the refusal, whichever MCP SDK raised it ----------------------------------------------------------
+
+
+def test_a_refusal_is_found_in_the_error_a_newer_sdk_raises_and_in_what_wraps_it() -> None:
+    refused = token_refusal(RpcError({"authfi_refusal": "gateway_token_refused", "url": "https://x/mcp"}))
+    assert isinstance(refused, GatewayTokenRefused)
+    wrapped = ExceptionGroup("tg", [RuntimeError("other"), RpcError({"authfi_refusal": "gateway_token_refused"})])
+    assert isinstance(token_refusal(wrapped), GatewayTokenRefused)
+    chained = RuntimeError("outer")
+    chained.__cause__ = RpcError({"authfi_refusal": "gateway_token_refused", "www_authenticate": "Bearer"})
+    found = token_refusal(chained)
+    assert found is not None
+    assert found.challenge == "Bearer"
+
+
+def test_an_error_that_is_not_a_refusal_is_not_found() -> None:
+    assert token_refusal(RuntimeError("x")) is None
+    assert token_refusal(RpcError({"other": "thing"})) is None
+    assert token_refusal(RpcError("not a mapping")) is None
+
+
+def test_a_refusal_is_found_in_both_mcp_error_shapes() -> None:
+    data = {"authfi_refusal": "gateway_token_refused", "url": "https://x/mcp", "www_authenticate": "Bearer"}
+    one = RuntimeError("mcp 1.x")  # the JSON-RPC error is on .error
+    one.error = SimpleNamespace(data=data)  # type: ignore[attr-defined]
+    two = RpcError(data)  # mcp 2.x keeps data on the error itself
+    for error in (one, two):
+        found = token_refusal(error)
+        assert found is not None
+        assert found.challenge == "Bearer"
+    other = RuntimeError("mcp 1.x")
+    other.error = SimpleNamespace(data={"authfi_refusal": "something else"})  # type: ignore[attr-defined]
+    assert token_refusal(other) is None

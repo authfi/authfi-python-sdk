@@ -95,6 +95,9 @@ jobs:
           - { extras: "openai-agents,otel", tests: "tests/unit/test_openai_agents.py" }
           - { extras: "claude-agent", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
           - { extras: "adk,otel", tests: "tests/unit/test_adk.py" }
+          - { extras: "pydantic-ai,otel", tests: "tests/unit/test_pydantic_ai.py" }
+          - { extras: "llama-index,otel", tests: "tests/unit/test_llama_index.py" }
+          - { extras: "crewai,otel", tests: "tests/unit/test_crewai.py" }
           - { extras: "otel", tests: "tests/unit/test_otel.py" }
           - { extras: "fastapi,flask", tests: "tests/unit/test_signin.py" }
     steps:
@@ -107,6 +110,25 @@ jobs:
       - run: uv venv
       - run: uv pip install --resolution ${{ matrix.resolution }} ".[${{ matrix.adapter.extras }}]" --group test
       - run: .venv/bin/python -m pytest -p no:cacheprovider ${{ matrix.adapter.tests }}
+
+  # CrewAI pins anthropic and openai below what the dev group and the other extras need, so it cannot be
+  # installed with the linters: it is linted, type-checked and measured here, in its own environment.
+  crewai:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: uv venv
+      - run: uv pip install -e ".[crewai,otel]" --group test ruff mypy coverage
+      - run: .venv/bin/ruff check src/authfi/crewai.py tests/unit/test_crewai.py
+      - run: .venv/bin/ruff format --check src/authfi/crewai.py tests/unit/test_crewai.py
+      - run: .venv/bin/mypy --follow-imports=silent src/authfi/crewai.py tests/unit/test_crewai.py
+      - run: .venv/bin/coverage run --omit=none.py -m pytest -p no:cacheprovider tests/unit/test_crewai.py tests/unit/test_holds.py
+      - run: .venv/bin/coverage report --include="*/authfi/crewai.py,*/authfi/_holds.py" --fail-under=85
 
   build:
     runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
@@ -124,7 +146,7 @@ jobs:
   # The one required check: it passes only when every job above passed.
   ci:
     if: always()
-    needs: [lint, test, windows, adapters, build]
+    needs: [lint, test, windows, adapters, crewai, build]
     runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
     steps:
       - run: |

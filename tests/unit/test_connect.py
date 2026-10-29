@@ -317,3 +317,50 @@ def test_the_factories_build_the_integration_on_the_same_credential(platform: Pl
         af.langgraph()
     with pytest.raises(ConfigurationError, match=r"AsyncAuthFI\.agent"):
         af.claude_agent()
+
+
+@pytest.mark.parametrize(
+    ("framework", "factory", "module"),
+    [
+        ("pydantic_ai", "pydantic_ai", "authfi.pydantic_ai"),
+        ("crewai", "crewai", "authfi.crewai"),
+        ("llama_index.core", "llama_index", "authfi.llama_index"),
+    ],
+)
+def test_the_group_two_factories_build_on_the_same_asyncio_credential(
+    platform: Platform, framework: str, factory: str, module: str
+) -> None:
+    pytest.importorskip(framework)
+    blocking = authfi.connect(client_env(platform), http_client=platform.client())
+    with pytest.raises(ConfigurationError, match="asyncio"):
+        getattr(blocking, factory)()
+    af = authfi.connect_async(client_env(platform), http_client=platform.async_client(), run_id="g2-run")
+    integration = getattr(af, factory)()
+    assert type(integration).__module__ == module
+    assert integration.source is af
+    assert integration.gateway is af.gateway()
+    assert integration.run_id == "g2-run"
+
+
+@pytest.mark.parametrize(
+    ("factory", "package"), [("pydantic_ai", "pydantic_ai"), ("crewai", "crewai"), ("llama_index", "llama_index")]
+)
+def test_a_group_two_framework_that_is_not_installed_names_its_extra(
+    platform: Platform, monkeypatch: pytest.MonkeyPatch, factory: str, package: str
+) -> None:
+    import builtins
+    import sys
+
+    module = f"authfi.{factory}"
+    real = builtins.__import__
+
+    def refuse(name: str, *args: object, **kwargs: object) -> object:
+        if name == package or name.startswith(package + "."):
+            raise ImportError(f"No module named {package!r}")
+        return real(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    monkeypatch.setattr(builtins, "__import__", refuse)
+    af = authfi.connect_async(client_env(platform), http_client=platform.async_client())
+    with pytest.raises(ConfigurationError, match=r"authfi\[" + factory.replace("_", "-") + r"\]"):
+        getattr(af, factory)()
