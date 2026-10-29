@@ -123,6 +123,23 @@ class FakeGateway:
                 out.append((r["headers"], cast(dict[str, Any], body.get("params") or {})))
         return out
 
+    def exported_spans(self) -> list[dict[str, Any]]:
+        """Every span the agent exported to ``/otlp/v1/traces``: its name, attributes and the export's headers."""
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+        out: list[dict[str, Any]] = []
+        for r in self.requests:
+            if r["path"] != "/otlp/v1/traces":
+                continue
+            request = ExportTraceServiceRequest()
+            request.ParseFromString(r["body"])
+            for resource in request.resource_spans:
+                for scope in resource.scope_spans:
+                    for span in scope.spans:
+                        attributes = {kv.key: kv.value.string_value or kv.value.int_value for kv in span.attributes}
+                        out.append({"name": span.name, "attributes": attributes, "headers": r["headers"]})
+        return out
+
     def model_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["path"].endswith("/v1/messages")]
 
@@ -203,6 +220,8 @@ class FakeGateway:
                 {"WWW-Authenticate": 'Bearer error="invalid_token", error_description="revoked"'},
                 (b'{"error":"invalid_token"}'),
             )
+        if path == "/otlp/v1/traces":
+            return 200, {"Content-Type": "application/x-protobuf"}, b""
         if path.endswith("/v1/messages"):
             return self._model(json.loads(body))
         if path.endswith("/v1/chat/completions"):

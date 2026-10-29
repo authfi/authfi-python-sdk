@@ -25,7 +25,7 @@ request below the tracer.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 try:
     import anthropic
@@ -44,6 +44,8 @@ from authfi.gateway import AsyncGateway, Gateway, token_refusal
 from authfi.tokens import AsyncTokenSource, TokenSource
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import TracerProvider
+
     from authfi.client import AsyncAuthFI, AuthFI
 
 __all__ = ["AuthFIChatAnthropic", "LangChainIntegration"]
@@ -157,6 +159,11 @@ class LangChainIntegration:
         self.gateway = gateway_for(source, project)
         self.agent_id = agent_id_of(source)
 
+    @property
+    def run_id(self) -> str:
+        """The credential's run: on every gateway call (``X-Request-Id``) and every exported step."""
+        return cast(str, getattr(self.source, "run_id", None) or "")
+
     def chat_model(self, model: str, **kwargs: Any) -> AuthFIChatAnthropic:
         """A Claude model on the gateway. ``kwargs`` are ``ChatAnthropic``'s, except the credential ones."""
         for refused in ("api_key", "anthropic_api_key", "base_url", "anthropic_api_url"):
@@ -170,7 +177,22 @@ class LangChainIntegration:
         metadata = dict(kwargs.pop("metadata", None) or {})
         if self.agent_id:
             metadata["authfi_agent_id"] = self.agent_id
+        metadata["authfi_run_id"] = self.run_id
         return AuthFIChatAnthropic.on_gateway(self.gateway, model=model, metadata=metadata or None, **kwargs)
+
+    def export_steps(self, *, capture_content: bool = False, **options: Any) -> TracerProvider:
+        """Send this agent's steps to AuthFI: LangChain's own tracing, switched to OpenTelemetry (extra ``otel``).
+
+        LangSmith's client turns each run into spans on the OpenTelemetry provider, where the AuthFI exporter
+        (see :func:`authfi.otel.register`) sends them with the agent's current token. Nothing goes to
+        LangSmith, and runs carry no content unless ``capture_content``. Call it once, before the first run.
+        """
+        from authfi import otel
+
+        provider = otel.register(self.source, capture_content=capture_content, **options)
+        configure_langsmith(capture_content=capture_content, tracing_mode="otel", otel_tracer_provider=provider)
+        langsmith.configure(enabled=True)
+        return provider
 
     @staticmethod
     def configure_tracing(*, capture_content: bool = False, **client_kwargs: Any) -> langsmith.Client:

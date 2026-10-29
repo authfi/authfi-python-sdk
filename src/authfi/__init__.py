@@ -6,12 +6,18 @@ Start from the project::
 
     af = AuthFI("https://acme.authfi.io")       # or AuthFI.from_env(): AUTHFI_ISSUER
 
+An agent that runs a framework starts from its environment instead::
+
+    af = authfi.connect()                        # AUTHFI_ISSUER, then the agent key or the client id and secret
+    graph = af.langgraph()                       # also langchain(), openai_agents(), claude_agent(), adk()
+
 Every area is made from it and shares its discovery document, key set and HTTP client.
 """
 
 import warnings
 from typing import TYPE_CHECKING, Final
 
+from authfi._connect import connect, connect_async
 from authfi._protocol.agent import CIBA_GRANT as CIBA_GRANT_TYPE
 from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.ids import idempotency_key, request_id
@@ -204,6 +210,8 @@ __all__ = [
     "WebhookVerificationError",
     "__version__",
     "assert_public_jwk",
+    "connect",
+    "connect_async",
     "idempotency_key",
     "request_id",
 ]
