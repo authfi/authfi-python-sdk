@@ -5,8 +5,8 @@ The gateway is the real-HTTP stand-in; Claude Code itself is not started.
 
 from __future__ import annotations
 
-import sys
 import json
+import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
