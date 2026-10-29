@@ -452,6 +452,7 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         *,
         resource: str | None = None,
         refresh_skew: float = 60.0,
+        dpop: bool = True,
     ) -> AgentAuth:
         """An AI agent of this project, authenticating with ``key`` (an :class:`~authfi.AgentKey`).
 
@@ -459,10 +460,16 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         AuthFI gateway) when absent. For a customer's API, use ``agent.for_resource(resource,
         send_to=[...])``: the agent sends its own token to AuthFI's endpoints, so it never holds a
         token for another API by default.
-        """
-        return AgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
 
-    def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AgentAuth:
+        The agent's token is bound to a key this process holds (DPoP), and every gateway call proves it.
+        ``dpop=False`` asks for a plain Bearer token instead, for a credential you hand to a process that
+        cannot hold the key (Claude Code's ``apiKeyHelper``, an MCP server's ``headersHelper``).
+        """
+        return AgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew, dpop=dpop)
+
+    def agent_from_env(
+        self, env: Mapping[str, str] | None = None, *, resource: str | None = None, dpop: bool = True
+    ) -> AgentAuth:
         """The agent the environment names.
 
         ``AUTHFI_AGENT_ID``; ``AUTHFI_AGENT_KEY_FILE`` (the default and the documented way) or, for a
@@ -470,7 +477,7 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         and ``AUTHFI_AGENT_RESOURCE``. The project itself comes from ``AuthFI.from_env``.
         """
         agent_id, key, chosen = _agent_settings(env, resource)
-        return self.agent(agent_id, key, resource=chosen)
+        return self.agent(agent_id, key, resource=chosen, dpop=dpop)
 
     def client_credentials_from_env(
         self, env: Mapping[str, str] | None = None, *, resource: str | None = None
@@ -674,14 +681,17 @@ class AsyncAuthFI(_Project):
         *,
         resource: str | None = None,
         refresh_skew: float = 60.0,
+        dpop: bool = True,
     ) -> AsyncAgentAuth:
         """See :meth:`AuthFI.agent`."""
-        return AsyncAgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew)
+        return AsyncAgentAuth(self, agent_id, key, resource=resource, refresh_skew=refresh_skew, dpop=dpop)
 
-    def agent_from_env(self, env: Mapping[str, str] | None = None, *, resource: str | None = None) -> AsyncAgentAuth:
+    def agent_from_env(
+        self, env: Mapping[str, str] | None = None, *, resource: str | None = None, dpop: bool = True
+    ) -> AsyncAgentAuth:
         """See :meth:`AuthFI.agent_from_env`."""
         agent_id, key, chosen = _agent_settings(env, resource)
-        return self.agent(agent_id, key, resource=chosen)
+        return self.agent(agent_id, key, resource=chosen, dpop=dpop)
 
     def client_credentials_from_env(
         self, env: Mapping[str, str] | None = None, *, resource: str | None = None

@@ -214,6 +214,7 @@ def token_request(
     retry: Retry,
     what: str = "the token endpoint",
     headers: Mapping[str, str] | None = None,
+    dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> HttpRequest:
     """A form POST to ``endpoint`` with ``auth`` made fresh per attempt (``None``: no client authentication)."""
     return HttpRequest(
@@ -224,6 +225,7 @@ def token_request(
         form=dict(form),
         retry=retry,
         per_attempt=(lambda: auth.attempt(endpoint)) if auth is not None else None,
+        dpop=dpop,
     )
 
 
@@ -242,15 +244,19 @@ def client_credentials_request(
     *,
     resource: str | None = None,
     scope: Sequence[str] | None = None,
+    dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> HttpRequest:
-    """``grant_type=client_credentials`` (RFC 6749 §4.4), optionally for one ``resource`` (RFC 8707)."""
+    """``grant_type=client_credentials`` (RFC 6749 §4.4), optionally for one ``resource`` (RFC 8707).
+
+    ``dpop`` signs a proof for each attempt, asking the platform to bind the token to the key (agents only).
+    """
     form = {"grant_type": "client_credentials"}
     if resource:
         form["resource"] = resource
     scope_text = _space(scope)
     if scope_text:
         form["scope"] = scope_text
-    return token_request(token_endpoint, form, auth, retry=Retry.SAFE)
+    return token_request(token_endpoint, form, auth, retry=Retry.SAFE, dpop=dpop)
 
 
 def authorization_code_request(

@@ -73,6 +73,7 @@ from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi._holds import Decided, Held, HeldCalls
 from authfi._protocol.urls import origin_of
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
+from authfi.agents.task import AsyncTask, Task
 from authfi.errors import ConfigurationError, GatewayTokenRefused, NotSupportedError
 from authfi.gateway import HOLD_MESSAGE, PendingApproval, ToolApprovalRequired, ToolRefused, token_refusal
 from authfi.tokens import AsyncTokenSource
@@ -176,6 +177,13 @@ class ClaudeAgentIntegration:
                 "claude_agent_delegated",
                 "a token held for a person cannot be given to Claude Code: it would be a fixed value in its "
                 "environment. Run Claude Code as the agent itself.",
+            )
+        if isinstance(given, Task | AsyncTask):
+            raise NotSupportedError(
+                "claude_agent_task",
+                "a task cannot be given to Claude Code: its own model calls go through a helper process that "
+                "holds the agent's token, not the task's, so they would not be held to the task. Use a framework "
+                "that makes its calls in this process.",
             )
         if not isinstance(given, AsyncAgentAuth):
             raise ConfigurationError("ClaudeAgentIntegration takes the agent from AsyncAuthFI.agent(...)")

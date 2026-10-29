@@ -116,18 +116,32 @@ class _CurrentToken(AuthBase):
         self._source = source
         self._loop = loop
 
-    def _headers(self, url: str) -> dict[str, str]:
-        source = self._source
-        if isinstance(source, TokenSource):
-            return source.headers("POST", url)
+    def _loop_for(self) -> asyncio.AbstractEventLoop:
         loop = self._loop
         if loop is None:
-            loop = cast("Any", getattr(source, "project", None))._transport.bound_loop
+            loop = cast("Any", getattr(self._source, "project", None))._transport.bound_loop
         if loop is None or loop.is_closed():
             raise ConfigurationError(
                 "the credential's event loop is not running, so its token cannot be renewed for this export"
             )
-        future = asyncio.run_coroutine_threadsafe(source.headers("POST", url), loop)
+        return loop
+
+    def _headers(self, url: str) -> dict[str, str]:
+        source = self._source
+        if isinstance(source, TokenSource):
+            return source.headers("POST", url)
+        future = asyncio.run_coroutine_threadsafe(source.headers("POST", url), self._loop_for())
+        return future.result(_TOKEN_WAIT)
+
+    def retry_headers(self, url: str, response: requests.Response) -> dict[str, str] | None:
+        """The headers to send ``url`` once more after ``response``, when it asked for the server's DPoP nonce."""
+        challenge, nonce = response.headers.get("www-authenticate"), response.headers.get("dpop-nonce")
+        source = self._source
+        if isinstance(source, TokenSource):
+            return source.retry_headers("POST", url, response.status_code, challenge, nonce)
+        future = asyncio.run_coroutine_threadsafe(
+            source.retry_headers("POST", url, response.status_code, challenge, nonce), self._loop_for()
+        )
         return future.result(_TOKEN_WAIT)
 
     def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
@@ -136,6 +150,27 @@ class _CurrentToken(AuthBase):
 
     def __repr__(self) -> str:
         return f"_CurrentToken({self._source!r})"
+
+
+class _NonceSession(requests.Session):
+    """A session that sends an export once more when AuthFI answered 401 asking for its DPoP nonce."""
+
+    def __init__(self, auth: _CurrentToken) -> None:
+        super().__init__()
+        self.auth = auth
+        self._current = auth
+
+    def send(self, request: requests.PreparedRequest, **kwargs: Any) -> requests.Response:
+        response = super().send(request, **kwargs)
+        if response.status_code != 401:
+            return response
+        headers = self._current.retry_headers(str(request.url), response)
+        if headers is None:
+            return response
+        response.close()
+        again = request.copy()
+        again.headers.update(headers)
+        return super().send(again, **kwargs)
 
 
 class AuthFISpanExporter(SpanExporter):
@@ -152,8 +187,7 @@ class AuthFISpanExporter(SpanExporter):
     ) -> None:
         self._capture_content = capture_content
         url = endpoint or endpoint_for(source)
-        session = requests.Session()
-        session.auth = _CurrentToken(source, loop)
+        session = _NonceSession(_CurrentToken(source, loop))
         self._inner = OTLPSpanExporter(endpoint=url, session=session, timeout=timeout)
         self.endpoint = url
 

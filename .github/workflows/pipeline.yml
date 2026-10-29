@@ -91,11 +91,11 @@ jobs:
           - { extras: "fastapi,flask", tests: "tests/unit/test_api_adapters.py" }
           - { extras: "langchain", tests: "tests/unit/test_langchain_core.py" }
           - { extras: "langchain-anthropic,otel", tests: "tests/unit/test_langchain.py tests/unit/test_langchain_core.py" }
-          - { extras: "langgraph,langchain-anthropic,otel", tests: "tests/unit/test_langgraph.py" }
+          - { extras: "langgraph,langchain-anthropic,otel", tests: "tests/unit/test_langgraph.py tests/unit/test_langgraph_agent_security.py" }
           - { extras: "langgraph-auth", tests: "tests/unit/test_langgraph_auth.py" }
-          - { extras: "openai-agents,otel", tests: "tests/unit/test_openai_agents.py" }
-          - { extras: "claude-agent", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
-          - { extras: "adk,otel", tests: "tests/unit/test_adk.py" }
+          - { extras: "openai-agents,otel", tests: "tests/unit/test_openai_agents.py tests/unit/test_openai_agents_agent_security.py" }
+          - { extras: "claude-agent", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py tests/unit/test_claude_agent_agent_security.py" }
+          - { extras: "adk,otel", tests: "tests/unit/test_adk.py tests/unit/test_adk_agent_security.py" }
           - { extras: "pydantic-ai,otel", tests: "tests/unit/test_pydantic_ai.py" }
           - { extras: "llama-index,otel", tests: "tests/unit/test_llama_index.py" }
           - { extras: "crewai,otel", tests: "tests/unit/test_crewai.py" }

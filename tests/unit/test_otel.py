@@ -15,7 +15,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import authfi
-from authfi import AsyncAuthFI, AuthFI, ConfigurationError, Secret
+from authfi import AsyncAuthFI, AuthFI, ConfigurationError, Secret, _dpop
 from authfi import otel as authfi_otel
 from tests.support import FakeClock, Platform, json_response
 
@@ -26,6 +26,8 @@ class Collector:
     def __init__(self) -> None:
         self.exports: list[tuple[dict[str, str], ExportTraceServiceRequest]] = []
         self.status = 200
+        #: Answer 401 asking for a DPoP nonce until a request's DPoP proof names ``nonce-1``.
+        self.want_nonce = False
         collector = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -35,6 +37,12 @@ class Collector:
                 if self.headers.get("Content-Type") == "application/x-protobuf":
                     request.ParseFromString(body)
                 collector.exports.append(({k.lower(): v for k, v in self.headers.items()}, request))
+                if collector.want_nonce and "nonce-1" not in (self.headers.get("DPoP") or ""):
+                    self.send_response(401)
+                    self.send_header("WWW-Authenticate", 'DPoP error="use_dpop_nonce"')
+                    self.send_header("DPoP-Nonce", "nonce-1")
+                    self.end_headers()
+                    return
                 self.send_response(collector.status)
                 self.send_header("Content-Type", "application/x-protobuf")
                 self.end_headers()
@@ -407,3 +415,72 @@ def test_a_gateway_call_inside_a_step_carries_that_steps_trace(platform: Platfor
             client.post(gateway.mcp_url, json={})
         trace_id = format(span.get_span_context().trace_id, "032x")
     assert seen[0].headers["traceparent"].split("-")[1] == trace_id
+
+
+# --- the server's DPoP nonce ------------------------------------------------------------------------------
+
+
+class _Bound(authfi.TokenSource):
+    """A credential that proves a key, naming the nonce it has learned in its proof."""
+
+    def __init__(self, origin: str, *, answers_nonce: bool = True) -> None:
+        self._origin = origin
+        self._answers_nonce = answers_nonce
+
+    @property
+    def send_to(self) -> tuple[str, ...]:
+        return (self._origin,)
+
+    def token(self, *, force: bool = False) -> str:
+        return "bound-token"
+
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        nonce = _dpop.nonces.get(url)
+        return {"Authorization": "DPoP bound-token", "DPoP": f"proof-{nonce}"}
+
+    def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        if self._answers_nonce and _dpop.learn_nonce(url, status, www_authenticate, nonce):
+            return self.headers(method, url)
+        return None
+
+
+def _exporter_for(source: authfi.TokenSource, collector: Collector) -> authfi_otel.AuthFISpanExporter:
+    return authfi_otel.AuthFISpanExporter(source, endpoint=collector.origin + "/otlp/v1/traces")
+
+
+def test_an_export_the_server_refuses_for_want_of_its_nonce_is_sent_once_more_with_it(collector: Collector) -> None:
+    collector.want_nonce = True
+    source = _Bound(collector.origin)
+    provider, memory = provider_with(source)
+    one_span(provider)
+    exporter = _exporter_for(source, collector)
+    assert exporter.export(memory.get_finished_spans()) is SpanExportResult.SUCCESS
+    exporter.shutdown()
+    first, second = (headers for headers, _ in collector.exports)
+    assert first["dpop"] == "proof-None"
+    assert second["dpop"] == "proof-nonce-1"
+    assert len(collector.spans()) == 2, "the refused attempt carried the spans; the retry carries them again"
+
+
+def test_an_export_is_retried_for_the_nonce_only_once(collector: Collector) -> None:
+    collector.status = 401  # not a nonce challenge: nothing to learn
+    source = _Bound(collector.origin)
+    provider, memory = provider_with(source)
+    one_span(provider)
+    exporter = _exporter_for(source, collector)
+    assert exporter.export(memory.get_finished_spans()) is SpanExportResult.FAILURE
+    exporter.shutdown()
+    assert len(collector.exports) == 1
+
+
+def test_a_credential_that_does_not_answer_a_nonce_is_not_retried(collector: Collector) -> None:
+    collector.want_nonce = True
+    source = _Bound(collector.origin, answers_nonce=False)
+    provider, memory = provider_with(source)
+    one_span(provider)
+    exporter = _exporter_for(source, collector)
+    assert exporter.export(memory.get_finished_spans()) is SpanExportResult.FAILURE
+    exporter.shutdown()
+    assert len(collector.exports) == 1

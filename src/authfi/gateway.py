@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import httpx
 
+from authfi import _dpop
 from authfi._decision_span import record_decision
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
@@ -62,6 +63,7 @@ __all__ = [
     "ToolApprovalRequired",
     "ToolOutcome",
     "ToolRefused",
+    "asked_for_nonce",
     "token_refusal",
 ]
 
@@ -150,8 +152,51 @@ def token_refusal(error: BaseException) -> GatewayTokenRefused | None:
     return None
 
 
+def asked_for_nonce(error: BaseException) -> bool:
+    """``True`` once ``error`` is the gateway asking for its DPoP nonce: it is learned, so send the call once more.
+
+    For a client that cannot answer by itself (LiteLLM, given the proof in a header). A call the gateway
+    refused for its token is not this: that is :func:`token_refusal`.
+    """
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [error]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        headers = getattr(response, "headers", None)
+        get = getattr(headers, "get", None)
+        if callable(get) and getattr(response, "status_code", None) == 401:
+            try:
+                url = str(getattr(getattr(response, "request", None), "url", "") or "")
+            except RuntimeError:  # a response built without its request
+                url = ""
+            challenge, nonce = get("www-authenticate"), get("dpop-nonce")
+            if (
+                url
+                and isinstance(challenge, str)
+                and isinstance(nonce, str)
+                and _dpop.learn_nonce(url, 401, challenge, nonce)
+            ):
+                return True
+        stack.extend(getattr(current, "exceptions", None) or ())
+        stack.append(current.__cause__)
+        stack.append(current.__context__)
+    return False
+
+
 def _ignore(refused: GatewayTokenRefused | None) -> None:
     return None
+
+
+def _proofless(headers: Mapping[str, str]) -> tuple[dict[str, str], Callable[[str, str, str | None], str] | None]:
+    """``headers`` without their proof, and the signer that makes one per attempt (``None`` for a Bearer token)."""
+    signer = getattr(headers, "signer", None)
+    if signer is None:  # a credential of your own: its proof, if it made one, goes as it is
+        return dict(headers), None
+    return {k: v for k, v in headers.items() if k.lower() != "dpop"}, signer
 
 
 class _RefusalAsJsonRpc:
@@ -171,6 +216,12 @@ class _RefusalAsJsonRpc:
                 self._seen(None)
             return response
         challenge = response.headers.get("www-authenticate")
+        if not request.extensions.get("authfi_nonce_asked") and _dpop.is_nonce_challenge_headers(
+            401, challenge, response.headers.get("dpop-nonce")
+        ):
+            # The server wants its nonce in the proof: the credential's auth flow sends the call once more.
+            request.extensions["authfi_nonce_asked"] = True
+            return response
         self._seen(GatewayTokenRefused(str(request.url), challenge))
         if request.method != "POST":
             return response
@@ -202,6 +253,48 @@ class _RefusalAsJsonRpc:
 
     async def aclose(self) -> None:
         await self._inner.aclose()
+
+
+class CloudAccess:
+    """Cloud credentials for the agent, on the gateway: ``agent.cloud.credentials("prod", "deployer")``."""
+
+    def __init__(self, gateway: Gateway) -> None:
+        self._gateway = gateway
+
+    def credentials(
+        self,
+        account: str,
+        role: str,
+        duration: int = 900,
+        *,
+        session_policy: Mapping[str, Any] | None = None,
+        approval_id: str | None = None,
+    ) -> CloudCredentialOutcome:
+        """:meth:`Gateway.cloud_credentials` with ``duration`` seconds (1 to 900) for ``role`` in ``account``."""
+        return self._gateway.cloud_credentials(
+            account, role, expires_in=duration, session_policy=session_policy, approval_id=approval_id
+        )
+
+
+class AsyncCloudAccess:
+    """See :class:`CloudAccess`; for asyncio code."""
+
+    def __init__(self, gateway: AsyncGateway) -> None:
+        self._gateway = gateway
+
+    async def credentials(
+        self,
+        account: str,
+        role: str,
+        duration: int = 900,
+        *,
+        session_policy: Mapping[str, Any] | None = None,
+        approval_id: str | None = None,
+    ) -> CloudCredentialOutcome:
+        """See :meth:`CloudAccess.credentials`."""
+        return await self._gateway.cloud_credentials(
+            account, role, expires_in=duration, session_policy=session_policy, approval_id=approval_id
+        )
 
 
 class _GatewayBase:
@@ -288,6 +381,8 @@ class Gateway(_GatewayBase):
         self.project = project
         self.source = source
         self._clients: dict[str, Any] = {}
+        #: Short-lived cloud credentials: ``gateway.cloud.credentials(account, role)``.
+        self.cloud = CloudAccess(self)
         project._track(self)  # pyright: ignore[reportPrivateUsage]
 
     @overload
@@ -351,14 +446,16 @@ class Gateway(_GatewayBase):
         """
         api_origin = self.project.resolve_api_origin()
         url = api_origin + CLOUD_PATH
+        authorization, proof = _proofless(self.source.headers("POST", url))
         request = cloud_request(
             api_origin,
-            self.source.headers("POST", url),
+            authorization,
             account=account,
             role=role,
             expires_in=expires_in,
             session_policy=session_policy,
             approval_id=approval_id,
+            dpop=proof,
         )
         response = self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
         if response.status == 401:
@@ -392,6 +489,8 @@ class AsyncGateway(_GatewayBase):
         #: accepted again. For frameworks that turn every tool failure into text for the model.
         self.token_refused: GatewayTokenRefused | None = None
         self._clients: dict[str, Any] = {}
+        #: See :attr:`Gateway.cloud`.
+        self.cloud = AsyncCloudAccess(self)
         project._track(self)  # pyright: ignore[reportPrivateUsage]
 
     @overload
@@ -472,14 +571,16 @@ class AsyncGateway(_GatewayBase):
         """See :meth:`Gateway.cloud_credentials`."""
         api_origin = await self.project.resolve_api_origin()
         url = api_origin + CLOUD_PATH
+        authorization, proof = _proofless(await self.source.headers("POST", url))
         request = cloud_request(
             api_origin,
-            await self.source.headers("POST", url),
+            authorization,
             account=account,
             role=role,
             expires_in=expires_in,
             session_policy=session_policy,
             approval_id=approval_id,
+            dpop=proof,
         )
         response = await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
         if response.status == 401:

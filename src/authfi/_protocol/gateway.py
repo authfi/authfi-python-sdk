@@ -17,7 +17,7 @@ model: :data:`HOLD_MESSAGE` is, and the approval id travels outside the model.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
@@ -34,6 +34,7 @@ __all__ = [
     "MAX_CLOUD_SECONDS",
     "REFUSAL_META",
     "SCOPE_META",
+    "TASK_GUIDANCE",
     "CloudCredential",
     "ToolAllowed",
     "ToolApprovalRequired",
@@ -69,6 +70,35 @@ _HOLD = re.compile(r"^Waiting for approval ([A-Za-z0-9_-]+) \(([a-z_]+)\)\. A pe
 #: The most seconds a cloud credential can be asked for: the platform's cap.
 MAX_CLOUD_SECONDS = 900
 
+#: What a call a task (a mandate) refused means, and what the agent can still do. A task is one level
+#: deep and nothing raises trust, so no advice here starts a new task or asks for a wider one: the way
+#: out of a refusal is a different step inside the task, or stopping and telling the person.
+TASK_GUIDANCE: Mapping[str, tuple[str, str]] = {
+    "EMDT003": ("task_ended", "The task has run out of time. Stop, and tell the person what is done and what is not."),
+    "EMDT004": ("task_ended", "The task has ended. Stop, and tell the person what is done and what is not."),
+    "EMDT005": (
+        "outside_task",
+        "This tool is outside the task you were given. Use a tool the task allows, or stop and tell the person "
+        "what you could not do.",
+    ),
+    "EMDT006": ("over_budget", "This would go over the task's budget. Do less, or stop and tell the person."),
+    "EMDT007": (
+        "outside_task",
+        "A rule of the task does not allow these arguments. Change them to fit the task, or stop and tell the person.",
+    ),
+    "EMDT009": (
+        "cannot_meter",
+        "The task cannot count this call's cost. Give the amount the tool needs, or choose another step.",
+    ),
+    "EMDT010": ("bad_arguments", "The arguments are not what the tool accepts. Correct them and call again."),
+    "EMDT012": (
+        "in_progress",
+        "An earlier attempt of this call is still running. Do not repeat it: wait, then look at its result.",
+    ),
+    "EMDT013": ("cannot_meter", "This call spends from the task's budget and needs an Idempotency-Key."),
+    "EMDT014": ("cannot_meter", "The task cannot price this model call before it runs. Ask for something smaller."),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ToolAllowed:
@@ -100,6 +130,29 @@ class ToolRefused:
     kind: Literal["refused"] = field(default="refused", init=False)
 
     @property
+    def why(self) -> str:
+        """Why it was refused in one word: ``outside_task``, ``over_budget``, ``task_ended``, ... or ``refused``."""
+        found = TASK_GUIDANCE.get(self.code or "")
+        return found[0] if found else "refused"
+
+    @property
+    def next_step(self) -> str | None:
+        """What the agent can still do, for a call a task refused; ``None`` for any other refusal."""
+        found = TASK_GUIDANCE.get(self.code or "")
+        return found[1] if found else None
+
+    def as_dict(self) -> dict[str, Any]:
+        """The refusal as data an agent can plan around: ``refused``, ``why``, ``code``, ``reason``, ``next_step``."""
+        out: dict[str, Any] = {"refused": True, "why": self.why, "code": self.code or self.error}
+        if self.reason:
+            out["reason"] = self.reason
+        if self.required_scope:
+            out["required_scope"] = self.required_scope
+        if self.next_step:
+            out["next_step"] = self.next_step
+        return out
+
+    @property
     def model_text(self) -> str:
         """What a model may read about this outcome when the framework needs a tool answer."""
         parts = [f"Refused by AuthFI ({self.code or self.error or 'refused'})"]
@@ -108,6 +161,8 @@ class ToolRefused:
         text = ": ".join(parts) + "."
         if self.required_scope:
             text += f" The call needs the scope {self.required_scope}."
+        if self.next_step:
+            text += " " + self.next_step
         return text
 
 
@@ -280,6 +335,7 @@ def cloud_request(
     expires_in: int,
     session_policy: Mapping[str, Any] | None,
     approval_id: str | None,
+    dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> HttpRequest:
     """``POST <api origin>/mcp/v1/cloud/credentials``. Never retried after send: it may open an approval."""
     for name, value in (("account", account), ("role", role)):
@@ -299,6 +355,7 @@ def cloud_request(
         headers={"Accept": "application/json", **authorization},
         json_body=body,
         retry=Retry.NEVER_AFTER_SEND,
+        dpop=dpop,
     )
 
 

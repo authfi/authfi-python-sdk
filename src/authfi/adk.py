@@ -66,6 +66,7 @@ from authfi.gateway import (
     AsyncGateway,
     ToolApprovalRequired,
     ToolRefused,
+    asked_for_nonce,
     token_refusal,
 )
 from authfi.gateway import PendingApproval as BasePendingApproval
@@ -122,20 +123,27 @@ class AuthFILiteLlm(LiteLlm):
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
         gateway = cast(AsyncGateway, self._authfi_gateway)
-        config = llm_request.config.model_copy()
-        options = (config.http_options or types.HttpOptions()).model_copy()
+        original = llm_request.config
         url = gateway.model_base_url("anthropic") + "/v1/messages"
-        options.headers = {**(options.headers or {}), **(await gateway.source.headers("POST", url))}
-        config.http_options = options
-        llm_request.config = config
-        try:
-            async for response in super().generate_content_async(llm_request, stream=stream):
-                yield response
-        except Exception as error:
-            refused = token_refusal(error)
-            if refused is not None:
-                raise refused from error
-            raise
+        for attempt in (1, 2):
+            config = original.model_copy()
+            options = (config.http_options or types.HttpOptions()).model_copy()
+            options.headers = {**(options.headers or {}), **(await gateway.source.headers("POST", url))}
+            config.http_options = options
+            llm_request.config = config
+            started = False
+            try:
+                async for response in super().generate_content_async(llm_request, stream=stream):
+                    started = True
+                    yield response
+                return
+            except Exception as error:
+                if attempt == 1 and not started and asked_for_nonce(error):  # the gateway wants its nonce: once more
+                    continue
+                refused = token_refusal(error)
+                if refused is not None:
+                    raise refused from error
+                raise
 
 
 def _no_google_mtls(toolset: McpToolset) -> None:

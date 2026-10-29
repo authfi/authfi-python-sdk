@@ -60,7 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "keygen":
             return _keygen(args.out, args.alg, args.kid)
         with AuthFI.from_env() as af:
-            token = af.agent_from_env().token()
+            # A Bearer token: the process that asked for it (Claude Code, an MCP server) cannot hold this key.
+            token = af.agent_from_env(dpop=False).token()
     except AuthFIError as error:
         print(f"authfi: {error.message}", file=sys.stderr)
         return 1
