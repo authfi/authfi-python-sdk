@@ -1,6 +1,7 @@
 """A fake AuthFI SAML identity provider: it signs the Assertion only (RSA-SHA256, exclusive c14n), as the
 platform does, and can be told to break each rule a service provider must enforce."""
 
+# pyright: basic
 from __future__ import annotations
 
 import base64

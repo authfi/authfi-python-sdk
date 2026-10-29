@@ -27,6 +27,9 @@ configured, never against the request that arrived. An assertion is accepted onc
 
 from __future__ import annotations
 
+# python3-saml and lxml ship no type information: what they return is checked at the boundary below.
+# pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
+# pyright: reportMissingTypeStubs=false, reportUnknownParameterType=false
 import base64
 import binascii
 import json
@@ -278,7 +281,7 @@ class PendingSamlSignIn:
     def load(cls, text: str) -> PendingSamlSignIn:
         """The pending sign-in :meth:`dump` made, or :class:`SamlAssertionRefused` for anything else."""
         try:
-            data = cast(Any, json.loads(text))
+            data: Any = json.loads(text)
             request_id, relay, expires, url = data["id"], data["rs"], data["exp"], data["url"]
         except (ValueError, KeyError, TypeError) as exc:
             raise SamlAssertionRefused("saml_pending_malformed", "the pending sign-in is not one") from exc
