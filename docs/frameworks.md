@@ -20,6 +20,68 @@ and raises `IntegrationError` naming the tested version rather than send a call 
 never installed by an extra: when it is present, `configure_tracing()` hides content from it; when it is not,
 there is nothing to hide and `configure_tracing()` returns nothing.
 
+## One line: `connect()`
+
+`authfi.connect()` reads the environment and returns the credential, ready to build any of the integrations below:
+
+```python
+import authfi
+
+af = authfi.connect()                    # blocking code: LangChain
+chain = af.langchain()
+
+af = authfi.connect_async()              # asyncio: LangGraph, OpenAI Agents, Claude Agent SDK, ADK
+graph = af.langgraph()
+```
+
+It reads `AUTHFI_ISSUER`, then `AUTHFI_AGENT_ID` with `AUTHFI_AGENT_KEY_FILE` (an agent, and the default
+when both are set) or `AUTHFI_CLIENT_ID` with `AUTHFI_CLIENT_SECRET` (a machine client; its token is for
+`<issuer>/mcp`, or `AUTHFI_CLIENT_RESOURCE`). A missing variable is a `ConfigurationError` that names it.
+`connect()` builds the same objects as `AuthFI.from_env().agent_from_env()` and
+`.client_credentials_from_env()`; they are the way to pass your own options. Close the project when you are
+done: `af.project.close()` (`await af.project.aclose()` for asyncio).
+
+`af.langchain()`, `.langgraph()`, `.openai_agents()`, `.claude_agent()` and `.adk()` build the integration
+for this credential and take its options (`project=`, `wait_for_decision=` and so on). A machine client's
+gateway calls are labelled `client-credentials` in the `User-Agent`, so the console tells them from an
+agent's.
+
+### The run
+
+Each credential has a run id, `af.run_id` (`run-` and 24 hex digits, or the one you give:
+`connect(run_id="nightly-2026-10-29")`; `af.start_run()` begins another). Every gateway call carries
+`X-Request-Id: <run id>.<n>`, every exported step carries `authfi.run_id`, and the integrations name it in the
+metadata of the framework's own runs (`authfi_run_id`). The gateway also decides a run of its own from the
+token and answers it in `AuthFI-Run-Id`.
+
+### Steps to AuthFI
+
+```bash
+pip install "authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main"
+```
+
+One call per integration sends the agent's steps (which agent ran, which tool, which model call, how long, how
+it ended) to `<issuer origin>/otlp/v1/traces`, over OTLP/HTTP protobuf:
+
+```python
+af.langgraph().export_steps()            # also .langchain(), .openai_agents(), .adk()
+options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps=True)
+```
+
+- The token is the credential's current one, read on every export: a token that is renewed is never stale.
+- Content is off by default: prompts, answers and tool arguments and results are removed before sending
+  (`capture_content=True` is the tenant's decision), and AuthFI drops them again on receipt.
+- Spans carry `authfi.agent_id` (`authfi.client_id` for a machine client) and `authfi.run_id`. AuthFI keeps
+  each span as the token's agent's, whatever the payload says. A gateway call made inside a step carries that
+  step's `traceparent`, so the gateway's record and the steps share a trace id.
+- LangChain and LangGraph: LangChain's tracing (LangSmith's client) is switched to OpenTelemetry, so runs go to
+  AuthFI and not to LangSmith. OpenAI Agents: the SDK's trace becomes GenAI spans (`invoke_agent`,
+  `execute_tool`, `chat`), replacing the SDK's default exporter as `configure_tracing()` does. ADK: its own
+  spans, on the global OpenTelemetry provider. Claude Agent SDK: Claude Code's own trace export (a Claude Code
+  beta feature) pointed at AuthFI, with the headers from `python -m authfi headers` on each refresh.
+- For any other OpenTelemetry-instrumented code, `authfi.otel.register(af)` adds the exporter to the SDK
+  provider (or makes one); `authfi.otel.exporter(af)` is the exporter alone, for your own processor.
+
 ## LangChain
 
 ```bash

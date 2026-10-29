@@ -73,6 +73,8 @@ from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import TracerProvider
+
     from authfi.client import AsyncAuthFI
 
 __all__ = ["ADKIntegration", "AuthFILiteLlm", "PendingApproval"]
@@ -353,11 +355,29 @@ class ADKIntegration:
         # google-adk 2.13 puts content on its inference spans only in a span-bearing mode.
         mode = "SPAN_ONLY" if capture_content else "NO_CONTENT"
         os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = mode
-        if self.agent_id:
-            attributes = [
-                a
-                for a in (os.environ.get("OTEL_RESOURCE_ATTRIBUTES") or "").split(",")
-                if a and not a.startswith("authfi.agent_id=")
-            ]
-            attributes.append(f"authfi.agent_id={self.agent_id}")
-            os.environ["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(attributes)
+        ours = {"authfi.agent_id": self.agent_id} if self.agent_id else {}
+        ours["authfi.run_id"] = self.run_id
+        attributes = [
+            a
+            for a in (os.environ.get("OTEL_RESOURCE_ATTRIBUTES") or "").split(",")
+            if a and a.split("=", 1)[0] not in ours
+        ]
+        attributes.extend(f"{name}={value}" for name, value in ours.items())
+        os.environ["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(attributes)
+
+    @property
+    def run_id(self) -> str:
+        """The credential's run: on every gateway call (``X-Request-Id``) and every exported step."""
+        return cast(str, getattr(self.source, "run_id", None) or "")
+
+    def export_steps(self, *, capture_content: bool = False, **options: Any) -> TracerProvider:
+        """Send this agent's steps to AuthFI (extra ``otel``): ADK's own OpenTelemetry spans, content off.
+
+        ADK traces through the global OpenTelemetry provider, so this registers the AuthFI exporter on it
+        (see :func:`authfi.otel.register`) and calls :meth:`configure_tracing`. Call it once, before the runner.
+        """
+        from authfi import otel
+
+        provider = otel.register(self.source, capture_content=capture_content, **options)
+        self.configure_tracing(capture_content=capture_content)
+        return provider

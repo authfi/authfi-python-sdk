@@ -113,6 +113,26 @@ _OWNED = (
 )
 _OWNED_PREFIXES = ("AUTHFI_", "OTEL_LOG_")
 
+#: Claude Code's trace export (beta): the AuthFI endpoint, with headers from ``python -m authfi headers``
+#: and none from the environment, which would send another system's OTLP credential to AuthFI.
+_TRACE_OWNED = (
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+)
+_TRACE_SWITCHES = {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_HEADERS": "",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "",
+}
+
 #: How many held or decided calls the integration remembers until Claude Code runs them.
 MEMORY = 10_000
 
@@ -351,6 +371,17 @@ class ClaudeAgentIntegration:
 
     # --- options ----------------------------------------------------------------------------------------
 
+    @property
+    def run_id(self) -> str:
+        """The credential's run: named in the resource attributes of the trace Claude Code exports."""
+        return self.source.run_id
+
+    def _trace_env(self) -> dict[str, str]:
+        return {
+            **_TRACE_SWITCHES,
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": origin_of(self.gateway.project.issuer) + "/otlp/v1/traces",
+        }
+
     def helper_env(self) -> dict[str, str]:
         """What ``python -m authfi token`` needs to sign as this agent: names and a path, never the key.
 
@@ -372,7 +403,13 @@ class ClaudeAgentIntegration:
         return env
 
     async def options(
-        self, *, model: str, capture_content: bool = False, include_never_allowed: bool = False, **claude_options: Any
+        self,
+        *,
+        model: str,
+        capture_content: bool = False,
+        include_never_allowed: bool = False,
+        export_steps: bool = False,
+        **claude_options: Any,
     ) -> ClaudeAgentOptions:
         """``ClaudeAgentOptions`` for this agent on the gateways.
 
@@ -380,6 +417,10 @@ class ClaudeAgentIntegration:
         ``hooks`` and ``mcp_servers`` are merged with the integration's. ``can_use_tool`` decides the
         tools that are not AuthFI's (by default they are refused). A credential in ``env`` is refused,
         and so is ``permission_mode="bypassPermissions"``, which would skip approvals.
+
+        ``export_steps`` has Claude Code send its own trace to AuthFI (``<issuer origin>/otlp/v1/traces``),
+        authenticated by ``python -m authfi headers`` on every refresh, with prompts and tool content off
+        unless ``capture_content``. Claude Code's trace export is a beta feature of Claude Code.
         """
         await self.gateway.project.resolve_api_origin()
         if claude_options.get("permission_mode") == "bypassPermissions":
@@ -387,7 +428,7 @@ class ClaudeAgentIntegration:
                 "permission_mode bypassPermissions skips can_use_tool, and with it AuthFI approvals"
             )
         given_env = dict(claude_options.pop("env", None) or {})
-        _refuse_owned(given_env, "env")
+        _refuse_owned(given_env, "env", steps=export_steps)
         inherited = [name for name in _FIXED_CREDENTIALS if os.environ.get(name)]
         if inherited:
             self.gateway.project.logger.warning(
@@ -407,13 +448,18 @@ class ClaudeAgentIntegration:
             # beta headers are not passed through to them.
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "OTEL_RESOURCE_ATTRIBUTES": f"authfi.agent_id={self.agent_id}",
+            "OTEL_RESOURCE_ATTRIBUTES": f"authfi.agent_id={self.agent_id},authfi.run_id={self.run_id}",
+            **(self._trace_env() if export_steps else {}),
             **self.helper_env(),
             **{name: "1" if capture_content else "0" for name in CONTENT_SWITCHES},
         }
         settings = _settings(claude_options.pop("settings", None))
-        _refuse_owned(settings.get("env"), "settings['env']")
+        _refuse_owned(settings.get("env"), "settings['env']", steps=export_steps)
         settings["apiKeyHelper"] = f"{shlex.quote(sys.executable)} -m authfi token"
+        if export_steps and "otelHeadersHelper" in settings:
+            raise ConfigurationError("otelHeadersHelper in settings is set by the integration with export_steps")
+        if export_steps:
+            settings["otelHeadersHelper"] = f"{shlex.quote(sys.executable)} -m authfi headers"
         servers = dict(claude_options.pop("mcp_servers", None) or {})
         if self.server_name in servers:
             raise ConfigurationError(
@@ -456,7 +502,7 @@ class ClaudeAgentIntegration:
         return bool(configure_claude_agent_sdk(metadata=metadata, **kwargs))
 
 
-def _refuse_owned(env: object, where: str) -> None:
+def _refuse_owned(env: object, where: str, *, steps: bool = False) -> None:
     """Refuse an environment variable that would turn the agent's token, or the content switches, elsewhere."""
     if not isinstance(env, Mapping):
         return
@@ -474,7 +520,7 @@ def _refuse_owned(env: object, where: str) -> None:
             )
         if upper.startswith("OTEL_LOG_"):
             raise ConfigurationError(f"{name} in {where} is set from capture_content, not by hand")
-        if upper in _OWNED or upper.startswith(_OWNED_PREFIXES):
+        if upper in _OWNED or upper.startswith(_OWNED_PREFIXES) or (steps and upper in _TRACE_OWNED):
             raise ConfigurationError(f"{name} in {where} is set by the integration")
 
 

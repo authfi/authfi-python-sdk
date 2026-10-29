@@ -247,9 +247,19 @@ class _GatewayBase:
             )
         return clean
 
+    def _user_agent(self) -> str:
+        """The ``User-Agent``; a machine client's calls say so, which the gateway records as the caller's claim."""
+        kind = getattr(getattr(self, "source", None), "credential_kind", "agent")
+        return user_agent("authfi-credential/client-credentials" if kind == "client_credentials" else None)
+
+    def _next_request_id(self) -> str:
+        """``<run id>.<n>`` for a credential that has a run, else a fresh id for the call."""
+        next_in_run = getattr(getattr(self, "source", None), "next_request_id", None)
+        return cast(str, next_in_run()) if callable(next_in_run) else request_id()
+
     def _stamp(self, request: httpx.Request) -> None:
         if "x-request-id" not in request.headers:
-            request.headers["X-Request-Id"] = request_id()
+            request.headers["X-Request-Id"] = self._next_request_id()
         headers = dict(request.headers)
         inject_traceparent(headers)
         if "traceparent" in headers and "traceparent" not in request.headers:
@@ -311,7 +321,7 @@ class Gateway(_GatewayBase):
             timeout=timeout
             if timeout is not None
             else package.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
-            headers={"User-Agent": user_agent(), **(headers or {})},
+            headers={"User-Agent": self._user_agent(), **(headers or {})},
             event_hooks={"request": [on_request]},
         )
 
@@ -414,7 +424,7 @@ class AsyncGateway(_GatewayBase):
             timeout=timeout
             if timeout is not None
             else package.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
-            headers={"User-Agent": user_agent(), **(headers or {})},
+            headers={"User-Agent": self._user_agent(), **(headers or {})},
             event_hooks={"request": [on_request]},
             transport=transport,
         )

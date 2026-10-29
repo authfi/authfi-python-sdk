@@ -32,11 +32,12 @@ jobs:
         adapter:
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_api_adapters.py" }
           - { extras: "langchain", overrides: "langchain-core", tests: "tests/unit/test_langchain_core.py" }
-          - { extras: "langchain-anthropic", overrides: "langchain-core langchain-anthropic langsmith", tests: "tests/unit/test_langchain.py" }
-          - { extras: "langgraph,langchain-anthropic", overrides: "langgraph langchain-mcp-adapters mcp", tests: "tests/unit/test_langgraph.py" }
-          - { extras: "openai-agents", overrides: "openai-agents[litellm] mcp", tests: "tests/unit/test_openai_agents.py" }
+          - { extras: "langchain-anthropic,otel", overrides: "langchain-core langchain-anthropic langsmith opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_langchain.py" }
+          - { extras: "langgraph,langchain-anthropic,otel", overrides: "langgraph langchain-mcp-adapters mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_langgraph.py" }
+          - { extras: "openai-agents,otel", overrides: "openai-agents[litellm] mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_openai_agents.py" }
           - { extras: "claude-agent", overrides: "claude-agent-sdk mcp", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
-          - { extras: "adk", overrides: "google-adk litellm mcp", tests: "tests/unit/test_adk.py" }
+          - { extras: "adk,otel", overrides: "google-adk litellm mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_adk.py" }
+          - { extras: "otel", overrides: "opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_otel.py" }
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_signin.py" }
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0

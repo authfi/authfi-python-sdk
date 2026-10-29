@@ -66,6 +66,8 @@ from authfi.langchain import LangChainIntegration
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import TracerProvider
+
     from authfi.client import AsyncAuthFI
     from authfi.langchain_anthropic import AuthFIChatAnthropic
 
@@ -170,6 +172,15 @@ class LangGraphIntegration:
         return self.langchain.chat_model(model, **kwargs)
 
     configure_tracing = staticmethod(LangChainIntegration.configure_tracing)
+
+    @property
+    def run_id(self) -> str:
+        """The credential's run, as :attr:`authfi.langchain.LangChainIntegration.run_id`."""
+        return self.langchain.run_id
+
+    def export_steps(self, *, capture_content: bool = False, **options: Any) -> TracerProvider:
+        """Send this agent's steps to AuthFI; see :meth:`authfi.langchain.LangChainIntegration.export_steps`."""
+        return self.langchain.export_steps(capture_content=capture_content, **options)
 
     # --- tools ----------------------------------------------------------------------------------------
 

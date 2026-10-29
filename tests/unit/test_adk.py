@@ -253,7 +253,9 @@ def test_tracing_has_no_content_unless_asked(adk: ADKIntegration, monkeypatch: p
 
     assert os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] == "false"
     assert os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "NO_CONTENT"
-    assert os.environ["OTEL_RESOURCE_ATTRIBUTES"] == f"service.name=x,authfi.agent_id={AGENT}"
+    assert (
+        os.environ["OTEL_RESOURCE_ATTRIBUTES"] == f"service.name=x,authfi.agent_id={AGENT},authfi.run_id={adk.run_id}"
+    )
     adk.configure_tracing(capture_content=True)
     assert os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] == "true"
     assert os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "SPAN_ONLY"
@@ -391,3 +393,36 @@ def test_the_pending_approval_extends_the_one_vocabulary() -> None:
 
     assert issubclass(PendingApproval, Base)
     assert list(PendingApproval.__dataclass_fields__) == ["approval_id", "tool", "args", "call_id"]
+
+
+async def test_export_steps_sends_adks_spans_to_authfi_with_no_content(
+    fake: FakeGateway, adk: ADKIntegration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    import asyncio
+    import os
+
+    from opentelemetry.sdk.trace import TracerProvider
+
+    for name in ("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+    provider = TracerProvider()
+    assert adk.export_steps(tracer_provider=provider) is provider
+    assert os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] == "NO_CONTENT"
+    assert f"authfi.run_id={adk.run_id}" in os.environ["OTEL_RESOURCE_ATTRIBUTES"]
+    await adk.gateway.source.token()  # the credential's loop is known once it has been used
+
+    with provider.get_tracer("adk").start_as_current_span(
+        "invoke_agent research", attributes={"gen_ai.input.messages": "ada@example.com"}
+    ):
+        pass
+    await asyncio.to_thread(provider.force_flush)
+    await asyncio.to_thread(provider.shutdown)
+
+    (step,) = fake.exported_spans()
+    assert step["attributes"]["authfi.agent_id"] == AGENT
+    assert step["attributes"]["authfi.run_id"] == adk.run_id
+    assert "gen_ai.input.messages" not in step["attributes"]
+    assert step["headers"]["authorization"].startswith("Bearer tok-minted-")

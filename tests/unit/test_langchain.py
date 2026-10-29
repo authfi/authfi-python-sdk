@@ -72,7 +72,7 @@ def test_the_model_calls_the_gateway_with_the_agents_token(
     (request,) = fake.model_requests()
     assert request["path"] == "/mcp/v1/messages"
     assert request["headers"]["authorization"] == "Bearer tok-minted-1"
-    assert request["headers"]["x-request-id"].startswith("afr-")
+    assert request["headers"]["x-request-id"].startswith(f"{integration.run_id}.")
     assert request["json"]["model"] == "claude-haiku-5-5"
 
 
@@ -228,3 +228,44 @@ def test_importing_the_adapter_checks_the_seam_where_it_runs() -> None:
     )
     assert ran.stdout.startswith("IntegrationError"), ran.stdout + ran.stderr
     assert "ChatAnthropic._client" in ran.stdout
+
+
+@pytest.mark.parametrize("capture_content", [False, True])
+def test_export_steps_sends_the_runs_to_authfi_and_not_to_langsmith(
+    fake: FakeGateway, key: AgentKey, capture_content: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    with CaptureServer() as langsmith_backend, AuthFI(fake.issuer) as af:
+        monkeypatch.setenv("LANGSMITH_ENDPOINT", langsmith_backend.url)  # a stand-in that must see nothing
+        monkeypatch.setenv("LANGSMITH_API_KEY", "lsv2-capture")
+        agent = af.agent(AGENT, key)
+        integration = LangChainIntegration(agent)
+        provider = TracerProvider()
+        try:
+            integration.export_steps(capture_content=capture_content, tracer_provider=provider)
+            model = integration.chat_model("claude-haiku-5-5", max_tokens=64)
+            fake.model_script.append([{"type": "text", "text": "Refund sent to 99417."}])
+            model.invoke(PROMPT)
+            langsmith.run_trees.get_cached_client().flush()
+            provider.force_flush()
+            provider.shutdown()
+        finally:
+            langsmith.configure(client=None, enabled=None)
+        assert [body for _, _, body in langsmith_backend.bodies if body] == []
+
+    steps = fake.exported_spans()
+    assert steps, "LangChain's run reached AuthFI as spans"
+    assert all(s["attributes"]["authfi.agent_id"] == AGENT for s in steps)
+    assert all(s["attributes"]["authfi.run_id"] == agent.run_id for s in steps)
+    assert all(s["headers"]["authorization"] == "Bearer tok-minted-1" for s in steps)
+    posted = b"".join(r["body"] for r in fake.requests if r["path"] == "/otlp/v1/traces")
+    assert fake.minted[0].encode() not in posted
+    assert (b"99417" in posted) is capture_content
+
+
+def test_the_run_is_in_the_models_metadata(integration: LangChainIntegration) -> None:
+    model = integration.chat_model("claude-haiku-5-5")
+    assert (model.metadata or {})["authfi_run_id"] == integration.run_id
