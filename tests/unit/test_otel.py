@@ -15,8 +15,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import authfi
-from authfi import AsyncAuthFI, AuthFI, ConfigurationError, Secret
-from authfi import _dpop
+from authfi import AsyncAuthFI, AuthFI, ConfigurationError, Secret, _dpop
 from authfi import otel as authfi_otel
 from tests.support import FakeClock, Platform, json_response
 
