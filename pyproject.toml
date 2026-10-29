@@ -91,7 +91,8 @@ dev = [
     { include-group = "test" },
     "pytest-cov>=6,<8",
     "mypy>=1.15,<2",
-    "pyright>=1.1.390,<2",
+    # the [nodejs] extra ships Node in the wheel, so pyright does not download it at run time
+    "pyright[nodejs]>=1.1.390,<2",
     "ruff>=0.9,<1",
     "fastapi>=0.115,<1",
     "flask>=3.0,<4",
