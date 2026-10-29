@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from authfi import GatewayTokenRefused
-from authfi._holds import MEMORY, Decided, Held, HeldCalls, call_key, gateway_refusal, guard, text_of, wait_for_decision
+from authfi._holds import MEMORY, Decided, Held, HeldCalls, call_key, guard, text_of, wait_for_decision
 from authfi.gateway import AsyncGateway
 
 HOLD = (
@@ -119,35 +119,6 @@ async def test_a_token_the_gateway_refuses_ends_the_send() -> None:
 
     with pytest.raises(GatewayTokenRefused):
         await held.send(revoked, "t", {})
-
-
-# --- the refusal, whichever MCP SDK raised it ----------------------------------------------------------
-
-
-class RpcError(Exception):
-    """The MCP SDK 2 error: the JSON-RPC ``data`` is on the error itself."""
-
-    def __init__(self, data: Any) -> None:
-        super().__init__("refused")
-        self.data = data
-
-
-def test_a_refusal_is_found_in_the_error_a_newer_sdk_raises_and_in_what_wraps_it() -> None:
-    refused = gateway_refusal(RpcError({"authfi_refusal": "gateway_token_refused", "url": "https://x/mcp"}))
-    assert isinstance(refused, GatewayTokenRefused)
-    wrapped = ExceptionGroup("tg", [RuntimeError("other"), RpcError({"authfi_refusal": "gateway_token_refused"})])
-    assert isinstance(gateway_refusal(wrapped), GatewayTokenRefused)
-    chained = RuntimeError("outer")
-    chained.__cause__ = RpcError({"authfi_refusal": "gateway_token_refused", "www_authenticate": "Bearer"})
-    found = gateway_refusal(chained)
-    assert found is not None
-    assert found.challenge == "Bearer"
-
-
-def test_an_error_that_is_not_a_refusal_is_not_found() -> None:
-    assert gateway_refusal(RuntimeError("x")) is None
-    assert gateway_refusal(RpcError({"other": "thing"})) is None
-    assert gateway_refusal(RpcError("not a mapping")) is None
 
 
 # --- the guard ----------------------------------------------------------------------------------------

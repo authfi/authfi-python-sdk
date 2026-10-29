@@ -34,6 +34,7 @@ GATES: tuple[tuple[str, tuple[str, ...], str, float], ...] = (
             "src/authfi/fastapi.py",
             "src/authfi/flask.py",
             "src/authfi/langchain.py",
+            "src/authfi/langchain_anthropic.py",
             "src/authfi/langgraph.py",
             "src/authfi/openai_agents.py",
             "src/authfi/claude_agent.py",

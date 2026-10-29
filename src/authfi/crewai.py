@@ -92,9 +92,9 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
-from authfi._holds import Decided, Held, HeldCalls, gateway_refusal, guard, text_of, wait_for_decision
+from authfi._holds import Decided, Held, HeldCalls, guard, text_of, wait_for_decision
 from authfi.errors import ConfigurationError, GatewayTokenRefused
-from authfi.gateway import AsyncGateway
+from authfi.gateway import AsyncGateway, token_refusal
 from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
@@ -299,7 +299,7 @@ async def _list_tools(gateway: AsyncGateway) -> list[MCPTool]:
             await session.initialize()
             return list((await session.list_tools()).tools)
     except Exception as error:
-        refused = gateway_refusal(error)
+        refused = token_refusal(error)
         if refused is not None:
             raise refused from error
         raise

@@ -14,7 +14,6 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from authfi.errors import GatewayTokenRefused
 from authfi.gateway import AsyncGateway, ToolApprovalRequired, ToolRefused, token_refusal
 
 __all__ = [
@@ -23,7 +22,6 @@ __all__ = [
     "Held",
     "HeldCalls",
     "call_key",
-    "gateway_refusal",
     "guard",
     "text_of",
     "wait_for_decision",
@@ -48,35 +46,6 @@ class Decided:
     refusal: str | None = None
 
 
-def gateway_refusal(error: BaseException) -> GatewayTokenRefused | None:
-    """The gateway's refusal of the token, found in ``error``, whichever MCP SDK raised it.
-
-    :func:`~authfi.gateway.token_refusal` reads the JSON-RPC error the 1.x SDK keeps in ``error.error``; the
-    2.x SDK keeps ``data`` on the error itself, which this reads the same way.
-    """
-    refused = token_refusal(error)
-    if refused is not None:
-        return refused
-    seen: set[int] = set()
-    stack: list[BaseException | None] = [error]
-    while stack:
-        current = stack.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        data = getattr(current, "data", None)
-        if isinstance(data, Mapping):
-            detail = cast("Mapping[str, Any]", data)
-            if detail.get("authfi_refusal") == "gateway_token_refused":
-                challenge, url = detail.get("www_authenticate"), detail.get("url")
-                return GatewayTokenRefused(
-                    url if isinstance(url, str) else "", challenge if isinstance(challenge, str) else None
-                )
-        stack.extend(getattr(current, "exceptions", None) or ())
-        stack.extend((current.__cause__, current.__context__))
-    return None
-
-
 def text_of(result: object) -> str:
     """The text blocks of an MCP tool result, joined: what a framework shows its model of a tool's answer."""
     blocks = cast("list[Any]", getattr(result, "content", None) or [])
@@ -89,32 +58,52 @@ def call_key(tool: str, args: Mapping[str, Any]) -> str:
 
 
 class HeldCalls:
-    """What an adapter remembers about calls the gateway held or decided."""
+    """What an adapter remembers about calls the gateway held or decided.
 
-    def __init__(self, gateway: AsyncGateway) -> None:
+    ``ttl`` (seconds) makes a remembered call forgettable: one nobody came back for is dropped, so a later
+    identical call is sent afresh. Without it a call is kept until it is taken or pushed out by :data:`MEMORY`.
+    """
+
+    def __init__(self, gateway: AsyncGateway, *, ttl: float | None = None) -> None:
         self.gateway = gateway
-        self._calls: OrderedDict[str, Held | Decided] = OrderedDict()
+        self._ttl = ttl
+        self._calls: OrderedDict[str, tuple[Held | Decided, float]] = OrderedDict()
+
+    def _fresh(self, key: str, found: tuple[Held | Decided, float] | None) -> Held | Decided | None:
+        if found is None:
+            return None
+        entry, at = found
+        if self._ttl is not None and self.gateway.project.clock.monotonic() - at > self._ttl:
+            self._calls.pop(key, None)
+            return None
+        return entry
 
     def get(self, tool: str, args: Mapping[str, Any]) -> Held | Decided | None:
         """The remembered call, left in place."""
-        return self._calls.get(call_key(tool, args))
+        key = call_key(tool, args)
+        return self._fresh(key, self._calls.get(key))
 
     def take(self, tool: str, args: Mapping[str, Any]) -> Held | Decided | None:
         """The remembered call, forgotten: a decided call is answered once."""
-        return self._calls.pop(call_key(tool, args), None)
+        key = call_key(tool, args)
+        return self._fresh(key, self._calls.pop(key, None))
 
     def remember(self, tool: str, args: Mapping[str, Any], entry: Held | Decided) -> None:
         """Keep ``entry`` for the call, forgetting the oldest beyond :data:`MEMORY`."""
         key = call_key(tool, args)
-        self._calls[key] = entry
+        self._calls[key] = (entry, self.gateway.project.clock.monotonic())
         self._calls.move_to_end(key)
         while len(self._calls) > MEMORY:
             self._calls.popitem(last=False)
 
+    def clear(self) -> None:
+        """Forget every remembered call."""
+        self._calls.clear()
+
     def holds(self, tool: str) -> bool:
         """Whether any call of ``tool`` is held, so its next call must wait for a person even if unannounced."""
         prefix = tool + "\x00"
-        return any(key.startswith(prefix) and isinstance(entry, Held) for key, entry in self._calls.items())
+        return any(key.startswith(prefix) and isinstance(entry, Held) for key, (entry, _) in self._calls.items())
 
     async def send(
         self,
@@ -132,7 +121,7 @@ class HeldCalls:
         try:
             result = await call(sent)
         except Exception as error:
-            refused = gateway_refusal(error)
+            refused = token_refusal(error)
             if refused is not None:
                 raise refused from error
             raise
@@ -168,7 +157,7 @@ class guard:
                 raise refused
             return
         if isinstance(error, Exception):
-            refused = refused or gateway_refusal(error)
+            refused = refused or token_refusal(error)
             if refused is not None:
                 raise refused from error
 

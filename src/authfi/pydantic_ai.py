@@ -67,9 +67,9 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
-from authfi._holds import Decided, Held, HeldCalls, gateway_refusal, text_of
+from authfi._holds import Decided, Held, HeldCalls, text_of
 from authfi.errors import ConfigurationError
-from authfi.gateway import HOLD_MESSAGE, AsyncGateway
+from authfi.gateway import HOLD_MESSAGE, AsyncGateway, token_refusal
 from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
@@ -151,7 +151,7 @@ class AuthFIModel(WrapperModel):
         try:
             return await super().request(messages, model_settings, model_request_parameters)
         except Exception as error:
-            refused = gateway_refusal(error)
+            refused = token_refusal(error)
             if refused is not None:
                 raise refused from error
             raise
@@ -171,7 +171,7 @@ class AuthFIModel(WrapperModel):
             ) as stream:
                 yield stream
         except Exception as error:
-            refused = gateway_refusal(error)
+            refused = token_refusal(error)
             if refused is not None:
                 raise refused from error
             raise
@@ -239,7 +239,7 @@ class AuthFIToolset(MCPToolset[Any]):
         try:
             return await super().__aenter__()
         except Exception as error:
-            refused = gateway_refusal(error)
+            refused = token_refusal(error)
             if refused is not None:
                 raise refused from error
             raise
@@ -249,7 +249,7 @@ class AuthFIToolset(MCPToolset[Any]):
         try:
             tools = await super().get_tools(ctx)
         except Exception as error:
-            refused = gateway_refusal(error)
+            refused = token_refusal(error)
             if refused is not None:
                 raise refused from error
             raise

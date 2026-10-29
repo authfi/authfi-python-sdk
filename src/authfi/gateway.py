@@ -116,7 +116,10 @@ def _refused_response(response: object) -> GatewayTokenRefused | None:
 
 
 def _refused_rpc_error(error: BaseException) -> GatewayTokenRefused | None:
+    # The mcp 1.x SDK keeps the JSON-RPC error's data on ``error.error``; the 2.x SDK keeps it on the error itself.
     data = getattr(getattr(error, "error", None), "data", None)
+    if not isinstance(data, Mapping):
+        data = getattr(error, "data", None)
     if not isinstance(data, Mapping):
         return None
     detail = cast(Mapping[str, Any], data)
