@@ -5,6 +5,7 @@ The gateway is the real-HTTP stand-in; Claude Code itself is not started.
 
 from __future__ import annotations
 
+import sys
 import json
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -268,8 +269,8 @@ async def test_options_that_would_bypass_the_integration(
 def test_tracing_records_the_agent_and_not_content(
     claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import langsmith
-    import langsmith.integrations.claude_agent_sdk as integration  # pyright: ignore[reportMissingTypeStubs]
+    langsmith = pytest.importorskip("langsmith")  # optional: the claude-agent extra does not install it
+    integration = pytest.importorskip("langsmith.integrations.claude_agent_sdk")
 
     seen: dict[str, Any] = {}
 
@@ -285,6 +286,14 @@ def test_tracing_records_the_agent_and_not_content(
     finally:
         langsmith.configure(client=None)
     assert seen == {"metadata": {"case": "1", "authfi_agent_id": AGENT}, "project_name": "p"}
+
+
+def test_tracing_without_langsmith_is_a_no_op_that_says_so(
+    claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "langsmith", None)
+    monkeypatch.setitem(sys.modules, "langsmith.integrations.claude_agent_sdk", None)
+    assert claude.configure_tracing() is False
 
 
 # --- the caller cannot redirect the agent's token, and the parent's credentials do not reach Claude Code ---

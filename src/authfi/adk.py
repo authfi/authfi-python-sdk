@@ -84,7 +84,7 @@ CONFIRMATION_CALL = "adk_request_confirmation"
 PAYLOAD_KEY = "authfi_approval_id"
 
 #: The google-adk versions whose private MCP seam this module is tested with.
-TESTED = "google-adk 2.12"
+TESTED = "google-adk 2.12 and 2.13"
 
 #: How many held calls the integration remembers until they are confirmed and run again.
 MEMORY = 10_000

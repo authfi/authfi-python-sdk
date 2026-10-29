@@ -38,20 +38,24 @@ authfi = "authfi.cli:main"
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
-# Each framework extra pins the range its adapter is tested with: an adapter reaches into the
-# framework where it has no public seam, and checks that seam when it is imported.
-langchain = ["langchain-anthropic>=1.7,<1.8", "langsmith>=0.14,<1"]
+# A framework extra covers the framework's major version, so a pip resolve is not held back for a minor release; where
+# an adapter reaches into the framework (no public seam), it checks that seam when it is imported and raises
+# IntegrationError naming the version it is tested with. The adapters job installs each extra at its lowest and its
+# newest version. LangSmith is never required: tracing redaction applies only when it is installed.
+langchain = ["langchain-core>=1.0,<2"]
+# The ready-made Claude model. Its private seam is pinned to the tested minor.
+langchain-anthropic = ["authfi[langchain]", "langchain-anthropic>=1.7,<1.8"]
+# langchain-mcp-adapters 0.3 itself requires mcp<2, so this extra cannot allow mcp 2 until it does.
 langgraph = [
     "authfi[langchain]",
     "langgraph>=1.2,<2",
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
-openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<2"]
-claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.14,<1"]
-# litellm 1.92 releases import orjson without requiring it, and 1.106 needs a newer mcp than google-adk 2.12
-# allows: the range excludes both, and the adapters job installs the newest version inside it.
-adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
+openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "mcp>=1.30,<3"]
+claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<3"]
+# litellm 1.92 releases import orjson without requiring it: the range excludes them.
+adk = ["google-adk>=2.12,<3", "litellm>=1.83,!=1.92.*,<2", "mcp>=1.30,<3"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -89,6 +93,7 @@ dev = [
     "flask>=3.0,<4",
     "anthropic>=1.0,<2",
     "openai>=3.0,<4",
+    "langchain-core>=1.0,<2",
     "langchain-anthropic>=1.7,<1.8",
     "langsmith>=0.14,<1",
     "langgraph>=1.2,<2",
@@ -96,7 +101,7 @@ dev = [
     "mcp>=1.30,<2",
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
-    "google-adk>=2.12,<2.13",
+    "google-adk>=2.12,<3",
 ]
 
 [tool.pytest.ini_options]

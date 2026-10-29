@@ -62,11 +62,12 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import async_gateway_for
 from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolAllowed, ToolRefused, token_refusal
-from authfi.langchain import AuthFIChatAnthropic, LangChainIntegration
+from authfi.langchain import LangChainIntegration
 from authfi.tokens import AsyncTokenSource
 
 if TYPE_CHECKING:
     from authfi.client import AsyncAuthFI
+    from authfi.langchain_anthropic import AuthFIChatAnthropic
 
 __all__ = [
     "APPROVAL_NODE",
@@ -162,7 +163,10 @@ class LangGraphIntegration:
     # --- the model ------------------------------------------------------------------------------------
 
     def chat_model(self, model: str, **kwargs: Any) -> AuthFIChatAnthropic:
-        """A Claude model on the AI gateway, as :meth:`authfi.langchain.LangChainIntegration.chat_model`."""
+        """A Claude model on the AI gateway, as :meth:`authfi.langchain.LangChainIntegration.chat_model`.
+
+        Needs ``authfi[langchain-anthropic]``; any other LangChain chat model can be used with the graph.
+        """
         return self.langchain.chat_model(model, **kwargs)
 
     configure_tracing = staticmethod(LangChainIntegration.configure_tracing)

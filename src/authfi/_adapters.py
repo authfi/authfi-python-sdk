@@ -89,8 +89,15 @@ def httpx_of(module_name: str) -> ModuleType:
 
 
 def configure_langsmith(*, capture_content: bool, **client_kwargs: Any) -> Any:
-    """Install the LangSmith client traces go to, hiding inputs and outputs unless ``capture_content``."""
-    import langsmith
+    """Install the LangSmith client traces go to, hiding inputs and outputs unless ``capture_content``.
+
+    LangSmith is optional: when it is not importable nothing is traced to it, so there is nothing to hide
+    and this returns ``None``.
+    """
+    try:
+        import langsmith
+    except ImportError:
+        return None
 
     hide = not capture_content
     client = langsmith.Client(hide_inputs=hide, hide_outputs=hide, **client_kwargs)

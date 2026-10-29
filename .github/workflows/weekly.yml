@@ -31,10 +31,11 @@ jobs:
       matrix:
         adapter:
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_api_adapters.py" }
-          - { extras: "langchain", overrides: "langchain-anthropic langsmith", tests: "tests/unit/test_langchain.py" }
-          - { extras: "langgraph", overrides: "langgraph langchain-mcp-adapters mcp", tests: "tests/unit/test_langgraph.py" }
+          - { extras: "langchain", overrides: "langchain-core", tests: "tests/unit/test_langchain_core.py" }
+          - { extras: "langchain-anthropic", overrides: "langchain-core langchain-anthropic langsmith", tests: "tests/unit/test_langchain.py" }
+          - { extras: "langgraph,langchain-anthropic", overrides: "langgraph langchain-mcp-adapters mcp", tests: "tests/unit/test_langgraph.py" }
           - { extras: "openai-agents", overrides: "openai-agents[litellm] mcp", tests: "tests/unit/test_openai_agents.py" }
-          - { extras: "claude-agent", overrides: "claude-agent-sdk mcp langsmith", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
+          - { extras: "claude-agent", overrides: "claude-agent-sdk mcp", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
           - { extras: "adk", overrides: "google-adk litellm mcp", tests: "tests/unit/test_adk.py" }
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_signin.py" }
     steps:

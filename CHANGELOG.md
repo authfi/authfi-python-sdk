@@ -10,6 +10,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- Extras cover each framework's major version (`google-adk` 2.x, `mcp` 2.x where the framework allows it,
+  `litellm` 1.x). `authfi[langchain]` installs only `langchain-core`; the Claude model is
+  `authfi[langchain-anthropic]`. LangSmith is never required, and `configure_tracing()` does nothing without it.
 - `AuthFI` and `AsyncAuthFI`: the project client, configured by its issuer alone, with discovery
   (RFC 8414 / OpenID), the key set, and one HTTP transport shared by every area.
 - Timeouts on every request (connect, read, and a deadline per call), and retries only where
