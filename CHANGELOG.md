@@ -10,6 +10,10 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `authfi.webhooks.verify`: checks `X-AuthFI-Signature-256` (HMAC-SHA256 over timestamp, `.` and the body, constant-time
+  compare, tolerance window) and returns a typed event; `sign` makes the headers for tests.
+- `credential.admin` (`Admin`, `AsyncAdmin`): organizations, members, invitations, join requests, users, roles,
+  permissions and role bindings over the public API, with typed models, pages and typed errors.
 - `AuthFI` and `AsyncAuthFI`: the project client, configured by its issuer alone, with discovery
   (RFC 8414 / OpenID), the key set, and one HTTP transport shared by every area.
 - Timeouts on every request (connect, read, and a deadline per call), and retries only where

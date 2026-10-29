@@ -18,6 +18,7 @@ from authfi._protocol.ids import idempotency_key, request_id
 from authfi._protocol.oauth import CLIENT_ASSERTION_TYPE
 from authfi._transport import user_agent
 from authfi._version import __version__
+from authfi.admin import Admin, AsyncAdmin
 from authfi.agents import (
     ActionDecision,
     AgentAuth,
@@ -132,9 +133,11 @@ __all__ = [
     "APIError",
     "AccessToken",
     "ActionDecision",
+    "Admin",
     "AgentAuth",
     "AgentKey",
     "Approval",
+    "AsyncAdmin",
     "AsyncAgentAuth",
     "AsyncAuthFI",
     "AsyncClientCredentials",

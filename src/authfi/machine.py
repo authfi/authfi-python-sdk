@@ -27,6 +27,7 @@ from authfi.tokens import AsyncTokenSource, Destinations, TokenSource
 
 if TYPE_CHECKING:
     from authfi._protocol.oauth import TokenResponse
+    from authfi.admin import Admin, AsyncAdmin
     from authfi.client import AsyncAuthFI, AuthFI
 
 __all__ = ["AsyncClientCredentials", "ClientCredentials"]
@@ -130,6 +131,7 @@ class ClientCredentials(TokenSource):
         )
         self.project = project
         self._cache: SyncCache[Secret] = SyncCache(project.clock, max_entries=1)
+        self._admin: Admin | None = None
 
     @property
     def client_id(self) -> str:
@@ -162,6 +164,15 @@ class ClientCredentials(TokenSource):
 
         return self._cache.get(self._config.key, mint, refresh=force).reveal()
 
+    @property
+    def admin(self) -> Admin:
+        """The admin API (organizations, users, roles, bindings) called with this client's token."""
+        if self._admin is None:
+            from authfi.admin import Admin
+
+            self._admin = Admin(self, project=self.project)
+        return self._admin
+
     def __repr__(self) -> str:
         return f"ClientCredentials(client_id={self.client_id!r}, resource={self.resource!r})"
 
@@ -193,6 +204,7 @@ class AsyncClientCredentials(AsyncTokenSource):
         )
         self.project = project
         self._cache: AsyncCache[Secret] = AsyncCache(project.clock, max_entries=1)
+        self._admin: AsyncAdmin | None = None
 
     @property
     def client_id(self) -> str:
@@ -224,6 +236,15 @@ class AsyncClientCredentials(AsyncTokenSource):
             return response.access_token, lifetime_for(response)
 
         return (await self._cache.get(self._config.key, mint, refresh=force)).reveal()
+
+    @property
+    def admin(self) -> AsyncAdmin:
+        """The admin API (organizations, users, roles, bindings) called with this client's token."""
+        if self._admin is None:
+            from authfi.admin import AsyncAdmin
+
+            self._admin = AsyncAdmin(self, project=self.project)
+        return self._admin
 
     def __repr__(self) -> str:
         return f"AsyncClientCredentials(client_id={self.client_id!r}, resource={self.resource!r})"
