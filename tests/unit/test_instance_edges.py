@@ -19,9 +19,9 @@ from authfi._protocol.instance import (
     refusal_with_fix,
 )
 from authfi.errors import APIError, OAuthError
-from authfi.instance import AsyncInstanceAuth, Configuration, Evidence, InstanceAuth
+from authfi.instance import AsyncInstanceAuth, Evidence, InstanceAuth
 from tests.agent_platform import AGENT
-from tests.instance_platform import CONFIG, InstancePlatform
+from tests.instance_platform import CONFIG, CONFIG_REF, InstancePlatform
 
 
 def reply(status: int, body: Any, *, raw: bytes | None = None) -> HttpResponse:
@@ -126,7 +126,7 @@ def test_the_instance_key_signs_nothing_an_agent_key_would(platform: InstancePla
 
 def test_unusable_evidence_is_named(platform: InstancePlatform, tmp_path: Path) -> None:
     project = authfi.AuthFI(platform.issuer, http_client=platform.client())
-    config = Configuration(CONFIG["version"], CONFIG["digest"])
+    config = CONFIG_REF
     missing = InstanceAuth(project, AGENT, Evidence("device", str(tmp_path / "none"), "k"), config=config)
     with pytest.raises(ConfigurationError, match="AUTHFI_DEVICE_KEY_KID"):
         missing.token()
@@ -220,9 +220,7 @@ async def test_the_asyncio_credential_names_what_is_missing(platform: InstancePl
     with pytest.raises(ConfigurationError, match="no evidence"):
         AsyncInstanceAuth.from_environment(project, {"AUTHFI_AGENT_ID": AGENT, "AUTHFI_DEVICE_KEY_FILE": ""})
     platform.discovery["grant_types_supported"] = ["authorization_code"]
-    agent = AsyncInstanceAuth(
-        project, AGENT, Evidence("k8s", str(token_file)), config=Configuration(CONFIG["version"], CONFIG["digest"])
-    )
+    agent = AsyncInstanceAuth(project, AGENT, Evidence("k8s", str(token_file)), config=CONFIG_REF)
     with pytest.raises(NotSupportedError, match="client credentials"):
         await agent.token()
     with pytest.raises(NotSupportedError):

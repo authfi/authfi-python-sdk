@@ -81,7 +81,7 @@ def test_the_header_decides_whether_the_proof_is_a_proof() -> None:
 
 
 def test_a_signature_by_another_key_and_a_missing_jti_are_refused() -> None:
-    key = DPoPKey()
+    key = DPoPKey("ES256")
     claims = {"htm": "POST", "htu": URL, "iat": int(time.time()), "jti": "j"}
     other = ec.generate_private_key(ec.SECP256R1())
     forged = jwt.encode(claims, other, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": key.public_jwk()})
@@ -90,6 +90,22 @@ def test_a_signature_by_another_key_and_a_missing_jti_are_refused() -> None:
     own = jwt.encode(without, other, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": _jwk_of(other)})
     thumb = DPoPKey()  # the token's key is irrelevant: the jti check comes first
     assert code_of(lambda: check(own, thumb)) == "dpop_proof_jti_missing"
+
+
+def test_an_algorithm_that_does_not_fit_the_proofs_key_is_refused_not_a_server_error() -> None:
+    ed_key = DPoPKey("EdDSA")
+    claims = {"htm": "POST", "htu": URL, "iat": int(time.time()), "jti": "j"}
+    other = ec.generate_private_key(ec.SECP256R1())
+    mislabelled = jwt.encode(claims, other, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": ed_key.public_jwk()})
+    assert code_of(lambda: check(mislabelled, ed_key)) == "dpop_proof_alg_mismatch"
+    ec_key = DPoPKey("ES256")
+    ed_signed = jwt.encode(
+        claims,
+        ed25519.Ed25519PrivateKey.generate(),
+        algorithm="EdDSA",
+        headers={"typ": "dpop+jwt", "jwk": ec_key.public_jwk()},
+    )
+    assert code_of(lambda: check(ed_signed, ec_key)) == "dpop_proof_alg_mismatch"
 
 
 def _jwk_of(key: ec.EllipticCurvePrivateKey) -> dict[str, Any]:

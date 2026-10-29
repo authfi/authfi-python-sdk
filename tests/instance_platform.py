@@ -26,12 +26,15 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils
 
+from authfi.instance import Configuration
 from tests.agent_platform import AgentPlatform
 from tests.support import json_response
 
 ATTEST = "/apis/regional/v1/ai/agents/attest"
 CHALLENGE = ATTEST + "/challenge"
-CONFIG = {"version": 7, "digest": "sha256:" + "ab" * 32}
+CONFIG: dict[str, Any] = {"version": 7, "digest": "sha256:" + "ab" * 32}
+#: The same, as the SDK takes it.
+CONFIG_REF = Configuration(7, "sha256:" + "ab" * 32)
 #: The members the attest route reads; any other is a 400.
 ATTEST_FIELDS = {"agent_id", "evidence", "instance_key", "config", "image_digest", "proof"}
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -117,8 +120,6 @@ class InstancePlatform(AgentPlatform):
             body: dict[str, Any] = json.loads(request.content)
         except ValueError:
             return self.refuse_with("request_invalid", 400)
-        if not isinstance(body, dict):
-            return self.refuse_with("request_invalid", 400)
         self.attests.append(body)
         if set(body) - ATTEST_FIELDS:
             return self.refuse_with("request_invalid", 400)
@@ -145,12 +146,10 @@ class InstancePlatform(AgentPlatform):
         kind: str | None = evidence.get("kind")
         if kind != self.binding_kind:
             return self.refuse_with("evidence_kind_mismatch")
-        problem = (
-            self._k8s(evidence) if kind == "k8s" else self._device(evidence, proof["nonce"], thumbprint(key_jwk))
-        )
+        problem = self._k8s(evidence) if kind == "k8s" else self._device(evidence, proof["nonce"], thumbprint(key_jwk))
         if problem is not None:
             return problem
-        want = body.get("config") or {}
+        want: dict[str, Any] = body.get("config") or {}
         approved = self.approved_config
         if want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix("sha256:") != str(
             approved["digest"]

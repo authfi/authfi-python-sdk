@@ -95,6 +95,8 @@ def check_proof(
         raise InvalidToken("dpop_proof_alg_mismatch", f"alg {alg!r} is not ES256 or EdDSA")
     jwk = header.get("jwk")
     key = _public_key(jwk)
+    if alg != ("EdDSA" if cast("dict[str, Any]", jwk).get("kty") == "OKP" else "ES256"):
+        raise InvalidToken("dpop_proof_alg_mismatch", f"alg {alg!r} does not fit the proof's key")
     try:
         claims = jwt.decode(
             proof, key, algorithms=[alg], options={"verify_aud": False, "verify_exp": False, "verify_iat": False}

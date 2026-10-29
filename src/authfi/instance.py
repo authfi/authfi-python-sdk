@@ -11,9 +11,10 @@ with ``audience`` = the project's origin and ``expirationSeconds: 600``), or the
 ``AUTHFI_DEVICE_KEY_FILE``. ``AUTHFI_CONFIG_VERSION`` and ``AUTHFI_CONFIG_DIGEST`` name the signed
 configuration the instance runs, and ``AUTHFI_IMAGE_DIGEST`` its image.
 
-Sign-in is challenge and attest, then the token request (``OAuth-Client-Attestation``, ``-PoP`` and ``DPoP`` headers). The token is bound
-to the instance key, so every call carries ``Authorization: DPoP`` and a fresh proof; ``headers()`` does that, and
-the gateway and the exporters call it. The attestation is renewed before it expires.
+Sign-in is challenge and attest, then the token request (``OAuth-Client-Attestation``, ``-PoP`` and
+``DPoP`` headers). The token is bound to the instance key, so every call carries ``Authorization: DPoP``
+and a fresh proof; ``headers()`` does that, and the gateway and the exporters call it. The attestation is
+renewed before it expires.
 
 Acting for a person (CIBA) and the approval calls still authenticate with an agent key and are refused here
 with the fix; token exchange works.
@@ -145,7 +146,9 @@ class _Core:
                 "without one."
             )
         if image_digest is not None and not _IMAGE_DIGEST.fullmatch(image_digest):
-            raise ConfigurationError(f"AUTHFI_IMAGE_DIGEST is sha256: and 64 lowercase hex digits; got {image_digest!r}")
+            raise ConfigurationError(
+                f"AUTHFI_IMAGE_DIGEST is sha256: and 64 lowercase hex digits; got {image_digest!r}"
+            )
         self.evidence = evidence
         self.agent_id = agent_id
         self.issuer = issuer
@@ -232,9 +235,7 @@ class _Core:
     def pop(self, now: float) -> str:
         return self.key().sign_jwt(pop_claims(self.agent_id, self.issuer, now), typ=_POP_TYP)
 
-    def token_request(
-        self, endpoint: str, attestation: Attestation, resource: str | None, clock: Clock
-    ) -> HttpRequest:
+    def token_request(self, endpoint: str, attestation: Attestation, resource: str | None, clock: Clock) -> HttpRequest:
         """The token request: attestation, proof of the key, and a DPoP proof, fresh per attempt."""
         key = self.key()
 
@@ -465,7 +466,6 @@ class AsyncInstanceAuth(AsyncAgentAuth):
                 "client_credentials", "This AuthFI project does not offer the client credentials grant."
             )
         attestation = await self._attest()
-        origin = await self.project.resolve_api_origin()
         endpoint = metadata.token_endpoint
 
         async def attested() -> HttpRequest:

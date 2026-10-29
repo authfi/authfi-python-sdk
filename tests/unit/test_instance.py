@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+import httpx
 import jwt
 import pytest
 
@@ -13,7 +14,7 @@ from authfi import AgentKey, ConfigurationError, NotSupportedError
 from authfi.errors import APIError, OAuthError
 from authfi.instance import AsyncInstanceAuth, Evidence, InstanceAuth, find_evidence
 from tests.agent_platform import AGENT
-from tests.instance_platform import ATTEST, ATTEST_FIELDS, CHALLENGE, CONFIG, InstancePlatform
+from tests.instance_platform import ATTEST, ATTEST_FIELDS, CHALLENGE, CONFIG, CONFIG_REF, InstancePlatform
 from tests.support import FakeClock, json_response
 
 
@@ -181,6 +182,9 @@ def test_the_device_signature_is_over_the_nonce_the_agent_and_the_instance_key(t
         def sign(self, data: bytes) -> bytes:
             return private.sign(data)
 
+        def public_jwk(self) -> dict[str, str]:
+            return {}
+
     token = _device_signature(Device(), "agt_test1", "n-1", "jkt-1")
     signature = base64_decode(token)
     private.public_key().verify(signature, b"authfi-agent-attest" + b"\n" + b"n-1\nagt_test1\njkt-1")
@@ -292,12 +296,11 @@ def test_a_replayed_evidence_token_is_refused(platform: InstancePlatform, tmp_pa
 
 
 def test_a_kind_of_workload_the_agent_is_not_bound_to_is_refused(platform: InstancePlatform, token_file: Path) -> None:
-    config = authfi.instance.Configuration(CONFIG["version"], CONFIG["digest"])
     agent = InstanceAuth(
         authfi.AuthFI(platform.issuer, http_client=platform.client()),
         AGENT,
         Evidence("gcp", str(token_file)),
-        config=config,
+        config=CONFIG_REF,
     )
     with pytest.raises(APIError) as caught:
         agent.token()
@@ -394,7 +397,9 @@ def test_a_challenge_without_a_nonce_is_refused(platform: InstancePlatform, toke
     agent.project.close()
 
 
-def test_a_reply_wrapped_in_data_is_not_the_contract_and_is_not_read(platform: InstancePlatform, token_file: Path) -> None:
+def test_a_reply_wrapped_in_data_is_not_the_contract_and_is_not_read(
+    platform: InstancePlatform, token_file: Path
+) -> None:
     platform.route(
         "POST",
         "/apis/regional/v1/ai/agents/attest/challenge",
@@ -443,7 +448,12 @@ def test_the_proof_and_the_pop_are_signed_in_the_algorithm_of_the_instance_key(
 def test_the_token_request_asks_for_no_challenge_of_its_own(platform: InstancePlatform, token_file: Path) -> None:
     calls: list[int] = []
     inner = platform._challenge  # pyright: ignore[reportPrivateUsage]
-    platform.route("POST", CHALLENGE, lambda r: calls.append(1) or inner(r))
+
+    def counted(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return inner(request)
+
+    platform.route("POST", CHALLENGE, counted)
     agent = connect(platform, token_file)
     agent.token()
     agent.token(force=True)
