@@ -53,7 +53,8 @@ APPROVAL_ARGUMENT = "_authfi_approval_id"
 REFUSAL_META = "io.authfi/refusal"
 #: ``_meta`` key, in ``tools/list``, of the grant object a tool needs.
 SCOPE_META = "io.authfi/scope"
-#: The tool annotation with the calling agent's advisory outlook for a tool.
+#: The key of the calling agent's advisory outlook for a tool: in ``_meta`` (which every ``mcp`` client
+#: keeps), and in the tool annotations for older gateways (``mcp`` 2.x drops unknown annotation keys).
 GOVERNANCE_ANNOTATION = "io.authfi/governance"
 #: What a model is told about a held call: the wait, never an instruction or an id.
 HOLD_MESSAGE = "This action is waiting for a person's approval in AuthFI."
@@ -224,7 +225,9 @@ def governance_of(tool: object) -> str | None:
     ``no_policy_restriction``, ``may_require_approval`` or ``never_allowed``; ``None`` when the
     gateway has no opinion. Advisory only: the gateway decides each call.
     """
-    value = _annotation(tool, GOVERNANCE_ANNOTATION)
+    value = _meta(tool).get(GOVERNANCE_ANNOTATION)
+    if not (isinstance(value, str) and value):  # a gateway from before the outlook rode in _meta
+        value = _annotation(tool, GOVERNANCE_ANNOTATION)
     return value if isinstance(value, str) and value else None
 
 
