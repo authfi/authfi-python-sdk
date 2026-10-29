@@ -52,6 +52,8 @@ claude-agent = ["claude-agent-sdk>=0.2.168,<0.3", "mcp>=1.30,<2", "langsmith>=0.
 # litellm 1.92 releases import orjson without requiring it, and 1.106 needs a newer mcp than google-adk 2.12
 # allows: the range excludes both, and the adapters job installs the newest version inside it.
 adk = ["google-adk>=2.12,<2.13", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
+# 1.16.0 is the lowest release the adapters job proves; xmlsec ships wheels for the platforms we run on.
+saml = ["python3-saml>=1.16.0,<2"]
 
 [project.urls]
 Homepage = "https://authfi.io"
@@ -97,6 +99,7 @@ dev = [
     "openai-agents[litellm]>=0.24,<0.25",
     "claude-agent-sdk>=0.2.168,<0.3",
     "google-adk>=2.12,<2.13",
+    "python3-saml>=1.16.0,<2",
 ]
 
 [tool.pytest.ini_options]
@@ -149,7 +152,7 @@ module = ["tests.compat.*"]
 warn_unreachable = false
 
 [[tool.mypy.overrides]]
-module = ["opentelemetry", "opentelemetry.*"]
+module = ["opentelemetry", "opentelemetry.*", "onelogin", "onelogin.*", "xmlsec", "lxml", "lxml.*"]
 ignore_missing_imports = true
 
 [tool.pyright]
