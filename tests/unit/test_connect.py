@@ -289,12 +289,12 @@ def test_a_framework_that_is_not_installed_names_its_extra(platform: Platform, m
     real = builtins.__import__
 
     def refuse(name: str, *args: object, **kwargs: object) -> object:
-        if name == "langchain_anthropic":
-            raise ImportError("No module named 'langchain_anthropic'")
+        if name == "langchain_core":
+            raise ImportError("No module named 'langchain_core'")
         return real(name, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.delitem(__import__("sys").modules, "authfi.langchain", raising=False)
-    monkeypatch.delitem(__import__("sys").modules, "langchain_anthropic", raising=False)
+    monkeypatch.delitem(__import__("sys").modules, "langchain_core", raising=False)
     monkeypatch.setattr(builtins, "__import__", refuse)
     af = authfi.connect(client_env(platform), http_client=platform.client())
     with pytest.raises(ConfigurationError, match=r"authfi\[langchain\]"):

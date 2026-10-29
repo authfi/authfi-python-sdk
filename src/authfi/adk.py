@@ -86,7 +86,7 @@ CONFIRMATION_CALL = "adk_request_confirmation"
 PAYLOAD_KEY = "authfi_approval_id"
 
 #: The google-adk versions whose private MCP seam this module is tested with.
-TESTED = "google-adk 2.12"
+TESTED = "google-adk 2.12 and 2.13"
 
 #: How many held calls the integration remembers until they are confirmed and run again.
 MEMORY = 10_000
@@ -352,10 +352,9 @@ class ADKIntegration:
         Turning content on is the tenant's policy decision.
         """
         os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true" if capture_content else "false"
-        if capture_content:
-            os.environ.pop("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", None)
-        else:
-            os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = "NO_CONTENT"
+        # google-adk 2.13 puts content on its inference spans only in a span-bearing mode.
+        mode = "SPAN_ONLY" if capture_content else "NO_CONTENT"
+        os.environ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"] = mode
         ours = {"authfi.agent_id": self.agent_id} if self.agent_id else {}
         ours["authfi.run_id"] = self.run_id
         attributes = [

@@ -486,11 +486,15 @@ class ClaudeAgentIntegration:
         LangSmith's integration records the prompt, the system prompt and every tool's input and
         result by default. This installs a LangSmith client that hides inputs and outputs unless
         ``capture_content``, and puts ``authfi_agent_id`` in each run's metadata. ``kwargs`` go to
-        ``configure_claude_agent_sdk`` (``project_name``, ``tags``, ``name``).
+        ``configure_claude_agent_sdk`` (``project_name``, ``tags``, ``name``). Returns ``False`` when LangSmith
+        (or its Claude Agent SDK integration) is not installed.
         """
-        from langsmith.integrations.claude_agent_sdk import (  # pyright: ignore[reportMissingTypeStubs]
-            configure_claude_agent_sdk,  # pyright: ignore[reportUnknownVariableType]
-        )
+        try:
+            from langsmith.integrations.claude_agent_sdk import (  # pyright: ignore[reportMissingTypeStubs]
+                configure_claude_agent_sdk,  # pyright: ignore[reportUnknownVariableType]
+            )
+        except ImportError:
+            return False  # LangSmith is optional: without it nothing is traced to it
 
         metadata = dict(kwargs.pop("metadata", None) or {})
         metadata["authfi_agent_id"] = self.agent_id

@@ -10,6 +10,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- Extras cover each framework's major version (`google-adk` 2.x, `mcp` 2.x where the framework allows it,
+  `litellm` 1.x). `authfi[langchain]` installs only `langchain-core`; the Claude model is
+  `authfi[langchain-anthropic]`. LangSmith is never required, and `configure_tracing()` does nothing without it.
 - `authfi.connect()` and `connect_async()`: the credential the environment names (`AUTHFI_AGENT_ID` with a
   key, or `AUTHFI_CLIENT_ID` with `AUTHFI_CLIENT_SECRET`), with `langchain()`, `langgraph()`,
   `openai_agents()`, `claude_agent()` and `adk()` building the integrations. `client_credentials_from_env()`

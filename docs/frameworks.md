@@ -14,9 +14,11 @@ Any credential works: the agent itself (`af.agent(...)`), or a token it holds fo
 asyncio objects. Every adapter built on the same agent shares the agent's one gateway
 (`agent.gateway()`) and its HTTP client, so making adapters does not make connections.
 
-Each extra pins the framework versions the adapter is tested with. Where a framework has no public
-setting for its HTTP client, the adapter checks the one it uses when it is imported, and raises
-`IntegrationError` naming the tested range rather than send a call without the token.
+Each extra covers the framework's major version and is tested at its lowest and newest release. Where a
+framework has no public setting for its HTTP client, the adapter checks the one it uses when it is imported,
+and raises `IntegrationError` naming the tested version rather than send a call without the token. LangSmith is
+never installed by an extra: when it is present, `configure_tracing()` hides content from it; when it is not,
+there is nothing to hide and `configure_tracing()` returns nothing.
 
 ## One line: `connect()`
 
@@ -83,8 +85,11 @@ options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps
 ## LangChain
 
 ```bash
-pip install "authfi[langchain] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langchain-anthropic] @ git+https://github.com/authfi/authfi-python-sdk@main"
 ```
+
+`authfi[langchain]` installs only `langchain-core`: `LangChainIntegration.gateway` is the credential for any chat
+model that takes an HTTP client. `chat_model()` makes a Claude model, which needs the `langchain-anthropic` extra.
 
 ```python
 from authfi import AuthFI
@@ -343,7 +348,7 @@ gateway marks `never_allowed` is left out (`include_never_allowed=True` keeps it
 is cached for a minute. ADK replaces an MCP connection's HTTP client with a Google mTLS client when
 it finds Google credentials, which would send no AuthFI token; that is turned off for this toolset
 only. The integration checks, when the toolset is made, that the ADK it reaches into is the one it
-is tested with (`google-adk` 2.12, pinned by the extra), and raises `IntegrationError` otherwise.
+is tested with (`google-adk` 2.12 and 2.13), and raises `IntegrationError` otherwise.
 
 **Refusals** reach the model as `{"error": "<why>"}`. ADK turns every MCP failure into text for the
 model; when the gateway refused the token itself, the tool callback raises `GatewayTokenRefused`

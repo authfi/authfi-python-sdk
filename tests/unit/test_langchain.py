@@ -16,7 +16,8 @@ from langchain_core.load import dumps
 
 from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused, IntegrationError
 from authfi._adapters import async_gateway_for
-from authfi.langchain import AuthFIChatAnthropic, LangChainIntegration, _check_seam
+from authfi.langchain import LangChainIntegration
+from authfi.langchain_anthropic import AuthFIChatAnthropic, _check_seam
 from tests.fake_gateway import CaptureServer, FakeGateway
 
 AGENT = "agt_langchain1"
@@ -215,7 +216,7 @@ def test_importing_the_adapter_checks_the_seam_where_it_runs() -> None:
             "import langchain_anthropic",
             "del langchain_anthropic.ChatAnthropic._client",
             "try:",
-            "    import authfi.langchain",
+            "    import authfi.langchain_anthropic",
             "except Exception as error:",
             "    print(type(error).__name__, error)",
             "else:",

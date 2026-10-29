@@ -89,8 +89,9 @@ jobs:
         resolution: [lowest-direct, highest]
         adapter:
           - { extras: "fastapi,flask", tests: "tests/unit/test_api_adapters.py" }
-          - { extras: "langchain,otel", tests: "tests/unit/test_langchain.py" }
-          - { extras: "langgraph,otel", tests: "tests/unit/test_langgraph.py" }
+          - { extras: "langchain", tests: "tests/unit/test_langchain_core.py" }
+          - { extras: "langchain-anthropic,otel", tests: "tests/unit/test_langchain.py tests/unit/test_langchain_core.py" }
+          - { extras: "langgraph,langchain-anthropic,otel", tests: "tests/unit/test_langgraph.py" }
           - { extras: "openai-agents,otel", tests: "tests/unit/test_openai_agents.py" }
           - { extras: "claude-agent", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
           - { extras: "adk,otel", tests: "tests/unit/test_adk.py" }
