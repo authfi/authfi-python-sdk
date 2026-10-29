@@ -36,6 +36,9 @@ jobs:
           - { extras: "openai-agents,otel", overrides: "openai-agents[litellm] mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_openai_agents.py" }
           - { extras: "claude-agent", overrides: "claude-agent-sdk mcp langsmith", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py" }
           - { extras: "adk,otel", overrides: "google-adk litellm mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_adk.py" }
+          - { extras: "pydantic-ai,otel", overrides: "pydantic-ai-slim[anthropic,mcp] anthropic mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_pydantic_ai.py" }
+          - { extras: "llama-index,otel", overrides: "llama-index-core llama-index-llms-anthropic llama-index-tools-mcp anthropic mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_llama_index.py" }
+          - { extras: "crewai,otel", overrides: "crewai[anthropic] mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_crewai.py" }
           - { extras: "otel", overrides: "opentelemetry-sdk opentelemetry-exporter-otlp-proto-http", tests: "tests/unit/test_otel.py" }
           - { extras: "fastapi,flask", overrides: "fastapi flask", tests: "tests/unit/test_signin.py" }
     steps:
