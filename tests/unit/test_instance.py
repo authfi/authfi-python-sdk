@@ -217,6 +217,27 @@ def test_evidence_beats_a_key_file_and_the_key_is_the_labelled_fallback(
     assert "legacy" in caplog.text
 
 
+def test_a_pods_service_account_token_alone_does_not_turn_a_key_file_into_an_instance(
+    platform: InstancePlatform, token_file: Path, tmp_path: Path
+) -> None:
+    key_path = tmp_path / "agent.key"
+    AgentKey.generate(kid="k1").write(str(key_path))
+    env = {
+        "AUTHFI_ISSUER": platform.issuer,
+        "AUTHFI_AGENT_ID": AGENT,
+        "AUTHFI_SERVICE_ACCOUNT_TOKEN_FILE": str(token_file),
+        "AUTHFI_AGENT_KEY_FILE": str(key_path),
+        "AUTHFI_AGENT_KID": "k1",
+    }
+    credential = authfi.connect(env, http_client=platform.client())
+    assert not isinstance(credential, InstanceAuth), "no configuration named: the key file the agent was given"
+    credential.project.close()
+    named = {**env, "AUTHFI_CONFIG_VERSION": str(CONFIG["version"]), "AUTHFI_CONFIG_DIGEST": str(CONFIG["digest"])}
+    instance = authfi.connect(named, http_client=platform.client())
+    assert isinstance(instance, InstanceAuth), "the configuration says it was set up to sign in by attestation"
+    instance.project.close()
+
+
 def test_an_agent_with_no_way_in_is_told_both_ways(platform: InstancePlatform, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("authfi.instance.K8S_TOKEN_PATH", "/nonexistent/token")
     env = {"AUTHFI_ISSUER": platform.issuer, "AUTHFI_AGENT_ID": AGENT}
