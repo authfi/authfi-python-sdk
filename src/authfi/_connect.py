@@ -82,9 +82,9 @@ def connect(
 
     ``AUTHFI_ISSUER`` names the project. Then ``AUTHFI_AGENT_ID`` is an agent, which wins when both are set. It
     signs in as an instance when it shows evidence of where it runs (a projected service-account token, or
-    ``AUTHFI_DEVICE_KEY_FILE``; see :mod:`authfi.instance`) and the configuration it runs, else with ``AUTHFI_AGENT_KEY_FILE`` (or
-    ``AUTHFI_AGENT_PRIVATE_KEY``), the legacy long-lived key; otherwise ``AUTHFI_CLIENT_ID``
-    with ``AUTHFI_CLIENT_SECRET`` is a machine client. A missing variable is a
+    ``AUTHFI_DEVICE_KEY_FILE``; see :mod:`authfi.instance`) and the configuration it runs, else with
+    ``AUTHFI_AGENT_KEY_FILE`` (or ``AUTHFI_AGENT_PRIVATE_KEY``), the legacy long-lived key; otherwise
+    ``AUTHFI_CLIENT_ID`` with ``AUTHFI_CLIENT_SECRET`` is a machine client. A missing variable is a
     :class:`~authfi.ConfigurationError` that names it. ``run_id`` starts the run under that id.
 
     The result carries ``langchain()``, ``langgraph()``, ``openai_agents()``, ``claude_agent()`` and
