@@ -70,6 +70,7 @@ LEGACY_POSITIONAL = {("AgentAuth", "token", "force"), ("AgentAuth", "await_user_
 PLAIN_ON_BOTH = {
     "adk",
     "agent",
+    "bound_key",
     "agent_from_env",
     "claude_agent",
     "client_credentials",

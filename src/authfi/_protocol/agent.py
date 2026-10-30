@@ -17,6 +17,7 @@ never sent again after it may have arrived.
 from __future__ import annotations
 
 import dataclasses
+import json
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -48,11 +49,14 @@ from authfi.secret import Secret
 
 __all__ = [
     "CIBA_GRANT",
+    "TASK_DETAIL_TYPE",
     "TOKEN_EXCHANGE_GRANT",
     "TRANSACTION_TOKEN_PATH",
     "AgentEndpoints",
     "ApprovalRecord",
     "CibaStart",
+    "TaskDetails",
+    "TaskPending",
     "approval_request",
     "authorize_request",
     "ciba_poll_flow",
@@ -63,12 +67,19 @@ __all__ = [
     "parse_agent_configuration",
     "parse_approval",
     "parse_ciba_start",
+    "parse_task_start",
     "parse_transaction_token",
     "read_approval_request",
+    "task_details",
+    "task_request",
     "transaction_token_request",
 ]
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
+#: RFC 9396 ``type`` of the one ``authorization_details`` entry that asks for a task.
+TASK_DETAIL_TYPE = "authfi_mandate"
+_JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
+_MAX_TASK_SECONDS = 30 * 24 * 3600
 TRANSACTION_TOKEN_PATH = "/apis/regional/v1/ai/auth/transaction-token"
 _AUTHORIZE_PATH = "/apis/regional/v1/ai/auth/authorize"
 _SLOW_DOWN_STEP = 5.0
@@ -198,6 +209,7 @@ def ciba_poll_flow(
     request_deadline: float,
     now: Callable[[], float],
     resource: str | None,
+    dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> Flow[TokenResponse]:
     """Poll until the person decides (CIBA §7.3), waiting ``interval`` before the first poll.
 
@@ -219,7 +231,7 @@ def ciba_poll_flow(
         form = {"grant_type": CIBA_GRANT, "auth_req_id": auth_req_id.reveal()}
         if resource:
             form["resource"] = resource
-        response = yield from call(token_request(token_endpoint, form, auth, retry=Retry.NEVER_AFTER_SEND))
+        response = yield from call(token_request(token_endpoint, form, auth, retry=Retry.NEVER_AFTER_SEND, dpop=dpop))
         if response.status == 200:
             return parse_token_response(response, "the token endpoint", grant=CIBA_GRANT)
         error = oauth_error(response, "the token endpoint", grant=CIBA_GRANT)
@@ -241,6 +253,7 @@ def exchange_request(
     actor_token: str,
     resource: str | None,
     scope: Sequence[str] | None,
+    dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> HttpRequest:
     """RFC 8693 token exchange with the agent's own token as the actor, and no client authentication.
 
@@ -259,7 +272,128 @@ def exchange_request(
     scope_text = _space(scope)
     if scope_text:
         form["scope"] = scope_text
-    return token_request(token_endpoint, form, None, retry=Retry.NEVER_AFTER_SEND)
+    return token_request(token_endpoint, form, None, retry=Retry.NEVER_AFTER_SEND, dpop=dpop)
+
+
+# --- tasks ----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDetails:
+    """What the platform granted for a task: the ``authfi_mandate`` entry of the token answer."""
+
+    mandate_id: str
+    template: str
+    tools: tuple[str, ...]
+    budgets: Mapping[str, int]
+    expires_at: str | None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class TaskPending:
+    """A task a person must approve first. ``auth_req_id`` is a bearer handle, held as a :class:`Secret`."""
+
+    auth_req_id: Secret
+    mandate_id: str
+    interval: float
+    approval_url: str | None
+
+    def __repr__(self) -> str:
+        return f"TaskPending(mandate_id={self.mandate_id!r}, interval={self.interval})"
+
+
+def task_request(
+    token_endpoint: str,
+    *,
+    subject_token: str,
+    actor_assertion: Callable[[str], str],
+    template: str,
+    params: Mapping[str, Any] | None,
+    ttl_seconds: int | None,
+    resource: str | None,
+    dpop: Callable[[str, str, str | None], str],
+) -> HttpRequest:
+    """RFC 8693 exchange with RFC 9396 ``authorization_details`` that asks for a task. Never retried after send.
+
+    The person's token is the ``subject_token``. The ``actor_token`` is the agent's own signed assertion,
+    new for every attempt, that names the DPoP key that will hold the task; the request carries a proof of
+    that key. There is no client authentication: the actor assertion is the agent's.
+    """
+    if not _given(template):
+        raise ConfigurationError("template is required: it is the task's name, such as support.refund")
+    if params is not None and not isinstance(cast(object, params), Mapping):
+        raise ConfigurationError("params is a mapping of the template's parameters")
+    detail: dict[str, Any] = {"type": TASK_DETAIL_TYPE, "template": template.strip(), "params": dict(params or {})}
+    if ttl_seconds is not None:
+        if not 0 < ttl_seconds <= _MAX_TASK_SECONDS:
+            raise ConfigurationError("ttl_seconds must be from 1 second to 30 days")
+        detail["ttl_seconds"] = int(ttl_seconds)
+    try:
+        details = json.dumps([detail], separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError("params must be JSON: strings, numbers, booleans, lists and mappings") from exc
+    form = {
+        "grant_type": TOKEN_EXCHANGE_GRANT,
+        "subject_token": subject_token,
+        "subject_token_type": ACCESS_TOKEN_TYPE,
+        "actor_token_type": _JWT_TOKEN_TYPE,
+        "authorization_details": details,
+    }
+    if resource:
+        form["resource"] = resource
+    return dataclasses.replace(
+        token_request(token_endpoint, form, None, retry=Retry.NEVER_AFTER_SEND, dpop=dpop),
+        per_attempt=lambda: Attempt(form={"actor_token": actor_assertion(token_endpoint)}),
+    )
+
+
+def parse_task_start(response: HttpResponse) -> TokenResponse | TaskPending:
+    """The task's first token, or the wait for the person's approval (``authorization_pending``), or the refusal."""
+    body = response.json_object() or {}
+    if response.status == 400 and body.get("error") == "authorization_pending":
+        auth_req_id = body.get("auth_req_id")
+        mandate_id = body.get("authfi_mandate_id")
+        if not isinstance(auth_req_id, str) or not auth_req_id or not isinstance(mandate_id, str) or not mandate_id:
+            raise OAuthError("invalid_response", "the token endpoint held the task without a request to wait on", 400)
+        interval = body.get("interval")
+        url = body.get("approval_url")
+        return TaskPending(
+            auth_req_id=Secret(auth_req_id),
+            mandate_id=mandate_id,
+            interval=float(interval) if isinstance(interval, int | float) and interval > 0 else _DEFAULT_INTERVAL,
+            approval_url=url if isinstance(url, str) and url else None,
+        )
+    return parse_token_response(response, "the token endpoint", grant=TOKEN_EXCHANGE_GRANT)
+
+
+def task_details(response: TokenResponse) -> TaskDetails:
+    """The ``authfi_mandate`` entry of a task's token answer (RFC 9396 section 7)."""
+    entries = response.extra.get("authorization_details")
+    if isinstance(entries, list):
+        for entry in cast(list[object], entries):
+            if isinstance(entry, dict) and cast(dict[str, Any], entry).get("type") == TASK_DETAIL_TYPE:
+                found = cast(dict[str, Any], entry)
+                tools = found.get("tools")
+                budgets = found.get("budgets")
+                expires = found.get("expires_at")
+                return TaskDetails(
+                    mandate_id=str(found.get("mandate_id") or ""),
+                    template=str(found.get("template") or ""),
+                    tools=tuple(t for t in cast(list[object], tools) if isinstance(t, str))
+                    if isinstance(tools, list)
+                    else (),
+                    budgets=types.MappingProxyType(
+                        {
+                            k: v
+                            for k, v in cast(dict[str, Any], budgets).items()
+                            if isinstance(v, int) and not isinstance(v, bool)
+                        }
+                        if isinstance(budgets, dict)
+                        else {}
+                    ),
+                    expires_at=expires if isinstance(expires, str) and expires else None,
+                )
+    raise OAuthError("invalid_response", "the token endpoint answered a task without its authorization_details", 200)
 
 
 # --- the action gate -------------------------------------------------------------------------------

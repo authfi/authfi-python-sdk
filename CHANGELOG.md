@@ -10,6 +10,17 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- An agent's token is bound to a key it holds (DPoP, RFC 9449), and every gateway call proves it: the
+  MCP tools, the models, `/otlp/v1/traces` and the cloud credential door. The server's nonce is
+  answered once. `af.agent(..., dpop=False)` keeps a Bearer token for a process that cannot hold the key
+  (`authfi token` does). Tokens that a person's approval or an exchange yields are bound the same way.
+- `agent.task(...)`, `request_task` and `await_task`: authority for one piece of work (a mandate), asked for
+  with a token exchange and `authorization_details`. The task is a credential: an adapter takes it in the
+  agent's place (`LangGraphIntegration(task)`), and the gateway holds each call to it. A call the task refuses
+  reaches the model with what it can still do (`ToolRefused.why`, `next_step`, `as_dict()`). A task is one
+  level deep.
+- `agent.cloud.credentials(account, role, duration)` for short-lived cloud credentials.
+
 - Extras cover each framework's major version (`google-adk` 2.x, `mcp` 2.x where the framework allows it,
   `litellm` 1.x). `authfi[langchain]` installs only `langchain-core`; the Claude model is
   `authfi[langchain-anthropic]`. LangSmith is never required, and `configure_tracing()` does nothing without it.

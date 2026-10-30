@@ -3,6 +3,7 @@
 Made from the project: ``af.agent(agent_id, key)`` or ``af.agent_from_env()``.
 """
 
+from authfi._protocol.agent import TaskPending
 from authfi.agents.agent import (
     ActionDecision,
     AgentAuth,
@@ -14,6 +15,7 @@ from authfi.agents.agent import (
     TransactionToken,
 )
 from authfi.agents.keys import ASSERTION_LIFETIME, AgentKey, KeyAlgorithm, Signer, assert_public_jwk
+from authfi.agents.task import AsyncTask, Task
 
 __all__ = [
     "ASSERTION_LIFETIME",
@@ -23,10 +25,13 @@ __all__ = [
     "Approval",
     "AsyncAgentAuth",
     "AsyncDelegatedToken",
+    "AsyncTask",
     "CibaRequest",
     "DelegatedToken",
     "KeyAlgorithm",
     "Signer",
+    "Task",
+    "TaskPending",
     "TransactionToken",
     "assert_public_jwk",
 ]

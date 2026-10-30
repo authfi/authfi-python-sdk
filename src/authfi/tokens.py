@@ -121,9 +121,18 @@ class TokenSource(abc.ABC):
         """The current token, renewed when due (or now, with ``force``). A reveal point: keep it brief."""
 
     def headers(self, method: str, url: str) -> dict[str, str]:
-        """The headers that carry this credential to ``url``. Refuses an origin not in :attr:`send_to`."""
+        """The headers that carry this credential to ``url``. Refuses an origin not in :attr:`send_to`.
+
+        A credential bound to a key (an agent's) answers ``Authorization: DPoP`` and a fresh ``DPoP`` proof.
+        """
         check_destination(url, self.send_to)
         return {"Authorization": "Bearer " + self.token()}
+
+    def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """Headers to send ``url`` once more after this answer, or ``None``; a bound credential answers a nonce."""
+        return None
 
     @overload
     def httpx_auth(self) -> httpx.Auth: ...
@@ -163,6 +172,12 @@ class AsyncTokenSource(abc.ABC):
         check_destination(url, self.send_to)
         return {"Authorization": "Bearer " + await self.token()}
 
+    async def retry_headers(
+        self, method: str, url: str, status: int, www_authenticate: str | None, nonce: str | None
+    ) -> dict[str, str] | None:
+        """See :meth:`TokenSource.retry_headers`."""
+        return None
+
     @overload
     def httpx_auth(self) -> httpx.Auth: ...
 
@@ -184,8 +199,19 @@ class _SyncSourceAuth(httpx.Auth):
         self._source = source
 
     def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
-        request.headers.update(self._source.headers(request.method, str(request.url)))
-        yield request
+        method, url = request.method, str(request.url)
+        request.headers.update(self._source.headers(method, url))
+        response = yield request
+        again = self._source.retry_headers(
+            method,
+            url,
+            response.status_code,
+            response.headers.get("www-authenticate"),
+            response.headers.get("dpop-nonce"),
+        )
+        if again is not None:
+            request.headers.update(again)
+            yield request
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         raise ConfigurationError(
@@ -208,8 +234,19 @@ class _AsyncSourceAuth(httpx.Auth):
         yield request  # type: ignore[unreachable]  # pragma: no cover - makes this a generator
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        request.headers.update(await self._source.headers(request.method, str(request.url)))
-        yield request
+        method, url = request.method, str(request.url)
+        request.headers.update(await self._source.headers(method, url))
+        response = yield request
+        again = await self._source.retry_headers(
+            method,
+            url,
+            response.status_code,
+            response.headers.get("www-authenticate"),
+            response.headers.get("dpop-nonce"),
+        )
+        if again is not None:
+            request.headers.update(again)
+            yield request
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self._source!r})"

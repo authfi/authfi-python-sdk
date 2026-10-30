@@ -33,6 +33,15 @@ openai.OpenAI(base_url=gateway.model_base_url("openai"), api_key="unused",
 
 The token is never the SDK's `api_key` or a default header, which tracers record.
 
+## The agent's token is bound to its key
+
+An agent's token is bound to a key this process holds (DPoP). `http_client()`, `new_http_client()`, the
+MCP client factory and `cloud_credentials` send `Authorization: DPoP <token>` and a new proof for every
+request, and answer the server's nonce once (`use_dpop_nonce`). You do nothing. For a request of your own,
+use `agent.headers(method, url)`: a proof is good for one request. A machine client's token is not bound
+(the platform cannot bind a `client_credentials` token), so it stays Bearer, and so does an agent's token for a
+customer's API. `task.gateway()` is this gateway with a task's credential.
+
 ## What the gateway answered
 
 ```python
@@ -42,6 +51,10 @@ match outcome:
     case ToolRefused():                                tell_the_model(outcome.model_text)   # code, reason, required_scope, result
     case ToolApprovalRequired(approval_id=approval):   pause_until_a_person_decides(approval)
 ```
+
+A call a task refused (`EMDT003` to `EMDT014`) says why in one word (`outcome.why`: `outside_task`,
+`over_budget`, `task_ended`, ...) and what the agent can still do (`outcome.next_step`; `outcome.as_dict()`
+for code). `model_text` carries it, and it never offers to start a new task.
 
 `ToolOutcome` is the union of those three frozen dataclasses (from `authfi` or `authfi.gateway`), so a
 type checker narrows each arm: `approval_id` is a `str` where a call is held, and exists nowhere
@@ -73,6 +86,7 @@ credential = outcome.credential       # access_key_id, secret_access_key (a Secr
 ```
 
 A refusal raises `APIError` with the gateway's code. `expires_in` is 1 to 900 seconds, the most the platform issues.
+`agent.cloud.credentials(account, role, duration)` is the same call.
 
 ## In asyncio code
 
