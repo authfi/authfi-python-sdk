@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +16,12 @@ def _fresh_warnings() -> Iterator[None]:
     reset_warn_once()
     yield
     reset_warn_once()
+
+
+@pytest.fixture(autouse=True)
+def _no_pod_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Whatever runs the tests may be a pod with a service-account token: no test finds it unless it names one."""
+    monkeypatch.setattr("authfi.instance.K8S_TOKEN_PATH", str(tmp_path / "no-pod-token"))
 
 
 @pytest.fixture
