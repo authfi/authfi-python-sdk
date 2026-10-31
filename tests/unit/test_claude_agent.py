@@ -504,8 +504,8 @@ def test_a_helper_command_is_quoted_for_the_shell_that_runs_it(monkeypatch: pyte
     from authfi import claude_agent
 
     path = r"C:\Program Files\Python\python.exe"
-    monkeypatch.setattr(claude_agent.os, "name", "nt")
+    monkeypatch.setattr("os.name", "nt")
     assert claude_agent._shell_word(path) == f'"{path}"'
     assert claude_agent._shell_word(r"C:\Python\python.exe") == r"C:\Python\python.exe"
-    monkeypatch.setattr(claude_agent.os, "name", "posix")
+    monkeypatch.setattr("os.name", "posix")
     assert claude_agent._shell_word(path) == f"'{path}'"
