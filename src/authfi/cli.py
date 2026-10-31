@@ -10,6 +10,9 @@
     authfi headers
         {"Authorization": "Bearer ..."} as JSON (an MCP server's headersHelper); with
         AUTHFI_RUN_ID set, X-Request-Id too
+    authfi redteam --origin URL [--baseline FILE] [--send]
+        the platform's red-team corpus against your agent's configuration, read back from your call
+        tape; without --send it prints what it would send (see :mod:`authfi.redteam`)
 
 ``token`` and ``headers`` read the agent as ``AuthFI.from_env().agent_from_env()`` does:
 ``AUTHFI_ISSUER``, ``AUTHFI_AGENT_ID``, ``AUTHFI_AGENT_KEY_FILE``, ``AUTHFI_AGENT_KID`` and
@@ -25,6 +28,7 @@ import os
 import sys
 from collections.abc import Sequence
 
+from authfi import redteam
 from authfi._protocol.ids import is_valid_request_id
 from authfi.agents.keys import AgentKey, KeyAlgorithm
 from authfi.client import AuthFI
@@ -42,6 +46,9 @@ def _parser() -> argparse.ArgumentParser:
     keygen.add_argument("--kid", help="the key id; the public key's thumbprint by default")
     commands.add_parser("token", help="print the agent's current access token")
     commands.add_parser("headers", help="print the agent's request headers as JSON")
+    redteam.add_arguments(
+        commands.add_parser("redteam", help="run the red-team corpus against your agent (a dry run unless --send)")
+    )
     return parser
 
 
@@ -56,6 +63,8 @@ def _keygen(out: str, alg: str, kid: str | None) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; returns the exit code."""
     args = _parser().parse_args(argv)
+    if args.command == "redteam":
+        return redteam.command(args, os.environ, print, lambda text: print(text, file=sys.stderr))
     try:
         if args.command == "keygen":
             return _keygen(args.out, args.alg, args.kid)
