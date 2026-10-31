@@ -40,6 +40,7 @@ import inspect
 import json
 import os
 import shlex
+import subprocess
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -91,6 +92,11 @@ CONTENT_SWITCHES = (
     "OTEL_LOG_TOOL_DETAILS",
     "OTEL_LOG_RAW_API_BODIES",
 )
+
+def _shell_word(word: str) -> str:
+    """One word for the shell Claude Code runs a helper in: cmd.exe on Windows, where POSIX quoting breaks the command."""
+    return subprocess.list2cmdline([word]) if os.name == "nt" else shlex.quote(word)
+
 
 #: How long Claude Code keeps a token from its ``apiKeyHelper`` before running it again: well inside
 #: an agent token's lifetime of minutes.
@@ -426,11 +432,11 @@ class ClaudeAgentIntegration:
         }
         settings = _settings(claude_options.pop("settings", None))
         _refuse_owned(settings.get("env"), "settings['env']", steps=export_steps)
-        settings["apiKeyHelper"] = f"{shlex.quote(sys.executable)} -m authfi token"
+        settings["apiKeyHelper"] = f"{_shell_word(sys.executable)} -m authfi token"
         if export_steps and "otelHeadersHelper" in settings:
             raise ConfigurationError("otelHeadersHelper in settings is set by the integration with export_steps")
         if export_steps:
-            settings["otelHeadersHelper"] = f"{shlex.quote(sys.executable)} -m authfi headers"
+            settings["otelHeadersHelper"] = f"{_shell_word(sys.executable)} -m authfi headers"
         servers = dict(claude_options.pop("mcp_servers", None) or {})
         if self.server_name in servers:
             raise ConfigurationError(
