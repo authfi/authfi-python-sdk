@@ -93,6 +93,7 @@ CONTENT_SWITCHES = (
     "OTEL_LOG_RAW_API_BODIES",
 )
 
+
 def _shell_word(word: str) -> str:
     """One word for the shell that runs a helper: cmd.exe on Windows, where POSIX quoting breaks the command."""
     return subprocess.list2cmdline([word]) if os.name == "nt" else shlex.quote(word)
