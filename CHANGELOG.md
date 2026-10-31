@@ -24,6 +24,18 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - Extras cover each framework's major version (`google-adk` 2.x, `mcp` 2.x where the framework allows it,
   `litellm` 1.x). `authfi[langchain]` installs only `langchain-core`; the Claude model is
   `authfi[langchain-anthropic]`. LangSmith is never required, and `configure_tracing()` does nothing without it.
+- Instance sign-in: on a bound workload `connect()` returns an `InstanceAuth` that signs in by attestation with no key
+  to keep (a projected service-account token or a device key, then challenge, attest and a DPoP-bound token with
+  the `OAuth-Client-Attestation` headers), renews the attestation before it expires, and sends `Authorization: DPoP`
+  with a fresh proof on every call. The agent key file stays as the labelled legacy fallback. See `authfi.instance`.
+- LangSmith tracing: `authfi.otel.register()` also sets `langsmith.span.kind` and `langsmith.trace.name`, every gateway
+  decision is a `tool` child span (`authfi.decision.*`, `authfi.mandate.id`), and a secret-shaped value or a
+  credential-named attribute is replaced before any export, with content capture on or off (`authfi.tracing`).
+- `authfi.langgraph_auth`: an `Auth()` for `langgraph.json` that verifies AuthFI tokens (JWKS, DPoP proof, delegation
+  chain) and asks the project's policy engine about every thread, assistant, run, cron and store call (extra
+  `langgraph-auth`).
+- `authfi.a2a`: fetch and verify an A2A 1.0 agent card (JWS over RFC 8785, certificate chain to a root you trust),
+  call the remote agent with this agent's DPoP-bound token, and map AuthFI decisions to task states.
 - `authfi.connect()` and `connect_async()`: the credential the environment names (`AUTHFI_AGENT_ID` with a
   key, or `AUTHFI_CLIENT_ID` with `AUTHFI_CLIENT_SECRET`), with `langchain()`, `langgraph()`,
   `openai_agents()`, `claude_agent()` and `adk()` building the integrations. `client_credentials_from_env()`

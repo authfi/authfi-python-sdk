@@ -11,6 +11,7 @@ import httpx
 from authfi.agents.agent import AgentAuth, AsyncAgentAuth
 from authfi.client import AsyncAuthFI, AuthFI, AuthFIOptions
 from authfi.errors import ConfigurationError
+from authfi.instance import AsyncInstanceAuth, InstanceAuth, find_evidence
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 
 if TYPE_CHECKING:
@@ -21,6 +22,36 @@ __all__ = ["connect", "connect_async"]
 
 def _names_agent(env: Mapping[str, str]) -> bool:
     return bool(env.get("AUTHFI_AGENT_ID", "").strip())
+
+
+def _names_key(env: Mapping[str, str]) -> bool:
+    return bool(env.get("AUTHFI_AGENT_KEY_FILE", "").strip() or env.get("AUTHFI_AGENT_PRIVATE_KEY", "").strip())
+
+
+def _no_way_in() -> ConfigurationError:
+    return ConfigurationError(
+        "AUTHFI_AGENT_ID is set but the agent has no way to sign in: bind its workload and run it there "
+        "(a projected service-account token, or AUTHFI_DEVICE_KEY_FILE), or, legacy, set AUTHFI_AGENT_KEY_FILE"
+    )
+
+
+def _legacy_key_note(project: AuthFI | AsyncAuthFI) -> None:
+    project.logger.info(
+        "signing in with a long-lived agent key (legacy): bind the agent's workload to sign in by instance "
+        "attestation, with no key to keep"
+    )
+
+
+def _signs_in_as_instance(env: Mapping[str, str]) -> bool:
+    """Whether the environment shows an instance: evidence of where it runs, and the configuration it runs.
+
+    Every pod has a service-account token, so evidence alone does not say the agent was set up to sign in by
+    attestation: a key file named with no configuration is the legacy key, as it always was.
+    """
+    if find_evidence(env) is None:
+        return False
+    named_config = bool(env.get("AUTHFI_CONFIG_VERSION", "").strip() or env.get("AUTHFI_CONFIG_DIGEST", "").strip())
+    return named_config or not _names_key(env)
 
 
 def _names_client(env: Mapping[str, str]) -> bool:
@@ -49,9 +80,11 @@ def connect(
 ) -> AgentAuth | ClientCredentials:
     """The credential the environment names, for blocking code.
 
-    ``AUTHFI_ISSUER`` names the project. Then ``AUTHFI_AGENT_ID`` with ``AUTHFI_AGENT_KEY_FILE`` (or
-    ``AUTHFI_AGENT_PRIVATE_KEY``) is an agent, which wins when both are set; otherwise ``AUTHFI_CLIENT_ID``
-    with ``AUTHFI_CLIENT_SECRET`` is a machine client. A missing variable is a
+    ``AUTHFI_ISSUER`` names the project. Then ``AUTHFI_AGENT_ID`` is an agent, which wins when both are set. It
+    signs in as an instance when it shows evidence of where it runs (a projected service-account token, or
+    ``AUTHFI_DEVICE_KEY_FILE``; see :mod:`authfi.instance`) and the configuration it runs, else with
+    ``AUTHFI_AGENT_KEY_FILE`` (or ``AUTHFI_AGENT_PRIVATE_KEY``), the legacy long-lived key; otherwise
+    ``AUTHFI_CLIENT_ID`` with ``AUTHFI_CLIENT_SECRET`` is a machine client. A missing variable is a
     :class:`~authfi.ConfigurationError` that names it. ``run_id`` starts the run under that id.
 
     The result carries ``langchain()``, ``langgraph()``, ``openai_agents()``, ``claude_agent()`` and
@@ -63,7 +96,13 @@ def connect(
     try:
         credential: AgentAuth | ClientCredentials
         if _names_agent(source):
-            credential = project.agent_from_env(source, resource=resource)
+            if _signs_in_as_instance(source):
+                credential = InstanceAuth.from_environment(project, source, resource=resource)
+            elif _names_key(source):
+                _legacy_key_note(project)
+                credential = project.agent_from_env(source, resource=resource)
+            else:
+                raise _no_way_in()
         elif _names_client(source):
             credential = project.client_credentials_from_env(source, resource=resource)
         else:
@@ -92,7 +131,13 @@ def connect_async(
     project = AsyncAuthFI.from_env(source, http_client=http_client, **options)
     credential: AsyncAgentAuth | AsyncClientCredentials
     if _names_agent(source):
-        credential = project.agent_from_env(source, resource=resource)
+        if _signs_in_as_instance(source):
+            credential = AsyncInstanceAuth.from_environment(project, source, resource=resource)
+        elif _names_key(source):
+            _legacy_key_note(project)
+            credential = project.agent_from_env(source, resource=resource)
+        else:
+            raise _no_way_in()
     elif _names_client(source):
         credential = project.client_credentials_from_env(source, resource=resource)
     else:
