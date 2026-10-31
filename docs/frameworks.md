@@ -274,7 +274,9 @@ async with ClaudeSDKClient(options) as client:
 ```
 
 **The model.** Claude Code runs `python -m authfi token` as its `apiKeyHelper` and calls the AI
-gateway with that token, running it again every four minutes. The helper signs as the agent with
+gateway with that token, running it again every four minutes. That token is a Bearer token: Claude Code's
+process cannot hold the agent's key, so its model calls carry no DPoP proof, and the gateway admits them only
+while its model proof check (`MCP_MODEL_PROOF_CHECK`) is not enforced, or for a workload the node cages. The helper signs as the agent with
 the agent's key file, so the agent's key must be loaded from a file (`AgentKey.from_file` or
 `AUTHFI_AGENT_KEY_FILE`). Claude Code's options and environment hold the file's path, never the key
 or a token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or

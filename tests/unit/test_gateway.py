@@ -485,3 +485,24 @@ def test_a_refusal_is_found_in_both_mcp_error_shapes() -> None:
     other = RuntimeError("mcp 1.x")
     other.error = SimpleNamespace(data={"authfi_refusal": "something else"})  # type: ignore[attr-defined]
     assert token_refusal(other) is None
+
+
+def test_learn_nonce_from_keeps_the_nonce_of_a_use_dpop_nonce_answer_and_nothing_else() -> None:
+    from authfi import _dpop
+    from authfi.gateway import learn_nonce_from
+
+    url = "https://nonce-learner.authfi.io/mcp/v1/messages"
+    asked = httpx.Response(401, headers={"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "n-1"})
+    assert learn_nonce_from(asked, url)
+    assert _dpop.nonces.get(url) == "n-1"
+
+    other = "https://other-learner.authfi.io/mcp/v1/messages"
+    for answer in (
+        httpx.Response(401, headers={"www-authenticate": 'Bearer error="invalid_token"', "dpop-nonce": "n-2"}),
+        httpx.Response(403, headers={"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "n-2"}),
+        httpx.Response(401, headers={"www-authenticate": 'DPoP error="use_dpop_nonce"'}),
+        httpx.Response(200),
+    ):
+        assert not learn_nonce_from(answer, other)
+    assert _dpop.nonces.get(other) is None
+    assert not learn_nonce_from(object(), other)
