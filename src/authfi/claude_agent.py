@@ -94,7 +94,7 @@ CONTENT_SWITCHES = (
 )
 
 def _shell_word(word: str) -> str:
-    """One word for the shell Claude Code runs a helper in: cmd.exe on Windows, where POSIX quoting breaks the command."""
+    """One word for the shell that runs a helper: cmd.exe on Windows, where POSIX quoting breaks the command."""
     return subprocess.list2cmdline([word]) if os.name == "nt" else shlex.quote(word)
 
 
