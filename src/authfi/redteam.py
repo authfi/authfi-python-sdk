@@ -189,12 +189,12 @@ def _baseline_of(doc: object, what: str) -> Baseline:
         raise RedTeamError(
             f"{what}: system must be the agent's system prompt (with none there is nothing to tamper with)"
         )
-    tool_list = tools if isinstance(tools, list) else None
+    tool_list: list[Any] | None = tools if isinstance(tools, list) else None  # pyright: ignore[reportUnknownVariableType]
     if tool_list is None or not all(
         isinstance(t, dict) and isinstance(cast("dict[str, Any]", t).get("function"), dict) for t in tool_list
     ):
         raise RedTeamError(f"{what}: tools must be a list of {{'type': 'function', 'function': {{...}}}} objects")
-    model_list = models if isinstance(models, list) else None
+    model_list: list[Any] | None = models if isinstance(models, list) else None  # pyright: ignore[reportUnknownVariableType]
     if not model_list or not all(isinstance(m, str) and m for m in model_list):
         raise RedTeamError(f"{what}: models must list at least one model, as <upstream>/<model>")
     return Baseline(system, tuple(copy.deepcopy(cast("list[dict[str, Any]]", tool_list))), cast(str, model_list[0]))
@@ -364,7 +364,8 @@ class _Tape:
         if response.status_code != 200 or errors:
             what = errors[0].get("message") if errors else f"HTTP {response.status_code}"
             raise RedTeamError(f"the call tape could not be read: {what}")
-        return cast("list[dict[str, Any]]", (document.get("data") or {}).get("mcpCallEvents") or [])
+        data = cast("dict[str, Any]", document.get("data") or {})
+        return cast("list[dict[str, Any]]", data.get("mcpCallEvents") or [])
 
 
 def _classify(case: Case, rows: Sequence[Mapping[str, Any]]) -> tuple[str, str, str]:

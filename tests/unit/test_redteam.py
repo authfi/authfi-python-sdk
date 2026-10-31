@@ -49,7 +49,7 @@ def _config_code(approved: redteam.Baseline, api: str, req: dict[str, Any]) -> s
             return "EACFG005"
     if systems != [approved.system]:
         return "EACFG005"
-    if any(t not in approved_tools for t in req.get("tools") or []):
+    if any(t not in approved_tools for t in cast("list[dict[str, Any]]", req.get("tools") or [])):
         return "EACFG006"
     return "EACFG007" if req.get("model") != approved.model else ""
 
@@ -381,13 +381,29 @@ def test_nothing_is_sent_when_the_tape_cannot_be_read(key: AgentKey) -> None:
         assert stand.model_paths() == []
 
 
+def _tape_403(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(403, json={})
+
+
+def _tape_500(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(500, text="oops")
+
+
+def _tape_error(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"errors": [{"message": "no field"}]})
+
+
+def _tape_down(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("down", request=request)
+
+
 @pytest.mark.parametrize(
     ("handler", "message"),
     [
-        (lambda _r: httpx.Response(403, json={}), "refused the token \\(HTTP 403\\)"),
-        (lambda _r: httpx.Response(500, text="oops"), "could not be read: HTTP 500"),
-        (lambda _r: httpx.Response(200, json={"errors": [{"message": "no field"}]}), "could not be read: no field"),
-        (lambda _r: (_ for _ in ()).throw(httpx.ConnectError("down")), "cannot reach the call tape"),
+        (_tape_403, r"refused the token \(HTTP 403\)"),
+        (_tape_500, "could not be read: HTTP 500"),
+        (_tape_error, "could not be read: no field"),
+        (_tape_down, "cannot reach the call tape"),
     ],
 )
 def test_a_tape_that_fails_stops_the_run_before_anything_is_sent(
@@ -451,7 +467,7 @@ def test_the_requests_are_the_corpus_edits_with_a_request_id_each_and_the_agents
 
 
 def test_the_attacks_are_edits_of_the_customers_own_configuration(stand: Stand, key: AgentKey, tmp_path: Path) -> None:
-    tool = {
+    tool: dict[str, Any] = {
         "type": "function",
         "function": {"name": "pay", "description": "pay", "parameters": {"properties": {"a": {}}}},
     }
