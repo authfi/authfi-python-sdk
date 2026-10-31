@@ -94,7 +94,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
 from authfi._holds import Decided, Held, HeldCalls, guard, text_of, wait_for_decision
 from authfi.errors import ConfigurationError, GatewayTokenRefused
-from authfi.gateway import AsyncGateway, token_refusal
+from authfi.gateway import AsyncGateway, learn_nonce_from, token_refusal
 from authfi.gateway import PendingApproval as BasePendingApproval
 from authfi.tokens import AsyncTokenSource
 
@@ -259,9 +259,15 @@ class AuthFIInterceptor(BaseInterceptor[httpx.Request, httpx.Response]):
 
     def _saw(self, message: httpx.Response) -> httpx.Response:
         """Record the gateway's answer to the token: CrewAI's model errors would otherwise hide a 401."""
+        url = self.gateway.model_base_url("anthropic")  # the transport's response has no request yet
+        if learn_nonce_from(message, url):
+            # The gateway wants its nonce in the proof, which is not a refused token. The nonce is kept for the
+            # next attempt, and the provider SDK is told to make it: a 401 is not retried unless the answer says so.
+            message.headers["x-should-retry"] = "true"
+            return message
         if message.status_code == 401:
             self.gateway.token_refused = GatewayTokenRefused(
-                self.gateway.model_base_url("anthropic"),  # the transport's response has no request yet
+                url,
                 message.headers.get("www-authenticate"),
                 request_id=message.headers.get("x-request-id"),
             )

@@ -81,9 +81,13 @@ class AgentGateway(FakeGateway):
         always_challenge: bool = False,
         bind: bool = True,
         dpop_algs: tuple[str, ...] = ("EdDSA", "ES256"),
+        model_proof: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        #: The gateway's MCP_MODEL_PROOF_CHECK=enforce: a model call whose token is bound to nothing is refused.
+        self.model_proof = model_proof
+        self.unproven_model_calls: list[str] = []  # the path of each model call refused for its holder
         self.nonce = nonce
         self.always_challenge = always_challenge
         self.bind = bind
@@ -296,6 +300,10 @@ class AgentGateway(FakeGateway):
             if refusal is not None:
                 return refusal
             assert info is not None
+            if self.model_proof and path.startswith("/mcp/v1/") and not info.get("jkt"):
+                self.unproven_model_calls.append(path)
+                refusal_body = {"error": {"type": "permission_error", "code": "EMODEL020", "message": "unproven"}}
+                return 403, {}, json.dumps(refusal_body).encode()
             if info["kind"] == "task" and info["mandate_id"] in self.ended:
                 return (
                     401,

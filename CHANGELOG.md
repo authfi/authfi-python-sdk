@@ -10,6 +10,12 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- A model call that goes to the AI gateway with no DPoP proof is said once in the log: the gateway refuses such a
+  call once its model proof check (`MCP_MODEL_PROOF_CHECK=enforce`) is on, unless the workload is caged. Claude
+  Code's model calls (`authfi token` as `apiKeyHelper`) are always in this group: its process cannot hold the key.
+  `authfi.gateway.learn_nonce_from` keeps the nonce a gateway asked for in an answer the caller cannot resend.
+- CrewAI's model calls answer the gateway's DPoP nonce: the nonce is kept and the provider SDK is told to try
+  again, where a nonce challenge was reported as a refused token and never learned.
 - An agent's token is bound to a key it holds (DPoP, RFC 9449), and every gateway call proves it: the
   MCP tools, the models, `/otlp/v1/traces` and the cloud credential door. The server's nonce is
   answered once. `af.agent(..., dpop=False)` keeps a Bearer token for a process that cannot hold the key

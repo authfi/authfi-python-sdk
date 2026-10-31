@@ -25,6 +25,7 @@ import httpx
 
 from authfi import _dpop
 from authfi._decision_span import record_decision
+from authfi._log import warn_once
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
     CLOUD_PATH,
@@ -64,10 +65,14 @@ __all__ = [
     "ToolOutcome",
     "ToolRefused",
     "asked_for_nonce",
+    "learn_nonce_from",
     "token_refusal",
 ]
 
 ModelApi = Literal["anthropic", "openai"]
+
+#: Where the AI gateway's model routes begin, under the gateway's resource.
+MODEL_PATH_PREFIX = "/mcp/v1/"
 
 #: The JSON-RPC error an MCP client gets when the gateway refuses the token (see ``mcp_client_factory``).
 TOKEN_REFUSED_RPC_CODE = -32001
@@ -185,6 +190,23 @@ def asked_for_nonce(error: BaseException) -> bool:
         stack.append(current.__cause__)
         stack.append(current.__context__)
     return False
+
+
+def learn_nonce_from(response: object, url: str) -> bool:
+    """Keep the nonce an httpx or httpx2 ``response`` asked for; ``True`` when it refused the call for want of one.
+
+    For a client that makes the request itself and cannot send it again (CrewAI's transport interceptor): the
+    next attempt, which the provider SDK's retry makes, then carries the nonce.
+    """
+    headers = getattr(response, "headers", None)
+    get = getattr(headers, "get", None)
+    status = getattr(response, "status_code", None)
+    if not callable(get) or not isinstance(status, int):
+        return False
+    challenge, nonce = get("www-authenticate"), get("dpop-nonce")
+    return _dpop.learn_nonce(
+        url, status, challenge if isinstance(challenge, str) else None, nonce if isinstance(nonce, str) else None
+    )
 
 
 def _ignore(refused: GatewayTokenRefused | None) -> None:
@@ -360,12 +382,27 @@ class _GatewayBase:
         return cast(str, next_in_run()) if callable(next_in_run) else request_id()
 
     def _stamp(self, request: httpx.Request) -> None:
+        self._warn_if_unproven(request)
         if "x-request-id" not in request.headers:
             request.headers["X-Request-Id"] = self._next_request_id()
         headers = dict(request.headers)
         inject_traceparent(headers)
         if "traceparent" in headers and "traceparent" not in request.headers:
             request.headers["traceparent"] = headers["traceparent"]
+
+    def _warn_if_unproven(self, request: httpx.Request) -> None:
+        """Say once that a model call has no DPoP proof, which the AI gateway refuses when its check enforces."""
+        path = request.url.path
+        if not path.startswith(MODEL_PATH_PREFIX) or "dpop" in request.headers:
+            return
+        warn_once(
+            self._project.logger,
+            ("model-call-unproven", self.mcp_url),
+            "a model call to %s carries a Bearer token and no DPoP proof; the AI gateway refuses such a call once its "
+            "proof check (MCP_MODEL_PROOF_CHECK) is enforced, unless the workload is caged. Use a credential that is "
+            "bound to this process's key (authfi.connect(), or agent(..., dpop=True)).",
+            self.mcp_url,
+        )
 
     def _now(self) -> float:
         return self._project.clock.time()
