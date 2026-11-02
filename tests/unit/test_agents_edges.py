@@ -106,15 +106,15 @@ def test_api_answers_without_data_or_with_a_refusal() -> None:
 
 def test_request_builders_refuse_empty_values() -> None:
     with pytest.raises(ConfigurationError):
-        wire.transaction_token_request(ISSUER, "t", action=" ", resource=None, context=None)
+        wire.transaction_token_request(ISSUER, {}, action=" ", resource=None, context=None)
     with pytest.raises(ConfigurationError):
         wire.approval_request(ISSUER, agent_id="a", sign=str, audience=ISSUER, action="", context=None, expires_in=10)
     with pytest.raises(ConfigurationError):
         wire.approval_request(ISSUER, agent_id="a", sign=str, audience=ISSUER, action="act", context=None, expires_in=0)
     with pytest.raises(DiscoveryError):
-        wire.read_approval_request(ISSUER + "/approvals", "a", "t")
+        wire.approval_url(ISSUER + "/approvals", "a")
     with pytest.raises(ConfigurationError):
-        wire.read_approval_request(ISSUER + "/approvals/{id}", " ", "t")
+        wire.approval_url(ISSUER + "/approvals/{id}", " ")
     assert wire.label_claims("not-a-token") == {}
 
 

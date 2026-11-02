@@ -422,9 +422,14 @@ def _data(response: HttpResponse, what: str, ok: tuple[int, ...] = (200,)) -> di
     return cast(dict[str, Any], data)
 
 
+def transaction_token_url(api_origin: str) -> str:
+    """Where a transaction token is minted."""
+    return api_origin + TRANSACTION_TOKEN_PATH
+
+
 def transaction_token_request(
-    api_origin: str,
-    bearer: str,
+    url: str,
+    credential: Mapping[str, str],
     *,
     action: str,
     resource: str | None,
@@ -440,9 +445,9 @@ def transaction_token_request(
         body["context"] = dict(context)
     return _json_request(
         "POST",
-        api_origin + TRANSACTION_TOKEN_PATH,
+        url,
         "the transaction-token endpoint",
-        {"Authorization": "Bearer " + bearer},
+        credential,
         body,
     )
 
@@ -552,14 +557,18 @@ def approval_request(
     )
 
 
-def read_approval_request(template: str, approval_id: str, bearer: str) -> HttpRequest:
-    """Read approval ``approval_id`` with the agent's own token."""
+def approval_url(template: str, approval_id: str) -> str:
+    """Where approval ``approval_id`` is read."""
     if "{id}" not in template:
         raise DiscoveryError("the approval endpoint has no {id} in it", code="metadata_invalid")
     if not _given(approval_id):
         raise ConfigurationError("approval_id is required")
-    url = template.replace("{id}", quote(approval_id.strip(), safe=""))
-    return _json_request("GET", url, "the approval endpoint", {"Authorization": "Bearer " + bearer}, None)
+    return template.replace("{id}", quote(approval_id.strip(), safe=""))
+
+
+def read_approval_request(url: str, credential: Mapping[str, str]) -> HttpRequest:
+    """Read the approval at ``url`` with the agent's own credential."""
+    return _json_request("GET", url, "the approval endpoint", credential, None)
 
 
 def parse_approval(response: HttpResponse, *, reading: bool) -> ApprovalRecord:

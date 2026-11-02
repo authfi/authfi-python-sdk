@@ -129,6 +129,11 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   session; `session()`, the person's token as a `TokenSource` shared through a `TokenStore`.
   `AsyncWebApp` is its asyncio twin.
 
+### Fixed
+
+- `approval()`, `wait_for_approval()` and `transaction_token()` prove the token when it is bound to a key. They sent it as
+  Bearer, which AuthFI refuses, so an agent could not learn that a person had decided.
+
 ### Changed
 
 - Python 3.11 or later is required (was 3.8).

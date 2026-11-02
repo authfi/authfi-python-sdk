@@ -122,6 +122,11 @@ class AgentGateway(FakeGateway):
         return self
 
     def _get(self, path: str, headers: dict[str, str]) -> tuple[int, bytes]:
+        if path.startswith("/apis/regional/v1/ai/auth/approvals/"):
+            # As the agent service does: a token bound to a key is refused as Bearer.
+            _, refusal = self._credential("GET", path, headers)
+            if refusal is not None:
+                return refusal[0], refusal[2]
         status, body = super()._get(path, headers)
         if path == "/.well-known/openid-configuration":
             doc = json.loads(body)
@@ -131,7 +136,6 @@ class AgentGateway(FakeGateway):
         return status, body
 
     def _authorized(self, headers: dict[str, str]) -> bool:
-        # Approval reads are Bearer on the agent service, whatever the token is bound to.
         auth = headers.get("authorization", "")
         return not self.revoked and auth.startswith(("Bearer ", "DPoP "))
 
