@@ -42,6 +42,7 @@ from authfi._protocol.agent import (
     CibaStart,
     TaskPending,
     approval_request,
+    approval_url,
     authorize_request,
     ciba_poll_flow,
     ciba_start_request,
@@ -56,6 +57,7 @@ from authfi._protocol.agent import (
     read_approval_request,
     task_request,
     transaction_token_request,
+    transaction_token_url,
 )
 from authfi._protocol.discovery import ServerMetadata, ttl_from_headers
 from authfi._protocol.http import DOCUMENT_LIMIT, HttpRequest, HttpResponse, Retry
@@ -780,6 +782,20 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         chosen = self._resource(resource)
         return self._tokens.get(chosen or "", lambda: self._mint(chosen), refresh=force)
 
+    def _send_own(self, method: str, url: str, build: Callable[[Mapping[str, str]], HttpRequest]) -> HttpResponse:
+        """Call AuthFI's own endpoint with the token minted for AuthFI, proving it when it is bound.
+
+        A bound token sent as Bearer is refused, and so is one proved without the nonce the server asks for: that
+        refusal gets the one retry.
+        """
+        minted = self._tokens.get("", lambda: self._mint(None))
+        response = self._send(build(self._bearing(minted, method, url, self._project_ref.authfi_origins)))
+        if minted.key is not None and _dpop.learn_nonce(
+            url, response.status, response.header("WWW-Authenticate"), response.header("DPoP-Nonce")
+        ):
+            response = self._send(build(self._bearing(minted, method, url, self._project_ref.authfi_origins)))
+        return response
+
     def _authfi_bearer(self) -> str:
         """The token for AuthFI's own endpoints: minted for AuthFI, whatever the default resource is."""
         return self._tokens.get("", lambda: self._mint(None)).access_token.reveal()
@@ -1122,10 +1138,15 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         This is AuthFI's own action gate, named after the IETF Transaction Tokens draft without
         following it.
         """
-        request = transaction_token_request(
-            self.project.resolve_api_origin(), self._authfi_bearer(), action=action, resource=resource, context=context
+        url = transaction_token_url(self.project.resolve_api_origin())
+        response = self._send_own(
+            "POST",
+            url,
+            lambda credential: transaction_token_request(
+                url, credential, action=action, resource=resource, context=context
+            ),
         )
-        token, txn, expires_in = parse_transaction_token(self._send(request))
+        token, txn, expires_in = parse_transaction_token(response)
         expires_at = datetime.fromtimestamp(self._clock.time() + expires_in, UTC)
         return TransactionToken(token, txn, action, resource, dict(context or {}), expires_at)
 
@@ -1199,7 +1220,8 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             raise NotSupportedError(
                 "agent_approval_status", "This AuthFI project does not offer approval status to agents."
             )
-        response = self._send(read_approval_request(template, approval_id, self._authfi_bearer()))
+        url = approval_url(template, approval_id)
+        response = self._send_own("GET", url, lambda credential: read_approval_request(url, credential))
         return Approval.of(parse_approval(response, reading=True))
 
     def wait_for_approval(
@@ -1259,6 +1281,16 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
     async def _own(self, resource: str | None, force: bool) -> _Minted:
         chosen = self._resource(resource)
         return await self._tokens.get(chosen or "", lambda: self._mint(chosen), refresh=force)
+
+    async def _send_own(self, method: str, url: str, build: Callable[[Mapping[str, str]], HttpRequest]) -> HttpResponse:
+        """See :meth:`AgentAuth._send_own`."""
+        minted = await self._tokens.get("", lambda: self._mint(None))
+        response = await self._send(build(self._bearing(minted, method, url, self._project_ref.authfi_origins)))
+        if minted.key is not None and _dpop.learn_nonce(
+            url, response.status, response.header("WWW-Authenticate"), response.header("DPoP-Nonce")
+        ):
+            response = await self._send(build(self._bearing(minted, method, url, self._project_ref.authfi_origins)))
+        return response
 
     async def _authfi_bearer(self) -> str:
         """See :meth:`AgentAuth._authfi_bearer`."""
@@ -1530,14 +1562,15 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         context: Mapping[str, Any] | None = None,
     ) -> TransactionToken:
         """See :meth:`AgentAuth.transaction_token`."""
-        request = transaction_token_request(
-            await self.project.resolve_api_origin(),
-            await self._authfi_bearer(),
-            action=action,
-            resource=resource,
-            context=context,
+        url = transaction_token_url(await self.project.resolve_api_origin())
+        response = await self._send_own(
+            "POST",
+            url,
+            lambda credential: transaction_token_request(
+                url, credential, action=action, resource=resource, context=context
+            ),
         )
-        token, txn, expires_in = parse_transaction_token(await self._send(request))
+        token, txn, expires_in = parse_transaction_token(response)
         expires_at = datetime.fromtimestamp(self._clock.time() + expires_in, UTC)
         return TransactionToken(token, txn, action, resource, dict(context or {}), expires_at)
 
@@ -1609,7 +1642,8 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             raise NotSupportedError(
                 "agent_approval_status", "This AuthFI project does not offer approval status to agents."
             )
-        response = await self._send(read_approval_request(template, approval_id, await self._authfi_bearer()))
+        url = approval_url(template, approval_id)
+        response = await self._send_own("GET", url, lambda credential: read_approval_request(url, credential))
         return Approval.of(parse_approval(response, reading=True))
 
     async def wait_for_approval(

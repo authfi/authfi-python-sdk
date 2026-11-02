@@ -119,6 +119,20 @@ def test_the_token_is_bound_at_mint_and_every_gateway_call_proves_it(gw: AgentGa
     assert all(r["headers"]["authorization"].startswith("DPoP ") for r in gw.requests if r["path"] == "/mcp")
 
 
+def test_reading_an_approval_proves_the_bound_token(gw: AgentGateway, key: AgentKey) -> None:
+    gw.approvals["apr-1"] = {"status": "approved"}
+    gw.approvals_readable = True
+    with AuthFI(gw.issuer) as af:
+        agent = af.agent(AGENT, key)
+        token = agent.token()
+        assert agent.approval("apr-1").status == "approved"
+
+    path = "/apis/regional/v1/ai/auth/approvals/apr-1"
+    assert "token_dpop_proof_required" not in gw.refused_proofs
+    proof = next(p for p in gw.proofs if p["path"] == path)
+    assert proof["claims"]["htm"] == "GET" and proof["claims"]["ath"] == ath(token)
+
+
 def test_the_run_key_is_ed25519_unless_the_project_lists_only_p256(key: AgentKey) -> None:
     with AgentGateway(dpop_algs=("ES256",)) as gateway, AuthFI(gateway.issuer) as af:
         af.agent(AGENT, key).token()
