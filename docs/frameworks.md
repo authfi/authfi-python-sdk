@@ -334,12 +334,13 @@ is named by its agent id, never by its parent's name. A span that already names 
 its value. Nothing else in the export is changed; the proxy sends on Claude Code's `Authorization`, `DPoP`, `User-Agent`,
 `traceparent` and `Content-Type`, and nothing else of its headers.
 
-An export is bounded before it is built: 4 MB as it arrives, 16 MB decompressed, 4096 spans, and 262144 fields of
-resources, scopes and spans together, counted from the wire format before any message is made; the rewrite runs on a
+An export is bounded before it is built: 4 MB as it arrives, 16 MB decompressed, 4096 spans, and 262144 fields in all
+(of resources, scopes, spans, events, links, attributes and the values inside them, nested up to 32 deep), counted by
+walking the wire format before any message is made; the rewrite runs on a
 worker thread, one export at a time, so it never holds up your hooks, `can_use_tool` or token renewal. An export over a
 cap (413), malformed or cut short (400), or in an encoding other than gzip or deflate (415) is answered with that status
-and **not sent on**: unnamed, a sub-agent's spans would read as the main loop's. A failure of the rewrite is a 500. Claude
-Code sees the status and can try again. Each kind of refusal is logged once a minute.
+and **not sent on**: unnamed, a sub-agent's spans would read as the main loop's. A failure of the rewrite is a 500, the only one
+of these an exporter may retry. Each kind of refusal is logged once a minute.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code

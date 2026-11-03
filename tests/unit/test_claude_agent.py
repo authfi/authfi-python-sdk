@@ -1035,3 +1035,72 @@ async def test_a_declared_length_over_the_trace_cap_is_refused_before_the_body_i
 
     assert answer.startswith(b"HTTP/1.1 413")
     assert not _received(fake)
+
+
+def _wrap(tag: int, payload: bytes) -> bytes:
+    return bytes([tag]) + _length(len(payload)) + payload
+
+
+def _nested_values(count: int) -> bytes:
+    """An export of one span with one attribute whose value is an array of ``count`` empty values (two bytes each)."""
+    key_value = _wrap(0x12, _wrap(0x2A, b"\x0a\x00" * count))  # KeyValue.value = AnyValue.array_value of empty values
+    return _many_spans(1, field=_wrap(0x4A, key_value))  # Span.attributes
+
+
+def _nested_depth(levels: int) -> bytes:
+    """An export of one span with an attribute nested ``levels`` arrays deep."""
+    value = b""
+    for _ in range(levels):
+        value = _wrap(0x2A, _wrap(0x0A, value))  # AnyValue.array_value holding ArrayValue.values
+    return _many_spans(1, field=_wrap(0x4A, _wrap(0x12, value)))
+
+
+async def test_millions_of_empty_values_inside_one_attribute_are_refused_and_nothing_is_sent(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    plain = _nested_values(1_500_000)  # 3 MB: under the body cap, and one attribute in one span
+    packed = gzip.compress(_nested_values(7_000_000), compresslevel=9)  # 14 MB decoded: under the decoded cap too
+    answers: list[Any] = []
+
+    async def send() -> None:
+        answers.append(await _send_export(dict(options.env)[TRACES], plain))
+        answers.append(await _send_export(dict(options.env)[TRACES], packed, **{"Content-Encoding": "gzip"}))
+
+    longest = await _responsive_while(send())
+
+    assert [a.status_code for a in answers] == [413, 413]
+    assert not _received(fake)
+    assert longest < 0.5
+
+
+def test_what_is_nested_in_a_resource_a_scope_an_event_or_a_link_is_walked_too() -> None:
+    from authfi import _claude_steps
+    from authfi._model_proxy import TraceRefused
+
+    key_value = _wrap(0x12, _wrap(0x2A, b"\x0a\x00" * 1_500_000))  # KeyValue.value = array of empty values
+    holders = {
+        # Resource.attributes in ResourceSpans.resource
+        "resource": _wrap(0x0A, _wrap(0x0A, _wrap(0x0A, key_value))),
+        # InstrumentationScope.attributes in ScopeSpans.scope
+        "scope": _wrap(0x0A, _wrap(0x12, _wrap(0x0A, _wrap(0x1A, key_value)))),
+        # Event.attributes in Span.events, Link.attributes in Span.links
+        "event": _many_spans(1, field=_wrap(0x5A, _wrap(0x1A, key_value))),
+        "link": _many_spans(1, field=_wrap(0x6A, _wrap(0x22, key_value))),
+    }
+    for name, body in holders.items():
+        with pytest.raises(TraceRefused) as refused:
+            _claude_steps.AgentNames().rewrite(body, "")
+        assert refused.value.status == 413, name
+
+
+def test_a_value_nested_too_deep_is_refused_and_a_real_nesting_is_not() -> None:
+    from authfi._claude_steps import MAX_DEPTH, AgentNames
+    from authfi._model_proxy import TraceRefused
+
+    with pytest.raises(TraceRefused) as refused:
+        AgentNames().rewrite(_nested_depth(MAX_DEPTH + 10), "")
+    assert (refused.value.status, refused.value.kind) == (413, "too-deep")
+    assert b"claude_code" in AgentNames().rewrite(_nested_depth(3), "")

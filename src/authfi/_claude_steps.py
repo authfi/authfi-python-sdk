@@ -11,10 +11,10 @@ on every other span. Nothing else in a span is changed or read. A span that alre
 The agent behind a gateway call is then the nearest ``gen_ai.agent.name`` at or above the step that made it.
 
 An export is untrusted input to a process that runs the application, so it is bounded before it is built: a body cap
-and a decoded-size cap, a count of its spans and fields taken from the wire format before any message is made, and an
-output cap. An export over a cap, malformed, truncated or in an encoding this does not read raises
-:class:`~authfi._model_proxy.TraceRefused`; it is never passed on unnamed, which would read a sub-agent's calls as its
-parent's.
+and a decoded-size cap, a walk of its wire format (every message field of the trace schema, to any depth up to a
+cap, against one budget of fields) before any message is made, and an output cap. An export over a cap, malformed,
+truncated or in an encoding this does not read raises :class:`~authfi._model_proxy.TraceRefused`; it is never passed
+on unnamed, which would read a sub-agent's calls as its parent's.
 """
 
 from __future__ import annotations
@@ -23,10 +23,11 @@ import importlib
 import threading
 import zlib
 from collections import OrderedDict
+from typing import Any
 
 from authfi._model_proxy import TraceRefused
 
-__all__ = ["DEFAULT_MAIN_NAME", "MAX_BODY", "AgentNames", "available"]
+__all__ = ["DEFAULT_MAIN_NAME", "MAX_BODY", "MAX_DEPTH", "AgentNames", "available"]
 
 #: What Claude Code calls itself in its own trace (``claude_code.interaction``): the name of the main loop when the
 #: application gives it none.
@@ -39,9 +40,12 @@ _MAX_AGENTS = 4096
 MAX_BODY = 4 * 1024 * 1024
 MAX_DECODED = 16 * 1024 * 1024
 MAX_OUTPUT = 20 * 1024 * 1024
-#: The most spans, and the most fields of resources, scopes and spans together, an export may hold.
+#: The most spans an export may hold, the most fields of every message in it together (resources, scopes, spans,
+#: attributes and the values inside them), and how deeply messages may be nested (a value inside an array inside a
+#: value). Claude Code exports a few hundred spans of a few dozen fields, nested two or three deep.
 MAX_SPANS = 4096
 MAX_FIELDS = 262_144
+MAX_DEPTH = 32
 
 
 def available() -> bool:
@@ -122,23 +126,60 @@ def _fields(buf: bytes, start: int, end: int, budget: list[int]) -> list[tuple[i
     return found
 
 
+def _children() -> dict[Any, dict[int, Any]]:
+    """For each message of the OTLP trace schema, the messages its fields hold: ``{message: {field number: message}}``.
+
+    Read from the schema of the installed protocol types, so a field a newer version adds is walked too.
+    """
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    table: dict[Any, dict[int, Any]] = {}
+    pending = [ExportTraceServiceRequest.DESCRIPTOR]
+    while pending:
+        message = pending.pop()
+        if message in table:
+            continue
+        held = {field.number: field.message_type for field in message.fields if field.message_type is not None}
+        table[message] = held
+        pending.extend(held.values())
+    return table
+
+
+_schema: dict[Any, dict[int, Any]] | None = None
+_schema_lock = threading.Lock()
+
+
 def _check_shape(buf: bytes) -> None:
-    """Refuse an export with more spans or fields than a real one has, before a message is made of it."""
+    """Refuse an export with more spans or fields than a real one has, before a message is made of it.
+
+    Walks the wire format into every message field of the trace schema (resource, scope, spans, events, links,
+    attributes, and the values, arrays and lists inside them, at any depth up to ``MAX_DEPTH``), spending one of the
+    budget on every field. What the protocol types will build is then what was walked, so it is bounded by the budget.
+    """
+    global _schema
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    with _schema_lock:
+        if _schema is None:
+            _schema = _children()
+        schema = _schema
     budget = [MAX_FIELDS]
     spans = 0
-    for number, a, b in _fields(buf, 0, len(buf), budget):
-        if number != 1:  # ExportTraceServiceRequest.resource_spans
-            continue
-        for number2, a2, b2 in _fields(buf, a, b, budget):
-            if number2 != 2:  # ResourceSpans.scope_spans
+    stack: list[tuple[Any, int, int, int]] = [(ExportTraceServiceRequest.DESCRIPTOR, 0, len(buf), 0)]
+    while stack:
+        message, start, end, depth = stack.pop()
+        held = schema.get(message, {})
+        for number, a, b in _fields(buf, start, end, budget):
+            child = held.get(number)
+            if child is None:
                 continue
-            for number3, a3, b3 in _fields(buf, a2, b2, budget):
-                if number3 != 2:  # ScopeSpans.spans
-                    continue
+            if depth + 1 > MAX_DEPTH:
+                raise TraceRefused(413, "too-deep", "the export nests messages too deeply")
+            if getattr(child, "name", "") == "Span":
                 spans += 1
                 if spans > MAX_SPANS:
                     raise TraceRefused(413, "too-many-spans", "the export has too many spans")
-                _fields(buf, a3, b3, budget)  # a span's own fields (attributes, events, links)
+            stack.append((child, a, b, depth + 1))
 
 
 class AgentNames:

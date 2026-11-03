@@ -12,8 +12,9 @@ other method or path, including the rest of the gateway's model and cloud routes
 credential the caller sends is dropped; the gateway sees only this process's.
 
 When the application exports Claude Code's steps (``export_steps``), a second route relays Claude Code's trace export to
-AuthFI (:meth:`ModelProxy.relay_traces`): the same listener and secret, one fixed target, with the caller's own headers
-(the helper's token, which is what Claude Code sends AuthFI), and a rewrite of the body that names each span's agent.
+AuthFI (:meth:`ModelProxy.relay_traces`): the same listener and secret, one fixed target, with a short list of the
+caller's headers (its ``Authorization``, which is the helper's token Claude Code sends AuthFI, ``DPoP``, ``User-Agent``,
+``traceparent`` and ``Content-Type``), and a rewrite of the body that names each span's agent.
 The export is untrusted input: its body has a cap of its own, the rewrite runs on a worker thread, one at a time, and
 an export that is over a cap, cannot be read or cannot be named is refused, never sent on unnamed.
 
@@ -353,7 +354,8 @@ class ModelProxy:
         """Send Claude Code's trace export to AuthFI with its own credential, the body naming each span's agent.
 
         An export that is over a cap, cannot be read or cannot be named is answered 4xx or 5xx and not sent: unnamed,
-        a sub-agent's spans would be read as its parent's. Claude Code sees the failure and can try again.
+        a sub-agent's spans would be read as its parent's. Claude Code is told why: 4xx for an export that is over a
+        cap or cannot be read, which no retry mends, and 5xx for a failure of the rewrite, which may be retried.
         """
         relay = self._traces
         if relay is None:  # not served, or stopped while the body was read
@@ -367,7 +369,7 @@ class ModelProxy:
             self._said(refused.kind, refused.message)
             await _answer(writer, refused.status, refused.message)
             return
-        except Exception as error:  # a bug here is the proxy's, not the export's: a 5xx, which is retried
+        except Exception as error:  # a bug here is the proxy's, not the export's: a 5xx, which an exporter may retry
             self._said("internal", type(error).__name__)
             await _answer(writer, 500, "the export could not be processed")
             return
