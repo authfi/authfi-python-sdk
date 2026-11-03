@@ -10,6 +10,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- Claude Agent SDK: `options()` sets `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, so Claude Code sends no `x-anthropic-billing-header` system part (its suffix changes with the first user message), and `tools=["Agent"]`, so the model is offered the agent's AuthFI tools and the sub-agent tool and none of Claude Code's other built-ins. The owner's `env` and `tools` win; see docs/frameworks.md.
 - The steps name their agents in the OpenTelemetry GenAI standard: the agent behind a step or a gateway call is the
   nearest `gen_ai.agent.name` above it. LangGraph: the run of each compiled graph is an `invoke_agent` step named for
   the graph (`agent_graph(..., name=...)`; `LangGraph` when LangGraph gave it none), so a sub-agent's graph run names
