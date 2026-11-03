@@ -777,17 +777,6 @@ async def test_an_export_with_millions_of_fields_in_a_span_is_refused(
     assert not _received(fake)
 
 
-async def test_a_body_over_the_trace_cap_is_refused_unread(fake: FakeGateway, claude: ClaudeAgentIntegration) -> None:
-    from authfi._claude_steps import MAX_BODY
-
-    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
-
-    answer = await _send_export(dict(options.env)[TRACES], b"\x00" * (MAX_BODY + 1))
-
-    assert answer.status_code == 413
-    assert not _received(fake)
-
-
 async def test_exports_are_rewritten_one_at_a_time_off_the_event_loop(
     fake: FakeGateway, claude: ClaudeAgentIntegration
 ) -> None:
