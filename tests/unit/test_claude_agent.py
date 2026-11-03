@@ -25,7 +25,7 @@ from authfi import (
     GatewayTokenRefused,
     NotSupportedError,
 )
-from authfi.claude_agent import CONTENT_SWITCHES, ClaudeAgentIntegration, PendingApproval
+from authfi.claude_agent import CONTENT_SWITCHES, PLACEHOLDER_KEY_COMMAND, ClaudeAgentIntegration, PendingApproval
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
 from tests.support import FakeClock
@@ -226,7 +226,8 @@ async def test_the_options_carry_no_credential(
     options = await claude.options(model="claude-haiku-5-5", env={"EXTRA": "1"}, settings='{"theme": "dark"}')
 
     env = dict(options.env)
-    assert env["ANTHROPIC_BASE_URL"] == fake.issuer + "/mcp"
+    assert env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")  # the proxy, which sends the call to the gateway
+    assert fake.issuer not in env["ANTHROPIC_BASE_URL"]
     assert env["AUTHFI_AGENT_ID"] == AGENT
     assert env["AUTHFI_AGENT_KEY_FILE"] == str(key_file)
     assert env["EXTRA"] == "1"
@@ -234,7 +235,7 @@ async def test_the_options_carry_no_credential(
         assert env[name] == "0"
     settings = json.loads(str(options.settings))
     assert settings["theme"] == "dark"
-    assert settings["apiKeyHelper"].endswith("-m authfi token")
+    assert settings["apiKeyHelper"] == PLACEHOLDER_KEY_COMMAND  # no token is minted for a process that cannot prove it
     assert options.permission_mode == "default"
     assert options.mcp_servers["authfi"]["type"] == "sdk"  # type: ignore[index]
     assert options.hooks is not None
@@ -327,7 +328,7 @@ async def test_the_callers_other_env_is_kept_and_the_integrations_wins(
     options = await claude.options(model="claude-haiku-5-5", env={"HTTPS_PROXY": "http://proxy.example:3128"})
     env = dict(options.env)
     assert env["HTTPS_PROXY"] == "http://proxy.example:3128"
-    assert env["ANTHROPIC_BASE_URL"] == fake.issuer + "/mcp"
+    assert env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:")
 
 
 async def test_credentials_in_this_processes_environment_do_not_reach_claude_code(
@@ -446,7 +447,7 @@ async def test_the_helper_is_not_pinned_to_an_api_origin_when_there_is_nothing_t
 async def test_without_export_steps_claude_code_exports_nothing_to_authfi(claude: ClaudeAgentIntegration) -> None:
     options = await claude.options(model="claude-haiku-5-5")
     env = dict(options.env)
-    assert env["OTEL_RESOURCE_ATTRIBUTES"] == f"authfi.agent_id={AGENT},authfi.run_id={claude.run_id}"
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == f"authfi.agent_id={AGENT}"  # this gateway names no run
     assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in env
     assert "otelHeadersHelper" not in json.loads(str(options.settings))
 
@@ -461,6 +462,10 @@ async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshin
     assert env["OTEL_TRACES_EXPORTER"] == "otlp"
     assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
     assert env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
+    # Claude Code has under two seconds to export at shutdown, and its first export runs the headers helper (about a
+    # second): spans go out while it runs, and the helper's answer is kept for as long as a token lasts.
+    assert env["OTEL_TRACES_EXPORT_INTERVAL"] == "1000"
+    assert env["CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS"] == "240000"
     # another system's OTLP credential, inherited from the environment, must not go to AuthFI
     assert env["OTEL_EXPORTER_OTLP_HEADERS"] == ""
     assert env["OTEL_EXPORTER_OTLP_TRACES_HEADERS"] == ""
@@ -477,6 +482,8 @@ async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshin
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
         "OTEL_TRACES_EXPORTER",
+        "OTEL_TRACES_EXPORT_INTERVAL",
+        "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS",
         "CLAUDE_CODE_ENABLE_TELEMETRY",
     ],
 )

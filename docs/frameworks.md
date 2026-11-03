@@ -22,8 +22,8 @@ and an adapter takes it in the agent's place: `LangGraphIntegration(task)`, `Ope
 `ADKIntegration(task)`. The gateway then holds every tool and model call to the task, and a refusal reaches the
 model with what it can still do. Nothing swaps the agent's token for the task's behind your back: a framework may
 keep a session open from before the task, and a call through it would go with the agent's wider token.
-`ClaudeAgentIntegration` does not take a task: Claude Code makes its own model calls through a helper process that
-cannot hold the key, so they could not be held to it.
+`ClaudeAgentIntegration` does not take a task: Claude Code makes its own model calls through a proxy that sends the
+agent's credential, not the task's, so they could not be held to it.
 
 Each extra covers the framework's major version and is tested at its lowest and newest release. Where a
 framework has no public setting for its HTTP client, the adapter checks the one it uses when it is imported,
@@ -89,7 +89,8 @@ options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps
   AuthFI and not to LangSmith. OpenAI Agents: the SDK's trace becomes GenAI spans (`invoke_agent`,
   `execute_tool`, `chat`), replacing the SDK's default exporter as `configure_tracing()` does. ADK: its own
   spans, on the global OpenTelemetry provider. Claude Agent SDK: Claude Code's own trace export (a Claude Code
-  beta feature) pointed at AuthFI, with the headers from `python -m authfi headers` on each refresh.
+  beta feature) pointed at AuthFI, with the headers from `python -m authfi headers`, and its spans carry the
+  run the gateway counts the process's calls on.
 - For any other OpenTelemetry-instrumented code, `authfi.otel.register(af)` adds the exporter to the SDK
   provider (or makes one); `authfi.otel.exporter(af)` is the exporter alone, for your own processor.
 
@@ -273,17 +274,35 @@ async with ClaudeSDKClient(options) as client:
         ...
 ```
 
-**The model.** Claude Code runs `python -m authfi token` as its `apiKeyHelper` and calls the AI
-gateway with that token, running it again every four minutes. That token is a Bearer token: Claude Code's
-process cannot hold the agent's key, so its model calls carry no DPoP proof, and the gateway admits them only
-while its model proof check (`MCP_MODEL_PROOF_CHECK`) is not enforced, or for a workload the node cages. The helper signs as the agent with
-the agent's key file, so the agent's key must be loaded from a file (`AgentKey.from_file` or
-`AUTHFI_AGENT_KEY_FILE`). Claude Code's options and environment hold the file's path, never the key
-or a token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
+**The model.** Claude Code cannot hold the agent's key or sign a proof, so its model calls go to a proxy
+in your process, on the loopback interface (`ANTHROPIC_BASE_URL` is its address, with a secret made for the
+run). The proxy sends each call to the AI gateway with your process's credential: bound to the key, with a proof
+on every request, and the call's `X-Request-Id`. The model calls and the tools are therefore one run of the
+key (`gateway_run_id`), and the gateway admits them while its model proof check (`MCP_MODEL_PROOF_CHECK`) is
+enforced. The proxy forwards exactly one request, `POST /v1/messages` (the Anthropic Messages API, which is all
+Claude Code calls), to `<issuer>/mcp/v1/messages`. Every other method and path answers 404 and is never sent on:
+not the other model routes, not `/mcp`, not `/v1/cloud/credentials`. That matters because the proxy's address
+(it holds a secret made for the run) is in the environment of every tool Claude Code runs. The proxy drops whatever
+credential Claude Code sends, and passes its `User-Agent` on, so the call's client in the call tape is Claude
+Code's. Claude Code is given a placeholder key (`echo authfi-loopback` is its `apiKeyHelper`), which is no
+credential. A connection that sends no request is closed after 2 seconds, at most 16 such connections are
+held, and a new one takes the place of the oldest, so a process that opens many cannot use up the file descriptors
+of yours or keep Claude Code out.
+`AsyncAuthFI.aclose()` stops the proxy, as does `claude.aclose()`. Claude Code's options and environment hold
+no key or token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
 switch content on: `ANTHROPIC_BASE_URL`, every `AUTHFI_*` and `OTEL_LOG_*` name, the other variables
 the integration sets, and `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Claude Code starts with this
 process's environment as well, so the options blank those two (and `AUTHFI_AGENT_PRIVATE_KEY`) in
 the environment they give it, and log that they were set here.
+
+**The steps.** With `export_steps=True`, Claude Code exports a span batch every second (`OTEL_TRACES_EXPORT_INTERVAL`,
+which the options own) and keeps the headers from `python -m authfi headers` for four minutes. Claude Code's
+default is to export every five seconds and to run the helper at the first export, which for a short run is at
+shutdown, when Claude Code gives its exporter under two seconds in all: a helper that takes about a second then
+leaves no time for the export, and the run's steps are never sent. The helper needs the agent's key file
+(`AgentKey.from_file` or `AUTHFI_AGENT_KEY_FILE`); its Bearer token cannot carry the key's proof, so the options
+name the gateway's run for the trace (`authfi.run_id`), which the gateway told the integration when it first listed
+the tools.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code

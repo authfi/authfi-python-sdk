@@ -16,9 +16,10 @@
         async for message in client.receive_response():
             ...
 
-- **The model.** Claude Code calls the AI gateway with a token from ``python -m authfi token`` (its
-  ``apiKeyHelper``), run again before the token expires. The helper signs as the agent from the
-  agent's key file; neither the key nor a token is put in Claude Code's options or environment.
+- **The model.** Claude Code cannot hold the agent's key, so its model calls go to a loopback proxy in this
+  process, which sends them to the AI gateway with this process's credential: bound to the process's key,
+  proved on every request, on the same run as the tools. Neither the key nor a token is put in Claude Code's
+  options or environment; it is given a placeholder key, which the proxy drops.
 - **The tools.** The gateway's tools are served to Claude Code by an MCP server in this process,
   which calls the gateway with the current token on every request. Tool names are the gateway's,
   under the server's name (``mcp__authfi__<server>__<tool>``).
@@ -72,6 +73,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi._holds import Decided, Held, HeldCalls
+from authfi._model_proxy import RUN_HEADER, ModelProxy
 from authfi._protocol.urls import origin_of
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
 from authfi.agents.task import AsyncTask, Task
@@ -99,9 +101,18 @@ def _shell_word(word: str) -> str:
     return subprocess.list2cmdline([word]) if os.name == "nt" else shlex.quote(word)
 
 
-#: How long Claude Code keeps a token from its ``apiKeyHelper`` before running it again: well inside
-#: an agent token's lifetime of minutes.
-KEY_HELPER_TTL_MS = 240_000
+#: The key Claude Code is given for the AI gateway. It is not a credential: the loopback proxy drops it and sends
+#: the call with this process's own. Claude Code needs some key to start, and ``echo`` prints one in every shell.
+PLACEHOLDER_KEY_COMMAND = "echo authfi-loopback"
+
+#: How long Claude Code keeps the headers from ``otelHeadersHelper`` before running it again: well inside an agent
+#: token's lifetime of minutes. Its default is 29 minutes, which would send an expired token on a long run.
+HEADERS_HELPER_TTL_MS = 240_000
+
+#: How often Claude Code exports the spans it has finished. Its default of 5 seconds leaves a short run to export
+#: everything while it shuts down, when it has under 2 seconds in all (``CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS`` is
+#: capped there), and the first export has to run ``otelHeadersHelper``, a process that takes about a second.
+TRACE_EXPORT_INTERVAL_MS = 1_000
 
 #: Environment that would hand Claude Code a fixed credential; the helper is the only way in. Claude
 #: Code inherits this process's environment, so each is also blanked in the environment it is given.
@@ -125,6 +136,8 @@ _OWNED_PREFIXES = ("AUTHFI_", "OTEL_LOG_")
 _TRACE_OWNED = (
     "CLAUDE_CODE_ENABLE_TELEMETRY",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+    "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS",
+    "OTEL_TRACES_EXPORT_INTERVAL",
     "OTEL_TRACES_EXPORTER",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
@@ -135,6 +148,8 @@ _TRACE_SWITCHES = {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
     "OTEL_TRACES_EXPORTER": "otlp",
+    "OTEL_TRACES_EXPORT_INTERVAL": str(TRACE_EXPORT_INTERVAL_MS),
+    "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS": str(HEADERS_HELPER_TTL_MS),
     "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
     "OTEL_EXPORTER_OTLP_HEADERS": "",
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "",
@@ -188,8 +203,8 @@ class ClaudeAgentIntegration:
         if isinstance(given, Task | AsyncTask):
             raise NotSupportedError(
                 "claude_agent_task",
-                "a task cannot be given to Claude Code: its own model calls go through a helper process that "
-                "holds the agent's token, not the task's, so they would not be held to the task. Use a framework "
+                "a task cannot be given to Claude Code: its own model calls go through a proxy that sends "
+                "the agent's token, not the task's, so they would not be held to the task. Use a framework "
                 "that makes its calls in this process.",
             )
         if not isinstance(given, AsyncAgentAuth):
@@ -208,6 +223,9 @@ class ClaudeAgentIntegration:
         self.prefix = f"mcp__{server_name}__"
         #: The gateway's refusal of the token, once it happened: the run was stopped.
         self.token_refused: GatewayTokenRefused | None = None
+        self._gateway_run_id: str | None = None
+        self._proxy = ModelProxy(self.gateway, on_refused=self._refuse_token, on_run=self._note_run)
+        self.gateway.project._track(self._proxy)  # pyright: ignore[reportPrivateUsage]
         self._calls = HeldCalls(self.gateway, ttl=MEMORY_SECONDS)
         self._other: CanUseTool | None = None
 
@@ -216,13 +234,24 @@ class ClaudeAgentIntegration:
     @asynccontextmanager
     async def _session(self) -> AsyncGenerator[ClientSession, None]:
         factory = self.gateway.mcp_client_factory(httpx)
-        async with (
-            factory(None, httpx.Timeout(30.0, read=300.0)) as http_client,
-            streamable_http_client(self.gateway.mcp_url, http_client=http_client) as (read, write, _),
-            ClientSession(read, write) as session,
-        ):
-            await session.initialize()
-            yield session
+        async with factory(None, httpx.Timeout(30.0, read=300.0)) as http_client:
+            http_client.event_hooks["response"].append(self._saw_run)
+            async with (
+                streamable_http_client(self.gateway.mcp_url, http_client=http_client) as (read, write, _),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                yield session
+
+    async def _saw_run(self, response: httpx.Response) -> None:
+        self._note_run(response.headers.get(RUN_HEADER))
+
+    def _note_run(self, run: str | None) -> None:
+        if run:
+            self._gateway_run_id = run
+
+    def _refuse_token(self, refused: GatewayTokenRefused) -> None:
+        self.token_refused = refused
 
     async def tools(self, *, include_never_allowed: bool = False) -> list[Tool]:
         """The gateway's tools for this agent; those marked ``never_allowed`` are left out unless asked."""
@@ -266,6 +295,10 @@ class ClaudeAgentIntegration:
     def reset(self) -> None:
         """Forget every remembered call. Call it when a run ends, so the next run never inherits an answer."""
         self._calls.clear()
+
+    async def aclose(self) -> None:
+        """Stop the model proxy. ``AsyncAuthFI.aclose()`` does this too; call it when Claude Code is done."""
+        await self._proxy.aclose()
 
     def _handler(self, tool: str) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
         async def run(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -351,8 +384,17 @@ class ClaudeAgentIntegration:
 
     @property
     def run_id(self) -> str:
-        """The credential's run: named in the resource attributes of the trace Claude Code exports."""
+        """The credential's run id, the prefix of the ``X-Request-Id`` of every call this process makes."""
         return self.source.run_id
+
+    @property
+    def gateway_run_id(self) -> str | None:
+        """The run the gateway counts this process's calls on, as it named it (``AuthFI-Run-Id``).
+
+        One run for the process when the credential is bound to its key, and the same for the tools and the model
+        calls; ``None`` until the gateway has answered once, which :meth:`options` does.
+        """
+        return self._gateway_run_id
 
     def _trace_env(self) -> dict[str, str]:
         return {
@@ -414,36 +456,39 @@ class ClaudeAgentIntegration:
                 "from the key file",
                 ", ".join(inherited),
             )
+        servers = dict(claude_options.pop("mcp_servers", None) or {})
+        if self.server_name in servers:
+            raise ConfigurationError(
+                f"the MCP server {self.server_name!r} is the integration's; name yours differently"
+            )
+        # Before the environment: this first call to the gateway is what tells us the run the trace belongs to.
+        servers[self.server_name] = await self.mcp_server(include_never_allowed=include_never_allowed)
+        resource = {"authfi.agent_id": self.agent_id}
+        if self._gateway_run_id:
+            resource["authfi.run_id"] = self._gateway_run_id
         env = {
             **given_env,
             # Claude Code starts with this process's environment under these: blank, so none reaches it.
             **dict.fromkeys(_FIXED_CREDENTIALS, ""),
-            "ANTHROPIC_BASE_URL": self.gateway.model_base_url("anthropic"),
+            "ANTHROPIC_BASE_URL": await self._proxy.start(),
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(KEY_HELPER_TTL_MS),
             # The AI gateway serves the models the project configures; Anthropic's experimental
             # beta headers are not passed through to them.
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "OTEL_RESOURCE_ATTRIBUTES": f"authfi.agent_id={self.agent_id},authfi.run_id={self.run_id}",
+            "OTEL_RESOURCE_ATTRIBUTES": ",".join(f"{name}={value}" for name, value in resource.items()),
             **(self._trace_env() if export_steps else {}),
             **self.helper_env(),
             **{name: "1" if capture_content else "0" for name in CONTENT_SWITCHES},
         }
         settings = _settings(claude_options.pop("settings", None))
         _refuse_owned(settings.get("env"), "settings['env']", steps=export_steps)
-        settings["apiKeyHelper"] = f"{_shell_word(sys.executable)} -m authfi token"
+        settings["apiKeyHelper"] = PLACEHOLDER_KEY_COMMAND
         if export_steps and "otelHeadersHelper" in settings:
             raise ConfigurationError("otelHeadersHelper in settings is set by the integration with export_steps")
         if export_steps:
             settings["otelHeadersHelper"] = f"{_shell_word(sys.executable)} -m authfi headers"
-        servers = dict(claude_options.pop("mcp_servers", None) or {})
-        if self.server_name in servers:
-            raise ConfigurationError(
-                f"the MCP server {self.server_name!r} is the integration's; name yours differently"
-            )
-        servers[self.server_name] = await self.mcp_server(include_never_allowed=include_never_allowed)
         hooks = dict(claude_options.pop("hooks", None) or {})
         hooks["PreToolUse"] = [*hooks.get("PreToolUse", []), HookMatcher(matcher=None, hooks=[self._ask])]
         self._other = claude_options.pop("can_use_tool", None)
