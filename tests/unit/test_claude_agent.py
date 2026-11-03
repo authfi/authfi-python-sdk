@@ -712,7 +712,7 @@ async def test_without_the_protocol_types_the_trace_goes_to_authfi_unchanged_and
         options = await claude.options(model="claude-haiku-5-5", export_steps=True)
 
     assert dict(options.env)[TRACES] == fake.issuer + "/otlp/v1/traces"
-    assert "pip install 'authfi[otel]'" in caplog.text
+    assert "pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main'" in caplog.text
 
 
 def test_an_export_is_read_whatever_encoding_the_exporter_chose() -> None:

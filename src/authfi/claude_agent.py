@@ -433,7 +433,8 @@ class ClaudeAgentIntegration:
         else:
             self.gateway.project.logger.warning(
                 "export_steps sends Claude Code's trace to AuthFI as it is, naming no agent on its spans: "
-                "pip install 'authfi[otel]' to have each span say which agent made it"
+                "pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main' "
+                "to have each span say which agent made it"
             )
         return {**_TRACE_SWITCHES, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint}
 
