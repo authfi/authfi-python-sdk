@@ -279,8 +279,14 @@ in your process, on the loopback interface (`ANTHROPIC_BASE_URL` is its address,
 run). The proxy sends each call to the AI gateway with your process's credential: bound to the key, with a proof
 on every request, and the call's `X-Request-Id`. The model calls and the tools are therefore one run of the
 key (`gateway_run_id`), and the gateway admits them while its model proof check (`MCP_MODEL_PROOF_CHECK`) is
-enforced. The proxy forwards only model routes (`/v1/...`) and drops whatever credential Claude Code sends:
-Claude Code is given a placeholder key (`echo authfi-loopback` is its `apiKeyHelper`), which is no credential.
+enforced. The proxy forwards exactly one request, `POST /v1/messages` (the Anthropic Messages API, which is all
+Claude Code calls), to `<issuer>/mcp/v1/messages`. Every other method and path answers 404 and is never sent on:
+not the other model routes, not `/mcp`, not `/v1/cloud/credentials`. That matters because the proxy's address
+(it holds a secret made for the run) is in the environment of every tool Claude Code runs. The proxy drops whatever
+credential Claude Code sends, and passes its `User-Agent` on, so the call's client in the call tape is Claude
+Code's. Claude Code is given a placeholder key (`echo authfi-loopback` is its `apiKeyHelper`), which is no
+credential. A connection that sends no request is closed after 10 seconds, and a process that opens many
+without one is refused new connections, so it cannot use up the file descriptors of yours.
 `AsyncAuthFI.aclose()` stops the proxy, as does `claude.aclose()`. Claude Code's options and environment hold
 no key or token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
 switch content on: `ANTHROPIC_BASE_URL`, every `AUTHFI_*` and `OTEL_LOG_*` name, the other variables

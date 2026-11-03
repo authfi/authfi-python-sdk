@@ -7,6 +7,9 @@ its trace export) cannot hold the key either, so the token commands ask for a Be
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,7 @@ pytest.importorskip("claude_agent_sdk")
 import jwt
 
 from authfi import AgentKey, AsyncAuthFI, GatewayTokenRefused, NotSupportedError
+from authfi import _model_proxy as model_proxy
 from authfi import cli as cli_module
 from authfi.claude_agent import ClaudeAgentIntegration
 from tests.fake_agent_gateway import AgentGateway
@@ -160,23 +164,214 @@ async def test_the_trace_belongs_to_the_run_the_gateway_named(
     assert dict(options.env)["OTEL_RESOURCE_ATTRIBUTES"] == f"authfi.agent_id={AGENT},authfi.run_id={run}"
 
 
-async def test_only_the_model_routes_are_forwarded(gw: AgentGateway, project: AsyncAuthFI, key_file: Path) -> None:
-    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+async def _proxy_address(claude: ClaudeAgentIntegration) -> tuple[str, int, str]:
     base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
     origin, _, secret = base_url.rpartition("/")
+    host, _, port = origin.removeprefix("http://").partition(":")
+    return host, int(port), secret
+
+
+async def _raw(host: str, port: int, request: bytes, *, wait: float = 5.0) -> bytes:
+    """What the proxy answers to these exact bytes: a client library would tidy the target before sending."""
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(request)
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(65536), wait)
+    except ConnectionError:
+        return b""
+    finally:
+        writer.close()
+
+
+def _post(target: str, extra: str = "", body: bytes = b"{}") -> bytes:
+    head = f"POST {target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+    return (head + extra + (f"Content-Length: {len(body)}\r\n" if "Content-Length" not in extra else "")).encode() + (
+        b"\r\n" + body
+    )
+
+
+async def test_only_the_model_call_is_forwarded(gw: AgentGateway, project: AsyncAuthFI, key_file: Path) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
     before = len(gw.requests)
 
     refused = [
-        await _model_call(origin + "/not-the-secret"),  # another process on this machine
-        await _model_call(origin, "/v1/messages"),  # no secret at all
+        await _model_call(base_url, "/v1/cloud/credentials"),  # the cloud credential door, with the agent's proof
+        await _model_call(base_url, "/v1/messages/count_tokens"),
+        await _model_call(base_url, "/v1/chat/completions"),
         await _model_call(base_url, "/mcp"),  # the tool door
-        await _model_call(base_url, "/v1/../mcp"),  # a way round to it
         await _model_call(base_url, "/oauth/token"),
+        await _model_call(base_url, "/v1/messages?" + "a" * 500),  # a query that is not one of Claude Code's
     ]
+    async with httpx.AsyncClient() as http:
+        refused.append(await http.get(base_url + "/v1/messages"))
+        refused.append(await http.request("DELETE", base_url + "/v1/messages"))
 
-    assert [r.status_code for r in refused] == [404] * 5
+    assert [r.status_code for r in refused] == [404] * 8
     assert len(gw.requests) == before  # none of them was sent on
-    assert secret not in "".join(r.text for r in refused)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/{wrong}/v1/messages",  # a secret of the right length that is not ours
+        "/{prefix}/v1/messages",  # the start of ours
+        "//v1/messages",  # none
+        "/v1/messages",
+        "/{secret}/v1/../mcp",  # dot segments, which a client library would have removed
+        "/{secret}/v1/messages/../../mcp",
+        "/{secret}/v1/./messages/../cloud/credentials",
+        "/{secret}/v1%2Fmessages",  # an encoded slash, and
+        "/{secret}/v1/%6Dessages",  # an encoded letter
+        "/{secret}/v1/messages/",
+        "/{secret}/v1//messages",
+        "/{secret}/mcp",
+        "/{secret}/v1/cloud/credentials",
+        "http://127.0.0.1/{secret}/v1/messages",  # absolute-form
+    ],
+)
+async def test_what_is_not_the_call_under_the_secret_is_never_sent_on(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, target: str
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+    before = len(gw.requests)
+    target = target.format(wrong="x" * len(secret), prefix=secret[:10], secret=secret)
+
+    answer = await _raw(host, port, _post(target))
+
+    assert answer.startswith((b"HTTP/1.1 404", b"HTTP/1.1 400"))
+    assert len(gw.requests) == before
+    assert secret.encode() not in answer
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "Content-Length: -5\r\n",
+        "Content-Length: +5\r\n",
+        "Content-Length: 1_0\r\n",
+        "Content-Length: \u00b2\r\n",
+        "Content-Length: 99999999999\r\n",
+        "Content-Length: 2\r\nContent-Length: 2\r\n",
+        "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+    ],
+)
+async def test_a_malformed_length_is_a_bad_request_not_a_failure(
+    gw: AgentGateway,
+    project: AsyncAuthFI,
+    key_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    extra: str,
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+    before = len(gw.requests)
+    request = f"POST /{secret}/v1/messages HTTP/1.1\r\nHost: x\r\n{extra}\r\n".encode("latin-1", "replace") + b"{}"
+
+    with caplog.at_level("DEBUG", logger="authfi"):
+        answer = await _raw(host, port, request)
+
+    assert answer.startswith((b"HTTP/1.1 400", b"HTTP/1.1 413"))
+    assert len(gw.requests) == before
+    assert not [
+        r for r in caplog.records if r.levelname == "ERROR" or r.exc_info
+    ]  # no traceback for a client's mistake
+
+
+@pytest.mark.parametrize("size", ["-5", "+5", "1_0", "\u00b2", "g", "", "f" * 9, "a" * 70000])
+async def test_a_malformed_chunk_is_a_bad_request_not_a_failure(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, caplog: pytest.LogCaptureFixture, size: str
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+    before = len(gw.requests)
+    head = f"POST /{secret}/v1/messages HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+    request = head.encode() + size.encode("utf-8") + b"\r\n{}\r\n0\r\n\r\n"
+
+    with caplog.at_level("DEBUG", logger="authfi"):
+        answer = await _raw(host, port, request)
+
+    assert answer.startswith(b"HTTP/1.1 400")
+    assert len(gw.requests) == before
+    assert not [r for r in caplog.records if r.levelname == "ERROR" or r.exc_info]
+
+
+async def test_a_chunked_model_call_is_forwarded(gw: AgentGateway, project: AsyncAuthFI, key_file: Path) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+    body = json.dumps(MODEL_REQUEST).encode()
+    head = f"POST /{secret}/v1/messages HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+    request = head.encode() + f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+
+    answer = await _raw(host, port, request)
+
+    assert answer.startswith(b"HTTP/1.1 200")
+    assert [r for r in gw.run_calls if r[0] == "/mcp/v1/messages"]
+
+
+async def test_a_head_that_never_ends_is_closed(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_proxy, "_HEAD_SECONDS", 0.3)
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, _ = await _proxy_address(claude)
+
+    started = time.monotonic()
+    answer = await _raw(host, port, b"POST /x HTTP/1.1\r\nHost: x\r\n", wait=3.0)  # and then nothing
+
+    assert time.monotonic() - started < 2.0
+    assert answer.startswith(b"HTTP/1.1 408")
+
+
+async def test_a_body_that_never_ends_is_closed(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_proxy, "_BODY_SECONDS", 0.3)
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+    before = len(gw.requests)
+
+    answer = await _raw(host, port, _post(f"/{secret}/v1/messages", "Content-Length: 100\r\n", b"{"), wait=3.0)
+
+    assert answer.startswith(b"HTTP/1.1 408")
+    assert len(gw.requests) == before
+
+
+async def test_sockets_held_open_without_a_request_cannot_exhaust_the_proxy(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_proxy, "_MAX_UNKNOWN", 2)
+    monkeypatch.setattr(model_proxy, "_HEAD_SECONDS", 0.5)
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    host, port, secret = await _proxy_address(claude)
+
+    holders = [await asyncio.open_connection(host, port) for _ in range(2)]  # a process that holds sockets
+    try:
+        await asyncio.sleep(0.1)
+        refused = await _raw(host, port, b"", wait=2.0)  # the third is closed at once, not held
+        assert refused == b""
+        await asyncio.sleep(0.8)  # the first two time out and free their places
+        answer = await _raw(host, port, _post(f"/{secret}/v1/messages", body=json.dumps(MODEL_REQUEST).encode()))
+        assert answer.startswith(b"HTTP/1.1 200")
+    finally:
+        for _, writer in holders:
+            writer.close()
+
+
+async def test_the_callers_user_agent_is_the_calls_client(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
+    agent = "claude-cli/2.1.316 (external, sdk-py, agent-sdk/0.2.176)"
+    async with httpx.AsyncClient() as http:
+        await http.post(base_url + "/v1/messages", headers={"User-Agent": agent}, json=MODEL_REQUEST)
+        await http.post(base_url + "/v1/messages", headers={"User-Agent": "authfi-loopback"}, json=MODEL_REQUEST)
+
+    seen = [r["headers"]["user-agent"] for r in gw.requests if r["path"] == "/mcp/v1/messages"]
+    assert seen == [agent, "authfi-loopback"]
 
 
 async def test_a_refused_token_on_a_model_call_is_the_runs_refusal(

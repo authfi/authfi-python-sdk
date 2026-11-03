@@ -6,8 +6,10 @@ apart from the tool calls this process makes with the key's proof. Pointed at th
 its model calls here, and they leave with this process's credential: bound to the same key, proved per request, on
 the same run as the tools.
 
-The proxy accepts one thing: a request whose path starts with a secret this process made for the run, naming a model
-route (``/v1/...``). Whatever credential the caller sends is dropped; the gateway sees only this process's.
+The proxy forwards one request: ``POST /v1/messages`` under a secret this process made for the run. The secret is
+in the environment of every tool Claude Code runs, so it does not stand for the right to use the credential: any
+other method or path, including the rest of the gateway's model and cloud routes, is refused unsent. Whatever
+credential the caller sends is dropped; the gateway sees only this process's.
 """
 
 from __future__ import annotations
@@ -36,7 +38,21 @@ RUN_HEADER = "AuthFI-Run-Id"
 _MAX_HEAD = 64 * 1024
 _MAX_BODY = 64 * 1024 * 1024
 
-_MODEL_ROUTE = re.compile(r"/v1/[A-Za-z0-9._~/-]*")
+#: The only requests forwarded, by method and path: the Anthropic API calls Claude Code makes. Nothing else of the
+#: gateway is reachable through the proxy, whoever holds its secret (the secret is in the environment of every tool
+#: Claude Code runs): not the cloud credential door, not the other model routes, not the tools.
+ROUTES = frozenset({("POST", "/v1/messages")})
+_QUERY = re.compile(r"[A-Za-z0-9_=&.-]{0,128}")
+
+#: How long a connection may take to send its head, and then its body. A caller without the secret never gets past
+#: the head, so these and the caps below are what it can hold: at most _MAX_UNKNOWN sockets for _HEAD_SECONDS each.
+_HEAD_SECONDS = 10.0
+_BODY_SECONDS = 120.0
+_MAX_UNKNOWN = 16
+_MAX_CONNECTIONS = 128
+_CONTENT_LENGTH = re.compile(r"[0-9]{1,10}")
+_CHUNK_SIZE = re.compile(r"[0-9A-Fa-f]{1,8}")
+_MAX_TRAILERS = 32
 
 #: Sent on by neither side of a proxy (RFC 9110 section 7.6.1), and the headers this proxy sets itself.
 _NOT_FORWARDED = frozenset(
@@ -56,8 +72,9 @@ _NOT_FORWARDED = frozenset(
         "expect",
     }
 )
-#: What the caller may not choose: the credential, the proof, and the labels the gateway's client sets.
-_CALLERS_OWN = frozenset({"authorization", "x-api-key", "dpop", "cookie", "x-request-id", "user-agent", "traceparent"})
+#: What the caller may not choose: the credential, the proof, and the request id. Its User-Agent is kept: the
+#: gateway records it as the client of the call, and the console should say Claude Code.
+_CALLERS_OWN = frozenset({"authorization", "x-api-key", "dpop", "cookie", "x-request-id", "traceparent"})
 
 
 class _BadRequest(Exception):
@@ -91,6 +108,7 @@ class ModelProxy:
         self._base_url: str | None = None
         self._lock = asyncio.Lock()
         self._connections: set[asyncio.Task[None]] = set()
+        self._unknown = 0  # connections that have not yet shown the secret and a route
 
     async def start(self) -> str:
         """Listen, once; returns the base URL to give the model client (``ANTHROPIC_BASE_URL``)."""
@@ -121,37 +139,50 @@ class ModelProxy:
     # --- one connection --------------------------------------------------------------------------------
 
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if len(self._connections) >= _MAX_CONNECTIONS or self._unknown >= _MAX_UNKNOWN:
+            writer.transport.abort()  # a process that holds sockets without a request must not exhaust ours
+            return
+        self._unknown += 1
         task = asyncio.get_running_loop().create_task(self._connection(reader, writer))
         self._connections.add(task)
         task.add_done_callback(self._connections.discard)
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         logger = self._gateway.project.logger
+        known = False
         try:
             try:
-                method, target, headers = await _read_head(reader)
-                route = self._route(target)
-                body = await _read_body(reader, writer, headers)
+                method, target, headers = await asyncio.wait_for(_read_head(reader), _HEAD_SECONDS)
+                url = self._route(method, target)  # the secret and the route, before a byte of the body is read
+                self._unknown, known = self._unknown - 1, True
+                body = await asyncio.wait_for(_read_body(reader, writer, headers), _BODY_SECONDS)
             except _BadRequest as bad:
+                logger.info("a request to the model proxy was refused: %d %s", bad.status, bad.message)
                 await _answer(writer, bad.status, bad.message)
                 return
-            await self._forward(writer, method, route, headers, body)
-        except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, TimeoutError):
+            await self._forward(writer, method, url, headers, body)
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             logger.debug("a model call ended before it was answered")
+        except TimeoutError:
+            logger.info("a request to the model proxy was not sent in time and was closed")
+            await _answer(writer, 408, "the request was not sent in time")
         except Exception:
             logger.exception("the model proxy failed on a call")
             await _answer(writer, 502, "the model call could not be forwarded")
         finally:
+            if not known:
+                self._unknown -= 1
             writer.close()
 
-    def _route(self, target: str) -> str:
-        """The gateway URL a request names, or ``_BadRequest`` for anything but a model route under the secret."""
+    def _route(self, method: str, target: str) -> str:
+        """The gateway URL a request names, or ``_BadRequest`` unless it is a listed route under the secret."""
         path, _, query = target.partition("?")
         given, _, rest = path[1:].partition("/")
-        route = "/" + rest
         if not hmac.compare_digest(given.encode(), self._secret.encode()):
             raise _BadRequest(404, "not found")
-        if not _MODEL_ROUTE.fullmatch(route) or any(part in ("", ".", "..") for part in route[1:].split("/")):
+        route = "/" + rest
+        if (method, route) not in ROUTES or not _QUERY.fullmatch(query):
+            self._gateway.project.logger.info("the model proxy does not forward %s %r", method, route[:64])
             raise _BadRequest(404, "not found")
         return self._gateway.mcp_url + route + ("?" + query if query else "")
 
@@ -207,14 +238,19 @@ async def _read_head(reader: asyncio.StreamReader) -> tuple[str, str, list[tuple
 async def _read_body(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: list[tuple[str, str]]
 ) -> bytes:
+    names = [name.lower() for name, _ in headers]
     fields = {name.lower(): value for name, value in headers}
+    if any(names.count(n) > 1 for n in ("content-length", "transfer-encoding")):
+        raise _BadRequest(400, "a repeated length header")
+    if "transfer-encoding" in fields and "content-length" in fields:
+        raise _BadRequest(400, "both a Content-Length and a Transfer-Encoding")
     if fields.get("expect", "").lower() == "100-continue":
         writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
         await writer.drain()
     if "chunked" in fields.get("transfer-encoding", "").lower():
         return await _read_chunked(reader)
     declared = fields.get("content-length", "0")
-    if not declared.isdigit():
+    if not _CONTENT_LENGTH.fullmatch(declared):
         raise _BadRequest(400, "a malformed Content-Length")
     length = int(declared)
     if length > _MAX_BODY:
@@ -222,22 +258,30 @@ async def _read_body(
     return await reader.readexactly(length) if length else b""
 
 
+async def _line(reader: asyncio.StreamReader) -> bytes:
+    try:
+        return await reader.readline()
+    except ValueError as error:  # a line longer than the reader's limit
+        raise _BadRequest(400, "a malformed chunk") from error
+
+
 async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
     body = bytearray()
     while True:
-        size_line = (await reader.readline()).split(b";")[0].strip()
-        try:
-            size = int(size_line, 16)
-        except ValueError as error:
-            raise _BadRequest(400, "a malformed chunk") from error
+        size_text = (await _line(reader)).split(b";")[0].strip().decode("latin-1")
+        if not _CHUNK_SIZE.fullmatch(size_text):
+            raise _BadRequest(400, "a malformed chunk")
+        size = int(size_text, 16)
         if size == 0:
-            while (await reader.readline()).strip():  # trailers
-                pass
-            return bytes(body)
+            for _ in range(_MAX_TRAILERS):  # trailers
+                if not (await _line(reader)).strip():
+                    return bytes(body)
+            raise _BadRequest(400, "too many trailers")
         if len(body) + size > _MAX_BODY:
             raise _BadRequest(413, "the request is too large")
         body += await reader.readexactly(size)
-        await reader.readexactly(2)
+        if await reader.readexactly(2) != b"\r\n":
+            raise _BadRequest(400, "a malformed chunk")
 
 
 async def _relay(writer: asyncio.StreamWriter, method: str, response: httpx.Response) -> None:
@@ -266,9 +310,13 @@ async def _relay(writer: asyncio.StreamWriter, method: str, response: httpx.Resp
 
 async def _answer(writer: asyncio.StreamWriter, status: int, message: str) -> None:
     """A refusal this proxy makes itself, in the shape the Anthropic API answers errors in."""
-    reason = {400: "Bad Request", 404: "Not Found", 413: "Payload Too Large", 431: "Header Fields Too Large"}.get(
-        status, "Bad Gateway"
-    )
+    reason = {
+        400: "Bad Request",
+        404: "Not Found",
+        408: "Request Timeout",
+        413: "Payload Too Large",
+        431: "Header Fields Too Large",
+    }.get(status, "Bad Gateway")
     body = ('{"type":"error","error":{"type":"api_error","message":"' + message + '"}}').encode()
     head = f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n"
     try:
