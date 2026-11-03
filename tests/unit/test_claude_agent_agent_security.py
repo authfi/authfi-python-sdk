@@ -368,8 +368,9 @@ async def test_a_connection_cancelled_before_its_first_step_leaves_nothing_behin
     await _proxy_address(claude)
     proxy = claude._proxy  # pyright: ignore[reportPrivateUsage]
     stub: Any = SimpleNamespace(transport=SimpleNamespace(abort=lambda: None), close=lambda: None)
+    no_reader: Any = None  # the task is cancelled before it reads
 
-    proxy._accept(None, stub)  # pyright: ignore[reportPrivateUsage]
+    proxy._accept(no_reader, stub)  # pyright: ignore[reportPrivateUsage]
     await proxy.aclose()  # before the loop has run the connection's task
 
     assert proxy._connections == set()  # pyright: ignore[reportPrivateUsage]
