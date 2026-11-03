@@ -285,8 +285,9 @@ not the other model routes, not `/mcp`, not `/v1/cloud/credentials`. That matter
 (it holds a secret made for the run) is in the environment of every tool Claude Code runs. The proxy drops whatever
 credential Claude Code sends, and passes its `User-Agent` on, so the call's client in the call tape is Claude
 Code's. Claude Code is given a placeholder key (`echo authfi-loopback` is its `apiKeyHelper`), which is no
-credential. A connection that sends no request is closed after 10 seconds, and a process that opens many
-without one is refused new connections, so it cannot use up the file descriptors of yours.
+credential. A connection that sends no request is closed after 2 seconds, at most 16 such connections are
+held, and a new one takes the place of the oldest, so a process that opens many cannot use up the file descriptors
+of yours or keep Claude Code out.
 `AsyncAuthFI.aclose()` stops the proxy, as does `claude.aclose()`. Claude Code's options and environment hold
 no key or token. The options refuse an `env` (or `settings["env"]`) that would turn the token elsewhere or
 switch content on: `ANTHROPIC_BASE_URL`, every `AUTHFI_*` and `OTEL_LOG_*` name, the other variables

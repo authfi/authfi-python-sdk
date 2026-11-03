@@ -45,8 +45,10 @@ ROUTES = frozenset({("POST", "/v1/messages")})
 _QUERY = re.compile(r"[A-Za-z0-9_=&.-]{0,128}")
 
 #: How long a connection may take to send its head, and then its body. A caller without the secret never gets past
-#: the head, so these and the caps below are what it can hold: at most _MAX_UNKNOWN sockets for _HEAD_SECONDS each.
-_HEAD_SECONDS = 10.0
+#: the head, so these and the caps below are what it can hold: at most _MAX_UNKNOWN sockets for _HEAD_SECONDS each, and
+#: a new connection takes the place of the oldest of them, so holding them all does not keep Claude Code out.
+#: Claude Code sends its head at once.
+_HEAD_SECONDS = 2.0
 _BODY_SECONDS = 120.0
 _MAX_UNKNOWN = 16
 _MAX_CONNECTIONS = 128
@@ -108,7 +110,8 @@ class ModelProxy:
         self._base_url: str | None = None
         self._lock = asyncio.Lock()
         self._connections: set[asyncio.Task[None]] = set()
-        self._unknown = 0  # connections that have not yet shown the secret and a route
+        #: The connections that have not yet shown the secret and a route, oldest first.
+        self._preauth: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
 
     async def start(self) -> str:
         """Listen, once; returns the base URL to give the model client (``ANTHROPIC_BASE_URL``)."""
@@ -126,10 +129,11 @@ class ModelProxy:
         server, self._server, self._base_url = self._server, None, None
         if server is not None:
             server.close()
-        for task in list(self._connections):
+        tasks = list(self._connections)
+        for task in tasks:
             task.cancel()
-        if self._connections:
-            await asyncio.gather(*self._connections, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if server is not None:
             await server.wait_closed()
 
@@ -139,22 +143,35 @@ class ModelProxy:
     # --- one connection --------------------------------------------------------------------------------
 
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if len(self._connections) >= _MAX_CONNECTIONS or self._unknown >= _MAX_UNKNOWN:
-            writer.transport.abort()  # a process that holds sockets without a request must not exhaust ours
+        if len(self._preauth) >= _MAX_UNKNOWN:
+            # A process that holds sockets without a request must not keep the real caller out: its oldest goes.
+            oldest = next(iter(self._preauth))
+            self._preauth.pop(oldest).transport.abort()
+        elif len(self._connections) >= _MAX_CONNECTIONS:
+            writer.transport.abort()
             return
-        self._unknown += 1
         task = asyncio.get_running_loop().create_task(self._connection(reader, writer))
         self._connections.add(task)
-        task.add_done_callback(self._connections.discard)
+        self._preauth[task] = writer
+        task.add_done_callback(self._forget)  # runs for a task cancelled before its first step, which has no finally
+
+    @staticmethod
+    def _self() -> asyncio.Task[Any]:
+        task = asyncio.current_task()
+        assert task is not None  # noqa: S101 - only called from a task
+        return task
+
+    def _forget(self, task: asyncio.Task[None]) -> None:
+        self._connections.discard(task)
+        self._preauth.pop(task, None)
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         logger = self._gateway.project.logger
-        known = False
         try:
             try:
                 method, target, headers = await asyncio.wait_for(_read_head(reader), _HEAD_SECONDS)
                 url = self._route(method, target)  # the secret and the route, before a byte of the body is read
-                self._unknown, known = self._unknown - 1, True
+                self._preauth.pop(self._self(), None)
                 body = await asyncio.wait_for(_read_body(reader, writer, headers), _BODY_SECONDS)
             except _BadRequest as bad:
                 logger.info("a request to the model proxy was refused: %d %s", bad.status, bad.message)
@@ -170,8 +187,6 @@ class ModelProxy:
             logger.exception("the model proxy failed on a call")
             await _answer(writer, 502, "the model call could not be forwarded")
         finally:
-            if not known:
-                self._unknown -= 1
             writer.close()
 
     def _route(self, method: str, target: str) -> str:

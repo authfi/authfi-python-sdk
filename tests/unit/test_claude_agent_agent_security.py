@@ -12,6 +12,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -339,25 +340,48 @@ async def test_a_body_that_never_ends_is_closed(
     assert len(gw.requests) == before
 
 
-async def test_sockets_held_open_without_a_request_cannot_exhaust_the_proxy(
+async def test_sockets_held_open_without_a_request_cannot_keep_the_real_caller_out(
     gw: AgentGateway, project: AsyncAuthFI, key_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(model_proxy, "_MAX_UNKNOWN", 2)
-    monkeypatch.setattr(model_proxy, "_HEAD_SECONDS", 0.5)
+    monkeypatch.setattr(model_proxy, "_HEAD_SECONDS", 60.0)  # it is not the timeout that makes room
     claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
     host, port, secret = await _proxy_address(claude)
 
-    holders = [await asyncio.open_connection(host, port) for _ in range(2)]  # a process that holds sockets
+    holders = [await asyncio.open_connection(host, port) for _ in range(model_proxy._MAX_UNKNOWN)]  # pyright: ignore[reportPrivateUsage]
     try:
-        await asyncio.sleep(0.1)
-        refused = await _raw(host, port, b"", wait=2.0)  # the third is closed at once, not held
-        assert refused == b""
-        await asyncio.sleep(0.8)  # the first two time out and free their places
+        await asyncio.sleep(0.2)
         answer = await _raw(host, port, _post(f"/{secret}/v1/messages", body=json.dumps(MODEL_REQUEST).encode()))
-        assert answer.startswith(b"HTTP/1.1 200")
+
+        assert answer.startswith(b"HTTP/1.1 200")  # the real caller took the place of the oldest
+        oldest = holders[0][0]
+        assert await asyncio.wait_for(oldest.read(), 2.0) == b""  # which was closed
     finally:
         for _, writer in holders:
             writer.close()
+
+
+async def test_a_connection_cancelled_before_its_first_step_leaves_nothing_behind(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_proxy, "_MAX_UNKNOWN", 1)
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    await _proxy_address(claude)
+    proxy = claude._proxy  # pyright: ignore[reportPrivateUsage]
+    stub: Any = SimpleNamespace(transport=SimpleNamespace(abort=lambda: None), close=lambda: None)
+
+    proxy._accept(None, stub)  # pyright: ignore[reportPrivateUsage]
+    await proxy.aclose()  # before the loop has run the connection's task
+
+    assert proxy._connections == set()  # pyright: ignore[reportPrivateUsage]
+    assert proxy._preauth == {}  # pyright: ignore[reportPrivateUsage]
+    # the same object, started again, takes calls as at first
+    host, port, secret = await _proxy_address(claude)
+    held = await asyncio.open_connection(host, port)
+    try:
+        answer = await _raw(host, port, _post(f"/{secret}/v1/messages", body=json.dumps(MODEL_REQUEST).encode()))
+        assert answer.startswith(b"HTTP/1.1 200")
+    finally:
+        held[1].close()
 
 
 async def test_the_callers_user_agent_is_the_calls_client(
