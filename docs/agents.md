@@ -77,8 +77,8 @@ the key, and a replayed proof is refused.
 - A machine client's token (`af.client_credentials(...)`) is **not** bound: the platform cannot bind a
   `client_credentials` token for an app, so it stays Bearer.
 - `af.agent(..., dpop=False)` asks for a Bearer token. It is for a credential you hand to a process
-  that cannot hold the key; `authfi token` and `authfi headers` do it for Claude Code's
-  `apiKeyHelper`. `agent.headers(method, url)` carries a proof good for one request, so make one per request.
+  that cannot hold the key; `authfi token` and `authfi headers` do it for a tool's
+  `apiKeyHelper` or `otelHeadersHelper`. `agent.headers(method, url)` carries a proof good for one request, so make one per request.
 - The approval status read and the action gate take the agent's token as Bearer, as those routes do.
 
 ### From the environment
@@ -176,8 +176,8 @@ the credential.
 A task is one level deep, and nothing raises it. Inside a task `agent.task(...)` is refused
 (`ConfigurationError`, `code == "task_nested"`), and no refusal offers a way to ask for more: only a
 person gives a task. Its credential goes only to AuthFI's origins, does not print and does not
-pickle. `ClaudeAgentIntegration` does not take a task: Claude Code's own model calls go through its
-`apiKeyHelper`, a separate process that cannot hold the key.
+pickle. `ClaudeAgentIntegration` does not take a task: Claude Code's own model calls go through a proxy that sends
+the agent's credential, not the task's.
 
 ## Cloud credentials, just in time
 

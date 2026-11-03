@@ -95,6 +95,8 @@ class AgentGateway(FakeGateway):
         #: token -> what the platform issued it as.
         self.issued: dict[str, dict[str, Any]] = {}
         self.proofs: list[dict[str, Any]] = []  # every proof accepted: its claims, alg and path
+        #: Each authenticated call on /mcp: (path, the run the gateway derives from its token, the scheme it came with).
+        self.run_calls: list[tuple[str, str, str]] = []
         self.refused_proofs: list[str] = []  # the kernel reason of each proof refused
         self.nonce_challenges = 0
         self.templates: dict[str, Template] = {"support.refund": Template([ALLOWED, STEP_UP], budget=100)}
@@ -299,11 +301,15 @@ class AgentGateway(FakeGateway):
             return 200, {}, json.dumps({"auth_req_id": "ciba-1", "expires_in": 300, "interval": 1}).encode()
         if path == CLOUD_PATH:
             return self._cloud(headers, body)
+        run: str | None = None
         if path == "/mcp" or path.startswith("/mcp/"):
             info, refusal = self._credential("POST", path, headers)
             if refusal is not None:
                 return refusal
             assert info is not None
+            run = self._run_of(info)
+            with self._lock:
+                self.run_calls.append((path, run, headers["authorization"].partition(" ")[0].lower()))
             if self.model_proof and path.startswith("/mcp/v1/") and not info.get("jkt"):
                 self.unproven_model_calls.append(path)
                 refusal_body = {"error": {"type": "permission_error", "code": "EMODEL020", "message": "unproven"}}
@@ -331,7 +337,15 @@ class AgentGateway(FakeGateway):
                 params: dict[str, Any] = message.get("params") or {}
                 if params.get("name") == "cloud__credentials":
                     return self._cloud_tool_call(message)
-        return super()._post(path, headers, body)
+        status, out_headers, out = super()._post(path, headers, body)
+        return status, ({**out_headers, "AuthFI-Run-Id": run} if run else out_headers), out
+
+    @staticmethod
+    def _run_of(info: dict[str, Any]) -> str:
+        """The gateway's run for a token (``internal/run``): its run key's thumbprint, else the agent itself."""
+        agent = str(info["claims"]["client_id"])
+        family = info.get("jkt") or agent
+        return "run_" + hashlib.sha256(f"tenant-1\x00{agent}\x00{family}".encode()).hexdigest()[:32]
 
     def add_cloud_tool(self) -> None:
         """List the gateway's own ``cloud__credentials`` tool, which holds a privileged role like any held tool."""

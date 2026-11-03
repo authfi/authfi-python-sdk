@@ -11,8 +11,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 ### Added
 
 - A model call that goes to the AI gateway with no DPoP proof is said once in the log: the gateway refuses such a
-  call once its model proof check (`MCP_MODEL_PROOF_CHECK=enforce`) is on, unless the workload is caged. Claude
-  Code's model calls (`authfi token` as `apiKeyHelper`) are always in this group: its process cannot hold the key.
+  call once its model proof check (`MCP_MODEL_PROOF_CHECK=enforce`) is on, unless the workload is caged.
   `authfi.gateway.learn_nonce_from` keeps the nonce a gateway asked for in an answer the caller cannot resend.
 - CrewAI's model calls answer the gateway's DPoP nonce: the nonce is kept and the provider SDK is told to try
   again, where a nonce challenge was reported as a refused token and never learned.
@@ -112,8 +111,8 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - `AsyncGateway.mcp_client_factory()`: HTTP clients for MCP libraries, which get a refused token
   as a JSON-RPC error at once instead of waiting out their session timeout.
 - `authfi.claude_agent.ClaudeAgentIntegration` (extra `claude-agent`): `options()` gives Claude Code
-  the agent's token through `python -m authfi token` as its `apiKeyHelper` (renewed, never in its
-  environment), the gateway's tools through an MCP server in your process, approvals through
+  model calls through a loopback proxy in your process that sends them with the agent's credential (never in
+  Claude Code's environment), the gateway's tools through an MCP server in your process, approvals through
   `can_use_tool` with a permission mode that makes Claude Code ask it, and OpenTelemetry content off.
 - `authfi.adk.ADKIntegration` (extra `adk`): a LiteLLM model that puts the agent's token on each
   call outside ADK's traces; ADK's `McpToolset` on the gateway with the token on every request and
@@ -133,6 +132,15 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 - `approval()`, `wait_for_approval()` and `transaction_token()` prove the token when it is bound to a key. They sent it as
   Bearer, which AuthFI refuses, so an agent could not learn that a person had decided.
+- Claude Code's model calls and its tools are one run of the agent's key. The model calls went with a Bearer
+  token from a helper process, so the gateway counted them on the agent's one coarse run while the tools
+  (which prove the key) were on another, and the steps Claude Code exported (also sent with that Bearer token) were
+  on the coarse run too. The options now point Claude Code at a loopback proxy that sends its model calls with the
+  process's credential and name the gateway's run in the exported trace.
+- `ClaudeAgentIntegration.options(export_steps=True)` could export nothing. Claude Code runs `otelHeadersHelper`
+  at its first export, which for a short run is while it shuts down, when it gives its exporter under two
+  seconds; the helper takes about a second, and a slower start (a busy machine) ran out of time with no request
+  sent. Claude Code now exports every second and keeps the helper's headers for four minutes.
 
 ### Changed
 

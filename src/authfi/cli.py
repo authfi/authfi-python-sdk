@@ -6,7 +6,7 @@
         writes a new private key (readable by its owner only) and prints the public JWK and its
         thumbprint: what you register in the console
     authfi token
-        the agent's current access token, on one line (Claude Code's apiKeyHelper)
+        the agent's current access token, on one line (a tool's apiKeyHelper)
     authfi headers
         {"Authorization": "Bearer ..."} as JSON (an MCP server's headersHelper); with
         AUTHFI_RUN_ID set, X-Request-Id too
