@@ -10,6 +10,13 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- A gateway call names the step that made it. With `export_steps()`, every tool call, model call and cloud
+  credential request carries the `traceparent` (trace id and span id) of the OpenAI Agents, LangChain, LangGraph,
+  ADK or Claude Agent SDK step executing when it is made, as that step is exported to `/otlp/v1/traces`; model
+  calls LiteLLM makes with its own HTTP client carry it too, and an MCP call is sent with the step in its
+  `_meta.traceparent`. With no step executing the value is fresh with the sampled flag off, as before.
+  LangSmith's OpenTelemetry bridge now makes a run's span from the run's UUID, so the id is known when the run
+  starts.
 - A model call that goes to the AI gateway with no DPoP proof is said once in the log: the gateway refuses such a
   call once its model proof check (`MCP_MODEL_PROOF_CHECK=enforce`) is on, unless the workload is caged.
   `authfi.gateway.learn_nonce_from` keeps the nonce a gateway asked for in an answer the caller cannot resend.

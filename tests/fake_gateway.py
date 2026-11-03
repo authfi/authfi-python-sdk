@@ -124,7 +124,7 @@ class FakeGateway:
         return out
 
     def exported_spans(self) -> list[dict[str, Any]]:
-        """Every span the agent exported to ``/otlp/v1/traces``: its name, attributes and the export's headers."""
+        """Every span the agent exported to ``/otlp/v1/traces``: its name, ids, attributes and the export's headers."""
         from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
         out: list[dict[str, Any]] = []
@@ -137,7 +137,16 @@ class FakeGateway:
                 for scope in resource.scope_spans:
                     for span in scope.spans:
                         attributes = {kv.key: kv.value.string_value or kv.value.int_value for kv in span.attributes}
-                        out.append({"name": span.name, "attributes": attributes, "headers": r["headers"]})
+                        out.append(
+                            {
+                                "name": span.name,
+                                "attributes": attributes,
+                                "headers": r["headers"],
+                                "trace_id": span.trace_id.hex(),
+                                "span_id": span.span_id.hex(),
+                                "parent_span_id": span.parent_span_id.hex(),
+                            }
+                        )
         return out
 
     def model_requests(self) -> list[dict[str, Any]]:

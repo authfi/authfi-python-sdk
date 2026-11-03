@@ -56,7 +56,8 @@ Every request the SDK makes:
 - has a connect timeout, a read timeout, and a deadline for the whole call, retries included, reading the answer's body too (a server that sends one byte a second is cut at the deadline with a `timeout` error);
 - follows no redirect, and reads at most 1 MiB of an answer (256 KiB of a discovery document);
 - sends a `User-Agent` naming the SDK, an `X-Request-Id` (the same on every retry of one call)
-  and a W3C `traceparent` (from OpenTelemetry when `opentelemetry-api` is installed).
+  and a W3C `traceparent` (the framework step executing, else the active OpenTelemetry span when
+  `opentelemetry-api` is installed, else a fresh value with the sampled flag off; one you set is kept).
 
 A request is sent again only when that is safe:
 

@@ -426,3 +426,50 @@ async def test_export_steps_sends_adks_spans_to_authfi_with_no_content(
     assert step["attributes"]["authfi.run_id"] == adk.run_id
     assert "gen_ai.input.messages" not in step["attributes"]
     assert step["headers"]["authorization"].startswith("Bearer tok-minted-")
+
+
+# --- every gateway call names the step that made it -------------------------------------------------------
+
+
+@pytest.fixture
+def global_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADK traces through the global OpenTelemetry provider: give this test a fresh one."""
+    from google.adk.telemetry import tracing
+    from opentelemetry import trace
+    from opentelemetry.util._once import Once
+
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+    if hasattr(tracing.tracer, "_real_tracer"):  # a proxy that an earlier test may have bound to its provider
+        monkeypatch.setattr(tracing.tracer, "_real_tracer", None)
+
+
+def _step_of(headers: dict[str, str]) -> tuple[str, str, str]:
+    """``(trace id, span id, flags)`` of a request's ``traceparent``."""
+    _, trace_id, span_id, flags = headers["traceparent"].split("-")
+    return trace_id, span_id, flags
+
+
+async def test_a_model_call_and_a_tool_call_name_the_step_that_made_them(
+    fake: FakeGateway, adk: ADKIntegration, global_tracing: None
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    import asyncio
+
+    provider = adk.export_steps()
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "It has an overview."}]]
+
+    await Run(adk).ask("Describe the wiki")
+    await asyncio.to_thread(provider.force_flush)
+
+    exported = {(s["trace_id"], s["span_id"]): s["name"] for s in fake.exported_spans()}
+    models = [_step_of(r["headers"]) for r in fake.model_requests()]
+    calls = [_step_of(headers) for headers, _ in fake.tool_requests()]
+    assert len(models) == 2 and len(calls) == 1
+    for trace_id, span_id, _ in models:
+        assert exported[(trace_id, span_id)].startswith("generate_content ")
+    assert models[0][1] != models[1][1]
+    # The MCP session was opened inside the agent's step; the call names the tool's own.
+    assert exported[calls[0][:2]] == f"execute_tool {ALLOWED}"
+    provider.shutdown()

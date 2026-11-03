@@ -135,6 +135,7 @@ _OWNED_PREFIXES = ("AUTHFI_", "OTEL_LOG_")
 #: and none from the environment, which would send another system's OTLP credential to AuthFI.
 _TRACE_OWNED = (
     "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "CLAUDE_CODE_PROPAGATE_TRACEPARENT",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
     "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS",
     "OTEL_TRACES_EXPORT_INTERVAL",
@@ -147,6 +148,8 @@ _TRACE_OWNED = (
 _TRACE_SWITCHES = {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+    # Claude Code puts the traceparent of the model request span it exports on that request, which the proxy keeps.
+    "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1",
     "OTEL_TRACES_EXPORTER": "otlp",
     "OTEL_TRACES_EXPORT_INTERVAL": str(TRACE_EXPORT_INTERVAL_MS),
     "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS": str(HEADERS_HELPER_TTL_MS),
@@ -275,11 +278,15 @@ class ClaudeAgentIntegration:
         self.token_refused = refused
         return refused
 
-    async def _send(self, tool: str, args: dict[str, Any], approval_id: str | None) -> Held | Decided:
+    async def _send(
+        self, tool: str, args: dict[str, Any], approval_id: str | None, asked_by: str | None = None
+    ) -> Held | Decided:
         sent = self.gateway.with_approval(args, approval_id) if approval_id else args
         try:
             async with self._session() as session:
-                result: CallToolResult = await session.call_tool(tool, sent)
+                result: CallToolResult = await session.call_tool(
+                    tool, sent, meta={"traceparent": asked_by} if asked_by else None
+                )
         except Exception as error:
             raise self._refused(error) from error
         outcome = self.gateway.read_result(result)
@@ -352,14 +359,17 @@ class ClaudeAgentIntegration:
         tool = tool_name[len(self.prefix) :]
         args = self.gateway.strip_approval_argument(tool_input)
         known = self._calls.get(tool, args)
+        # Claude Code does not say which span of its own is running the tool, so the call names the model request
+        # that asked for it: a step Claude Code exports, in the trace of the run, under the agent that asked.
+        asked_by = self._proxy.asked_by(context.tool_use_id)
         try:
             if not isinstance(known, Decided):
-                known = await self._send(tool, args, known.approval_id if isinstance(known, Held) else None)
+                known = await self._send(tool, args, known.approval_id if isinstance(known, Held) else None, asked_by)
             if isinstance(known, Held) and self.wait_for_decision is not None:
                 decided = self.wait_for_decision(PendingApproval(known.approval_id, tool, args))
                 if inspect.isawaitable(decided):
                     await decided
-                known = await self._send(tool, args, known.approval_id)
+                known = await self._send(tool, args, known.approval_id, asked_by)
         except GatewayTokenRefused as refused:
             return PermissionResultDeny(message=str(refused), interrupt=True)
         self._calls.remember(tool, args, known)

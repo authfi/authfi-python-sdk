@@ -13,7 +13,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -21,6 +21,7 @@ import pytest
 pytest.importorskip("claude_agent_sdk")
 
 import jwt
+from claude_agent_sdk import PermissionResultAllow, ToolPermissionContext
 
 from authfi import AgentKey, AsyncAuthFI, GatewayTokenRefused, NotSupportedError
 from authfi import _model_proxy as model_proxy
@@ -418,3 +419,85 @@ async def test_closing_the_project_stops_the_proxy(gw: AgentGateway, key_file: P
         base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
     with pytest.raises(httpx.ConnectError):
         await _model_call(base_url)
+
+
+# --- every gateway call names the step that made it ---------------------------------------------------------
+
+STEP = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+TOOL_USE_ID = "toolu_01ABCdefGHI"
+
+
+def _traceparent_of(request: dict[str, Any]) -> str:
+    return str(request["headers"]["traceparent"])
+
+
+async def _model_call_with(base_url: str, traceparent: str | None) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {CLAUDE_CODES_KEY}", "x-api-key": CLAUDE_CODES_KEY}
+    if traceparent is not None:
+        headers["traceparent"] = traceparent
+    async with httpx.AsyncClient() as http:
+        return await http.post(base_url + "/v1/messages?beta=true", headers=headers, json=MODEL_REQUEST)
+
+
+async def test_the_traceparent_claude_code_sends_is_the_model_calls(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
+
+    for sent in (STEP, STEP.upper()):
+        await _model_call_with(base_url, sent)
+        assert _traceparent_of(gw.model_requests()[-1]) == STEP
+    for not_one in ("nonsense", STEP + "-x", None):  # not a step of any exported span: fresh and unsampled
+        await _model_call_with(base_url, not_one)
+        assert _traceparent_of(gw.model_requests()[-1]).endswith("-00")
+    assert len({_traceparent_of(r) for r in gw.model_requests()[-3:]}) == 3
+
+
+async def test_the_call_made_for_a_tool_names_the_model_request_that_asked_for_it(
+    gw: AgentGateway, project: AsyncAuthFI, key_file: Path
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    base_url = dict((await claude.options(model="claude-haiku-5-5")).env)["ANTHROPIC_BASE_URL"]
+    gw.model_script += [[{"type": "tool_use", "id": TOOL_USE_ID, "name": ALLOWED, "input": ARGS}]]
+    await _model_call_with(base_url, STEP)
+
+    asked = await claude.can_use_tool(
+        f"mcp__authfi__{ALLOWED}", dict(ARGS), ToolPermissionContext(tool_use_id=TOOL_USE_ID)
+    )
+    stranger = await claude.can_use_tool(
+        f"mcp__authfi__{ALLOWED}", {"repoName": "other"}, ToolPermissionContext(tool_use_id="toolu_unseen")
+    )
+
+    assert isinstance(asked, PermissionResultAllow) and isinstance(stranger, PermissionResultAllow)
+    calls = [
+        r
+        for r in gw.requests
+        if r["path"] == "/mcp" and cast("dict[str, Any]", r["json"] or {}).get("method") == "tools/call"
+    ]
+    assert _traceparent_of(calls[0]) == STEP
+    assert _traceparent_of(calls[1]).endswith("-00")  # a call nobody saw the model ask for names no step
+
+
+def test_tool_calls_are_found_in_an_answer_whatever_the_chunks() -> None:
+    answer = (
+        b'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":'
+        b'{"type":"tool_use","id":"' + TOOL_USE_ID.encode() + b'","name":"x","input":{}}}\n\n'
+        b'data: {"id":"toolu_other","type":"tool_use"}'
+    )
+    for size in (1, 3, 7, 40, len(answer)):
+        scan = model_proxy._ToolUses()  # pyright: ignore[reportPrivateUsage]
+        found: set[str] = set()
+        for start in range(0, len(answer), size):
+            found |= scan.feed(answer[start : start + size])
+        assert found == {TOOL_USE_ID, "toolu_other"}, size
+    assert model_proxy._ToolUses().feed(b'{"type":"text","text":"a tool_use id"}') == set()  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_claude_codes_trace_names_its_model_requests_only_when_steps_are_exported(
+    project: AsyncAuthFI, key_file: Path
+) -> None:
+    claude = ClaudeAgentIntegration(project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")))
+    assert "CLAUDE_CODE_PROPAGATE_TRACEPARENT" not in dict((await claude.options(model="claude-haiku-5-5")).env)
+    exported = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    assert dict(exported.env)["CLAUDE_CODE_PROPAGATE_TRACEPARENT"] == "1"

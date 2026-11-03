@@ -57,7 +57,13 @@ try:
     from agents.items import ToolApprovalItem
     from agents.mcp import MCPServerStreamableHttp
     from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
-    from agents.tracing import TracingProcessor, set_trace_processors, set_tracing_disabled
+    from agents.tracing import (
+        TracingProcessor,
+        get_current_span,
+        get_current_trace,
+        set_trace_processors,
+        set_tracing_disabled,
+    )
     from agents.tracing.span_data import (
         AgentSpanData,
         CustomSpanData,
@@ -82,7 +88,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
-from authfi.errors import ConfigurationError
+from authfi._protocol.ids import Step, inject_traceparent, register_step_source, step_traceparent
+from authfi.errors import ConfigurationError, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,
     AsyncGateway,
@@ -111,6 +118,15 @@ __all__ = [
 
 #: How many held or decided calls a server remembers until the run comes back for them.
 MEMORY = 10_000
+
+#: The openai-agents versions the private seam on ``LitellmModel`` below is tested against.
+TESTED = "openai-agents 0.24"
+
+if not callable(getattr(LitellmModel, "_merge_headers", None)):  # pragma: no cover - exercised by a moved seam
+    raise IntegrationError(
+        "authfi.openai_agents puts the executing step's traceparent on a model call through "
+        f"LitellmModel._merge_headers, which this openai-agents does not have. It is tested with {TESTED}."
+    )
 
 
 class OpenAIAgentsIntegration:
@@ -201,7 +217,9 @@ class OpenAIAgentsIntegration:
         from authfi import otel
 
         provider = otel.register(self.source, capture_content=capture_content, **options)
-        self.configure_tracing([*processors, AuthFIStepsProcessor(provider)], capture_content=capture_content)
+        steps = AuthFIStepsProcessor(provider)
+        register_step_source(self.source, steps.current_step)
+        self.configure_tracing([*processors, steps], capture_content=capture_content)
         return provider
 
 
@@ -261,7 +279,8 @@ class AuthFIStepsProcessor(TracingProcessor):
     """The Agents SDK's trace as OpenTelemetry GenAI spans on ``provider``: the agent's steps, never its words.
 
     No input, output, prompt or tool argument is read, so none can reach a span. A span is a child of the
-    span the SDK says is its parent, so the trace id of a gateway call made inside it joins the steps.
+    span the SDK says is its parent. Each is made when the SDK's span starts, so its ids are fixed from then:
+    :meth:`current_step` names the one executing, for the ``traceparent`` of a gateway call made inside it.
     """
 
     def __init__(self, provider: TracerProvider) -> None:
@@ -289,6 +308,17 @@ class AuthFIStepsProcessor(TracingProcessor):
 
             span.set_status(Status(StatusCode.ERROR))
         span.end(end_time=ended)
+
+    def current_step(self) -> Step | None:
+        """The exported span of the SDK span (or, outside one, the trace) executing in this context."""
+        sdk_span, sdk_trace = get_current_span(), get_current_trace()
+        key = sdk_span.span_id if sdk_span is not None else sdk_trace.trace_id if sdk_trace is not None else None
+        with self._lock:
+            step = self._open.get(key) if key else None
+        if step is None:
+            return None
+        context = step.get_span_context()
+        return format(context.trace_id, "032x"), format(context.span_id, "016x")
 
     @override
     def on_trace_start(self, trace: Trace) -> None:
@@ -398,6 +428,14 @@ class AuthFIModel(LitellmModel):
             model=f"anthropic/{model}", base_url=gateway.model_base_url("anthropic"), api_key=PLACEHOLDER_KEY
         )
         self.gateway = gateway
+
+    @override
+    def _merge_headers(self, model_settings: ModelSettings) -> dict[str, Any]:
+        # Runs inside the SDK's generation span, so the step is the model call itself, which LiteLLM's own HTTP
+        # client (not the gateway's) would otherwise send without one.
+        headers: dict[str, Any] = super()._merge_headers(model_settings)  # pyright: ignore[reportUnknownMemberType]
+        inject_traceparent(cast("dict[str, str]", headers), self.gateway.source)
+        return headers
 
     async def _with_token(self, settings: ModelSettings) -> ModelSettings:
         url = self.gateway.model_base_url("anthropic") + "/v1/messages"
@@ -527,7 +565,7 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
     ) -> _Held | _Decided:
         sent = self.gateway.with_approval(args, approval_id) if approval_id else args
         try:
-            result = await super().call_tool(tool, sent, meta)
+            result = await super().call_tool(tool, sent, self._with_step(meta))
         except Exception as error:
             refused = token_refusal(error)
             if refused is not None:
@@ -541,6 +579,13 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
             self.gateway.project.logger.info("the gateway refused %s: %s", tool, outcome.code or outcome.error)
             return _Decided(_text_result(outcome.model_text))
         return _Decided(result)
+
+    def _with_step(self, meta: dict[str, Any] | None) -> dict[str, Any] | None:
+        """``meta`` naming the executing step: the MCP session sends the call from a task that began with it."""
+        stepped = step_traceparent(self.gateway.source)
+        if stepped is None or "traceparent" in (meta or {}):
+            return meta
+        return {**(meta or {}), "traceparent": stepped}
 
     @override
     async def call_tool(

@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -43,7 +44,8 @@ from authfi._protocol.gateway import (
     strip_approval_argument,
     with_approval,
 )
-from authfi._protocol.ids import inject_traceparent, request_id
+from authfi._protocol.http import HttpRequest
+from authfi._protocol.ids import inject_traceparent, request_id, step_traceparent, valid_traceparent
 from authfi._transport import user_agent
 from authfi.errors import ConfigurationError, GatewayTokenRefused
 from authfi.tokens import AsyncTokenSource, TokenSource
@@ -324,6 +326,7 @@ class _GatewayBase:
         self._project = project
         #: ``<issuer>/mcp``: the MCP gateway, and the base URL of the Anthropic API on the AI gateway.
         self.mcp_url = project.issuer + "/mcp"
+        self._mcp_path = urlsplit(self.mcp_url).path
 
     def model_base_url(self, api: ModelApi) -> str:
         """The base URL to give a provider SDK: ``<issuer>/mcp`` for Anthropic, ``<issuer>/mcp/v1`` for OpenAI."""
@@ -386,9 +389,34 @@ class _GatewayBase:
         if "x-request-id" not in request.headers:
             request.headers["X-Request-Id"] = self._next_request_id()
         headers = dict(request.headers)
-        inject_traceparent(headers)
+        carried = self._carried_traceparent(request)
+        if carried is not None:
+            headers.setdefault("traceparent", carried)
+        inject_traceparent(headers, getattr(self, "source", None))
         if "traceparent" in headers and "traceparent" not in request.headers:
             request.headers["traceparent"] = headers["traceparent"]
+
+    def _stepped(self, request: HttpRequest) -> HttpRequest:
+        """``request`` carrying the executing step's ``traceparent``; without a step the transport adds its own."""
+        stepped = step_traceparent(getattr(self, "source", None))
+        return replace(request, headers={**request.headers, "traceparent": stepped}) if stepped else request
+
+    def _carried_traceparent(self, request: httpx.Request) -> str | None:
+        """The step an MCP request names in its ``_meta.traceparent``, which is the one that made the call.
+
+        An MCP client sends a request from a background task that began with its session, so the step that is
+        executing when the request leaves is the session's, not the call's. The MCP convention for trace context
+        is ``params._meta.traceparent``, which the caller writes while its own step is current.
+        """
+        if request.method != "POST" or request.url.path != self._mcp_path:
+            return None
+        try:
+            body: object = json.loads(request.content)
+        except (httpx.RequestNotRead, ValueError):  # a streamed body, or not JSON
+            return None
+        params = cast("Mapping[str, Any]", body).get("params") if isinstance(body, dict) else None
+        meta = cast("Mapping[str, Any]", params).get("_meta") if isinstance(params, dict) else None
+        return valid_traceparent(cast("Mapping[str, Any]", meta).get("traceparent")) if isinstance(meta, dict) else None
 
     def _warn_if_unproven(self, request: httpx.Request) -> None:
         """Say once that a model call has no DPoP proof, which the AI gateway refuses when its check enforces."""
@@ -494,7 +522,7 @@ class Gateway(_GatewayBase):
             approval_id=approval_id,
             dpop=proof,
         )
-        response = self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        response = self.project._transport.send(self._stepped(request))  # pyright: ignore[reportPrivateUsage]
         if response.status == 401:
             raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
         credential, held = parse_cloud(response, self._now())
@@ -619,7 +647,7 @@ class AsyncGateway(_GatewayBase):
             approval_id=approval_id,
             dpop=proof,
         )
-        response = await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        response = await self.project._transport.send(self._stepped(request))  # pyright: ignore[reportPrivateUsage]
         if response.status == 401:
             raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
         credential, held = parse_cloud(response, self._now())

@@ -10,6 +10,10 @@ The proxy forwards one request: ``POST /v1/messages`` under a secret this proces
 in the environment of every tool Claude Code runs, so it does not stand for the right to use the credential: any
 other method or path, including the rest of the gateway's model and cloud routes, is refused unsent. Whatever
 credential the caller sends is dropped; the gateway sees only this process's.
+
+The caller's ``traceparent`` is kept when it is one: Claude Code sends the one of the model request span it exports
+(``CLAUDE_CODE_PROPAGATE_TRACEPARENT``), so the gateway's record of the call names that step. The proxy also reads the
+tool calls the answer asks for, so that the call made for a tool can name the model request that asked for it.
 """
 
 from __future__ import annotations
@@ -18,11 +22,13 @@ import asyncio
 import hmac
 import re
 import secrets
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from authfi._protocol.ids import valid_traceparent
 from authfi.gateway import _refused_response  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
@@ -75,8 +81,32 @@ _NOT_FORWARDED = frozenset(
     }
 )
 #: What the caller may not choose: the credential, the proof, and the request id. Its User-Agent is kept: the
-#: gateway records it as the client of the call, and the console should say Claude Code.
+#: gateway records it as the client of the call, and the console should say Claude Code. Its ``traceparent`` is kept
+#: only when it is one (see ``_forward``).
 _CALLERS_OWN = frozenset({"authorization", "x-api-key", "dpop", "cookie", "x-request-id", "traceparent"})
+
+#: A tool call in a model answer, whether streamed (``content_block_start``) or whole, in either key order.
+_TOOL_USE = re.compile(
+    rb'"type"\s*:\s*"tool_use"\s*,\s*"id"\s*:\s*"([A-Za-z0-9_-]{1,128})"'
+    rb'|"id"\s*:\s*"([A-Za-z0-9_-]{1,128})"\s*,\s*"type"\s*:\s*"tool_use"'
+)
+#: How much of a chunk's end is kept to find a tool call that straddles two chunks.
+_SCAN_TAIL = 160
+#: How many tool calls it remembers the model request of.
+_MAX_ASKED = 2048
+
+
+class _ToolUses:
+    """Finds the tool calls a model answer asks for, in chunks of any size."""
+
+    def __init__(self) -> None:
+        self._tail = b""
+
+    def feed(self, chunk: bytes) -> set[str]:
+        """The ids of the tool calls in ``chunk``, counting the end of the chunks before it."""
+        window = self._tail + chunk
+        self._tail = window[-_SCAN_TAIL:]
+        return {(a or b).decode() for a, b in _TOOL_USE.findall(window)}
 
 
 class _BadRequest(Exception):
@@ -112,6 +142,18 @@ class ModelProxy:
         self._connections: set[asyncio.Task[None]] = set()
         #: The connections that have not yet shown the secret and a route, oldest first.
         self._preauth: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
+        #: Tool call id -> the ``traceparent`` of the model request whose answer asked for it, oldest first.
+        self._asked_by: OrderedDict[str, str] = OrderedDict()
+
+    def asked_by(self, tool_use_id: str | None) -> str | None:
+        """The ``traceparent`` of the model request that asked for the tool call ``tool_use_id``, if it was seen."""
+        return self._asked_by.get(tool_use_id) if tool_use_id else None
+
+    def _note_asked(self, traceparent: str, found: set[str]) -> None:
+        for tool_use_id in found:
+            self._asked_by[tool_use_id] = traceparent
+        while len(self._asked_by) > _MAX_ASKED:
+            self._asked_by.popitem(last=False)
 
     async def start(self) -> str:
         """Listen, once; returns the base URL to give the model client (``ANTHROPIC_BASE_URL``)."""
@@ -209,6 +251,9 @@ class ModelProxy:
             for name, value in headers
             if name.lower() not in _NOT_FORWARDED and name.lower() not in _CALLERS_OWN
         ]
+        step = next((v for n, v in headers if n.lower() == "traceparent" and valid_traceparent(v)), None)
+        if step is not None:
+            sent.append(("traceparent", step.strip().lower()))
         client: Any = self._gateway.http_client(httpx)
         request = client.build_request(method, url, headers=sent, content=body)
         request.headers["Accept-Encoding"] = "identity"
@@ -225,7 +270,9 @@ class ModelProxy:
             refused = _refused_response(response)
             if refused is not None:
                 self._on_refused(refused)
-            await _relay(writer, method, response)
+            await _relay(
+                writer, method, response, None if step is None else lambda found: self._note_asked(step, found)
+            )
         finally:
             await response.aclose()
 
@@ -299,8 +346,16 @@ async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
             raise _BadRequest(400, "a malformed chunk")
 
 
-async def _relay(writer: asyncio.StreamWriter, method: str, response: httpx.Response) -> None:
-    """Send the gateway's answer on as it arrives, so a streamed answer (server-sent events) is not held back."""
+async def _relay(
+    writer: asyncio.StreamWriter,
+    method: str,
+    response: httpx.Response,
+    on_tool_uses: Callable[[set[str]], None] | None = None,
+) -> None:
+    """Send the gateway's answer on as it arrives, so a streamed answer (server-sent events) is not held back.
+
+    ``on_tool_uses`` is told the ids of the tool calls the answer asks for, as they go by.
+    """
     bodiless = method == "HEAD" or response.status_code in (204, 304) or 100 <= response.status_code < 200
     head = [f"HTTP/1.1 {response.status_code} {response.reason_phrase}"]
     for name, value in response.headers.multi_items():
@@ -311,9 +366,13 @@ async def _relay(writer: asyncio.StreamWriter, method: str, response: httpx.Resp
         head.append("Transfer-Encoding: chunked")
     writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1"))
     if not bodiless:
+        asked = _ToolUses()
         try:
             async for chunk in response.aiter_raw():
                 if chunk:
+                    found = asked.feed(chunk) if on_tool_uses is not None else None
+                    if found and on_tool_uses is not None:
+                        on_tool_uses(found)
                     writer.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
                     await writer.drain()
         except httpx.HTTPError:
