@@ -455,9 +455,11 @@ async def test_without_export_steps_claude_code_exports_nothing_to_authfi(claude
 async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshing_token(
     fake: FakeGateway, claude: ClaudeAgentIntegration
 ) -> None:
+    pytest.importorskip("opentelemetry.proto")  # the proxy reads the export with the protocol types of extra otel
     options = await claude.options(model="claude-haiku-5-5", export_steps=True)
     env = dict(options.env)
-    assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == fake.issuer + "/otlp/v1/traces"
+    # through the loopback proxy, which names each span's agent and sends the export on to AuthFI
+    assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == env["ANTHROPIC_BASE_URL"] + "/otlp/v1/traces"
     assert env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
     assert env["OTEL_TRACES_EXPORTER"] == "otlp"
     assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
@@ -517,3 +519,588 @@ def test_a_helper_command_is_quoted_for_the_shell_that_runs_it(monkeypatch: pyte
     assert claude_agent._shell_word(r"C:\Python\python.exe") == r"C:\Python\python.exe"
     monkeypatch.setattr("os.name", "posix")
     assert claude_agent._shell_word(path) == f"'{path}'"
+
+
+# --- the agent behind each exported span ------------------------------------------------------------------
+
+
+def _export(*spans: dict[str, str]) -> bytes:
+    """An OTLP trace export of spans with these string attributes, as Claude Code sends it."""
+    pytest.importorskip("opentelemetry.proto")
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    for number, attributes in enumerate(spans, start=1):
+        span = scope.spans.add(name="claude_code.llm_request", span_id=number.to_bytes(8, "big"))
+        span.trace_id = b"\x01" * 16
+        for key, value in attributes.items():
+            span.attributes.append(KeyValue(key=key, value=AnyValue(string_value=value)))
+    return bytes(request.SerializeToString())
+
+
+MAIN = {"session.id": "s1", "gen_ai.conversation.id": "s1"}
+WIKI = {"session.id": "s1", "agent_id": "a1", "gen_ai.conversation.id": "a1"}
+WIKI_BY_CONVERSATION = {"session.id": "s1", "gen_ai.conversation.id": "a1"}  # a span that does not say agent_id
+STRANGER = {"session.id": "s1", "agent_id": "a9", "gen_ai.conversation.id": "a9"}
+TRACES = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+
+
+async def _send_export(url: str, body: bytes, **headers: str) -> Any:
+    import httpx
+
+    async with httpx.AsyncClient() as http:
+        return await http.post(
+            url,
+            content=body,
+            headers={"Content-Type": "application/x-protobuf", "Authorization": "Bearer tok-claude-code", **headers},
+        )
+
+
+def _agent_names(fake: FakeGateway) -> list[str | None]:
+    """``gen_ai.agent.name`` of each span AuthFI received, ``None`` where a span has none."""
+    return [s["attributes"].get("gen_ai.agent.name") or None for s in fake.exported_spans()]
+
+
+def _received(fake: FakeGateway) -> list[dict[str, Any]]:
+    return [r for r in fake.requests if r["path"] == "/otlp/v1/traces"]
+
+
+async def test_each_exported_span_names_its_agent_a_sub_agent_by_its_type_and_the_main_loop_by_its_name(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+    started: Any = options.hooks["SubagentStart"][0].hooks[0]  # type: ignore[index]
+    await started({"hook_event_name": "SubagentStart", "agent_id": "a1", "agent_type": "wiki_researcher"}, None, {})
+
+    answer = await _send_export(
+        dict(options.env)[TRACES],
+        _export(MAIN, WIKI, WIKI_BY_CONVERSATION),
+        **{"X-Request-Id": "run-1", "Cookie": "a=b", "X-Anything": "x", "User-Agent": "claude-cli/2"},
+    )
+
+    assert answer.status_code == 200
+    assert _agent_names(fake) == ["support", "wiki_researcher", "wiki_researcher"]
+    (sent,) = _received(fake)
+    assert sent["headers"]["authorization"] == "Bearer tok-claude-code"  # Claude Code's own token, to AuthFI only
+    assert sent["headers"]["user-agent"] == "claude-cli/2" and sent["headers"]["content-type"].endswith("protobuf")
+    # an allowlist: the request id is not sent (the model route does not either), nor a cookie nor anything else
+    assert not {"x-request-id", "cookie", "x-anything"} & set(sent["headers"])
+
+
+async def test_the_main_loop_is_named_claude_code_unless_the_application_names_it(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    await _send_export(dict(options.env)[TRACES], _export(MAIN))
+
+    assert _agent_names(fake) == ["claude_code"]
+    with pytest.raises(ConfigurationError, match="agent_name"):
+        await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name=" ")
+
+
+async def test_a_sub_agent_whose_start_was_never_seen_is_not_named_for_its_parent(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+
+    await _send_export(dict(options.env)[TRACES], _export(MAIN, STRANGER))
+
+    assert _agent_names(fake) == [
+        "support",
+        "a9",
+    ]  # its id, which is true; "support" would read its calls as the parent's
+
+
+async def test_a_tool_hook_inside_a_sub_agent_teaches_its_type_when_its_start_was_missed(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    ask: Any = options.hooks["PreToolUse"][-1].hooks[0]  # type: ignore[index]
+
+    await ask({"tool_name": "Read", "agent_id": "a1", "agent_type": "wiki_researcher"}, None, {})
+    await _send_export(dict(options.env)[TRACES], _export(WIKI))
+
+    assert _agent_names(fake) == ["wiki_researcher"]
+
+
+async def test_a_span_that_already_names_its_agent_keeps_it(fake: FakeGateway, claude: ClaudeAgentIntegration) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    await _send_export(dict(options.env)[TRACES], _export({**MAIN, "gen_ai.agent.name": "theirs"}))
+
+    assert _agent_names(fake) == ["theirs"]
+
+
+async def test_a_compressed_export_is_read_and_sent_on_uncompressed(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+
+    await _send_export(dict(options.env)[TRACES], gzip.compress(_export(MAIN)), **{"Content-Encoding": "gzip"})
+
+    assert _agent_names(fake) == ["support"]
+    assert "content-encoding" not in _received(fake)[0]["headers"]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "body", "status"),
+    [
+        ("", b"\xff\xfe not an export", 400),
+        ("gzip", b"\xff\xfe not gzip", 400),
+        ("br", b"anything", 415),
+    ],
+)
+async def test_an_export_that_cannot_be_read_is_refused_and_not_sent_on_unnamed(
+    fake: FakeGateway, claude: ClaudeAgentIntegration, encoding: str, body: bytes, status: int
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    extra = {"Content-Encoding": encoding} if encoding else {}
+
+    answer = await _send_export(dict(options.env)[TRACES], body, **extra)
+
+    assert answer.status_code == status
+    assert not _received(fake)  # unnamed, a sub-agent's spans would read as the main loop's
+
+
+async def test_a_truncated_compressed_export_is_malformed(fake: FakeGateway, claude: ClaudeAgentIntegration) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    answer = await _send_export(
+        dict(options.env)[TRACES], gzip.compress(_export(MAIN))[:-6], **{"Content-Encoding": "gzip"}
+    )
+
+    assert answer.status_code == 400
+    assert not _received(fake)
+
+
+def _length(size: int) -> bytes:
+    out = bytearray()
+    while size > 0x7F:
+        out.append(size & 0x7F | 0x80)
+        size >>= 7
+    out.append(size)
+    return bytes(out)
+
+
+def _many_spans(count: int, *, field: bytes = b"") -> bytes:
+    """An export of ``count`` empty spans (two bytes each on the wire)."""
+    spans = (b"\x12" + _length(len(field)) + field) * count  # ScopeSpans.spans
+    scope_spans = b"\x12" + _length(len(spans)) + spans  # ResourceSpans.scope_spans
+    return b"\x0a" + _length(len(scope_spans)) + scope_spans  # ExportTraceServiceRequest.resource_spans
+
+
+async def _responsive_while(work: Any) -> float:
+    """The longest the event loop went without running while ``work`` was awaited."""
+    import asyncio
+    import time
+
+    longest = 0.0
+    running = True
+
+    async def tick() -> None:
+        nonlocal longest
+        last = time.monotonic()
+        while running:
+            await asyncio.sleep(0.01)
+            now = time.monotonic()
+            longest = max(longest, now - last)
+            last = now
+
+    ticker = asyncio.create_task(tick())
+    try:
+        await work
+    finally:
+        running = False
+        await ticker
+    return longest
+
+
+async def test_a_compression_bomb_is_refused_413_and_the_loop_stays_responsive(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    # about 100 MB of empty spans, a few hundred kilobytes compressed: far past the decoded cap, under the body cap
+    bomb = gzip.compress(b"\x12\x00" * 50_000_000, compresslevel=9)
+    assert len(bomb) < 1024 * 1024
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    answers: list[Any] = []
+
+    async def send() -> None:
+        answers.append(await _send_export(dict(options.env)[TRACES], bomb, **{"Content-Encoding": "gzip"}))
+
+    longest = await _responsive_while(send())
+
+    assert answers[0].status_code == 413
+    assert not _received(fake)
+    assert longest < 0.5
+
+
+async def test_an_export_with_millions_of_spans_is_refused_before_a_message_is_made(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    packed = _many_spans(1_500_000)  # 3 MB: under every size cap, over the span cap
+    answers: list[Any] = []
+
+    async def send() -> None:
+        answers.append(await _send_export(dict(options.env)[TRACES], packed))
+        answers.append(
+            await _send_export(dict(options.env)[TRACES], gzip.compress(packed), **{"Content-Encoding": "gzip"})
+        )
+
+    longest = await _responsive_while(send())
+
+    assert [a.status_code for a in answers] == [413, 413]
+    assert not _received(fake)
+    assert longest < 0.5
+
+
+async def test_an_export_with_millions_of_fields_in_a_span_is_refused(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    one_span_many_fields = _many_spans(1, field=b"\x4a\x00" * 1_500_000)  # Span.attributes, 3 MB
+
+    answer = await _send_export(dict(options.env)[TRACES], one_span_many_fields)
+
+    assert answer.status_code == 413
+    assert not _received(fake)
+
+
+async def test_exports_are_rewritten_one_at_a_time_off_the_event_loop(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import asyncio
+    import threading
+    import time
+    from dataclasses import replace
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    proxy = claude._proxy  # pyright: ignore[reportPrivateUsage]
+    relay = proxy._traces  # pyright: ignore[reportPrivateUsage]
+    assert relay is not None
+    inside = peak = 0
+    threads: set[int] = set()
+    lock = threading.Lock()
+
+    def slow(body: bytes, encoding: str) -> bytes:
+        nonlocal inside, peak
+        with lock:
+            inside += 1
+            peak = max(peak, inside)
+            threads.add(threading.get_ident())
+        time.sleep(0.15)
+        with lock:
+            inside -= 1
+        return relay.rewrite(body, encoding)
+
+    proxy._traces = replace(relay, rewrite=slow)  # pyright: ignore[reportPrivateUsage]
+    url = dict(options.env)[TRACES]
+
+    answers = await asyncio.gather(*[_send_export(url, _export(MAIN)) for _ in range(4)])
+
+    assert [a.status_code for a in answers] == [200] * 4
+    assert peak == 1
+    assert threading.get_ident() not in threads
+
+
+async def test_a_failure_of_the_rewrite_is_a_5xx_and_nothing_is_sent(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    from dataclasses import replace
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    proxy = claude._proxy  # pyright: ignore[reportPrivateUsage]
+    relay = proxy._traces  # pyright: ignore[reportPrivateUsage]
+    assert relay is not None
+
+    def broken(body: bytes, encoding: str) -> bytes:
+        raise RuntimeError("a bug")
+
+    proxy._traces = replace(relay, rewrite=broken)  # pyright: ignore[reportPrivateUsage]
+
+    answer = await _send_export(dict(options.env)[TRACES], _export(MAIN))
+
+    assert answer.status_code == 500
+    assert not _received(fake)
+
+
+async def test_a_refusal_is_logged_once_a_minute_for_its_kind_and_without_a_traceback(
+    claude: ClaudeAgentIntegration, caplog: pytest.LogCaptureFixture
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    with caplog.at_level("DEBUG", logger="authfi"):
+        for _ in range(5):
+            await _send_export(dict(options.env)[TRACES], b"\xff not an export")
+        await _send_export(dict(options.env)[TRACES], b"x", **{"Content-Encoding": "br"})
+
+    refusals = [r for r in caplog.records if "trace export was refused" in r.getMessage()]
+    assert [r.levelname for r in refusals].count("WARNING") == 2  # one for each kind, not one for each export
+    assert not [r for r in refusals if r.exc_info]
+
+
+async def test_the_trace_client_keeps_to_a_small_number_of_connections(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    await _send_export(dict(options.env)[TRACES], _export(MAIN))
+
+    client = claude._proxy._trace_client  # pyright: ignore[reportPrivateUsage]
+    assert client is not None
+    assert client._transport._pool._max_connections == 8  # type: ignore[attr-defined]  # pyright: ignore
+
+
+async def test_an_agent_name_of_another_type_is_kept_and_not_given_a_second(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    request = ExportTraceServiceRequest()
+    span = request.resource_spans.add().scope_spans.add().spans.add(name="s", span_id=b"\x00" * 7 + b"\x01")
+    span.attributes.append(KeyValue(key="gen_ai.agent.name", value=AnyValue(int_value=7)))
+    span.attributes.append(KeyValue(key="agent_id", value=AnyValue(string_value="a1")))
+    span.attributes.append(KeyValue(key="gen_ai.agent.id", value=AnyValue(bool_value=True)))
+
+    answer = await _send_export(dict(options.env)[TRACES], request.SerializeToString())
+
+    assert answer.status_code == 200
+    sent = ExportTraceServiceRequest()
+    sent.ParseFromString(_received(fake)[0]["body"])
+    keys = [kv.key for kv in sent.resource_spans[0].scope_spans[0].spans[0].attributes]
+    assert keys.count("gen_ai.agent.name") == 1 and keys.count("gen_ai.agent.id") == 1
+
+
+async def test_asking_for_no_steps_after_asking_for_them_stops_serving_the_trace_route(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    first = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    url = dict(first.env)[TRACES]
+    assert (await _send_export(url, _export(MAIN))).status_code == 200
+
+    await claude.options(model="claude-haiku-5-5")
+
+    assert (await _send_export(url, _export(MAIN))).status_code == 404
+    assert len(_received(fake)) == 1
+
+
+async def test_without_export_steps_the_proxy_does_not_serve_the_trace_route(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5")
+    base = dict(options.env)["ANTHROPIC_BASE_URL"]
+
+    answer = await _send_export(base + "/otlp/v1/traces", _export(MAIN))
+
+    assert answer.status_code == 404
+    assert not _received(fake)
+
+
+async def test_only_the_trace_export_is_served_beside_the_model_call(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    base = dict(options.env)["ANTHROPIC_BASE_URL"]
+
+    refused = [
+        await _send_export(base + "/otlp/v1/metrics", _export(MAIN)),
+        await _send_export(base + "/otlp/v1/traces?x=1", _export(MAIN)),
+        await _send_export(base + "/otlp/v1/traces/", _export(MAIN)),
+        await _send_export(base.rsplit("/", 1)[0] + "/wrong/otlp/v1/traces", _export(MAIN)),
+    ]
+
+    assert [r.status_code for r in refused] == [404] * 4
+    assert not [r for r in fake.requests if r["path"].startswith("/otlp")]
+
+
+async def test_a_hook_input_that_is_not_an_agent_and_its_type_teaches_nothing(claude: ClaudeAgentIntegration) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    started: Any = options.hooks["SubagentStart"][0].hooks[0]  # type: ignore[index]
+
+    for given in (
+        {},
+        {"agent_id": "a1"},
+        {"agent_type": "x"},
+        {"agent_id": 1, "agent_type": "x"},
+        {"agent_id": "", "agent_type": "x"},
+    ):
+        await started(given, None, {})
+
+    assert claude._names.name_of("a1") == "a1"  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_without_the_protocol_types_the_trace_goes_to_authfi_unchanged_and_the_log_says_so(
+    fake: FakeGateway, claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("authfi.claude_agent.agent_names_available", lambda: False)
+
+    with caplog.at_level("WARNING", logger="authfi"):
+        options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    assert dict(options.env)[TRACES] == fake.issuer + "/otlp/v1/traces"
+    assert "pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main'" in caplog.text
+
+
+def test_an_export_is_read_whatever_encoding_the_exporter_chose() -> None:
+    import gzip
+    import zlib
+
+    from authfi._claude_steps import AgentNames
+    from authfi._model_proxy import TraceRefused
+
+    names = AgentNames("support")
+    body = _export(MAIN)
+
+    for encoded, encoding in (
+        (body, ""),
+        (body, "identity"),
+        (gzip.compress(body), "GZIP"),
+        (zlib.compress(body), "deflate"),
+    ):
+        assert b"support" in names.rewrite(encoded, encoding)
+    for given, encoding, status in (
+        (gzip.compress(body), "br", 415),  # an encoding it does not read
+        (b"not gzip", "gzip", 400),
+        (gzip.compress(body)[:-3], "gzip", 400),  # cut short
+        (b"\xff\xfe", "", 400),
+    ):
+        with pytest.raises(TraceRefused) as refused:
+            names.rewrite(given, encoding)
+        assert refused.value.status == status
+
+
+def test_it_remembers_a_bounded_number_of_sub_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    from authfi import _claude_steps
+    from authfi._claude_steps import AgentNames
+
+    monkeypatch.setattr(_claude_steps, "_MAX_AGENTS", 2)
+    names = AgentNames()
+    for number in range(3):
+        names.learn(f"a{number}", f"type{number}")
+
+    assert [names.name_of(f"a{number}") for number in range(3)] == ["a0", "type1", "type2"]  # the oldest is forgotten
+
+
+def test_each_cap_refuses_on_its_own_before_anything_is_built() -> None:
+    import gzip
+
+    from authfi import _claude_steps
+    from authfi._model_proxy import TraceRefused
+
+    names = _claude_steps.AgentNames()
+    cases = {
+        "decoded-too-large": (gzip.compress(b"\x00" * (_claude_steps.MAX_DECODED + 1)), "gzip"),
+        "body-too-large": (b"\x00" * (_claude_steps.MAX_BODY + 1), ""),
+        "too-many-spans": (_many_spans(_claude_steps.MAX_SPANS + 1), ""),
+        "too-many-fields": (_many_spans(1, field=b"\x4a\x00" * (_claude_steps.MAX_FIELDS + 1)), ""),
+    }
+    for kind, (given, encoding) in cases.items():
+        with pytest.raises(TraceRefused) as refused:
+            names.rewrite(given, encoding)
+        assert (refused.value.kind, refused.value.status) == (kind, 413)
+
+
+async def test_a_declared_length_over_the_trace_cap_is_refused_before_the_body_is_read(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import asyncio
+
+    from authfi._claude_steps import MAX_BODY
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    origin, _, path = dict(options.env)[TRACES].removeprefix("http://").partition("/")
+    host, _, port = origin.partition(":")
+    reader, writer = await asyncio.open_connection(host, int(port))
+    try:
+        writer.write(
+            f"POST /{path} HTTP/1.1\r\nHost: x\r\nContent-Length: {MAX_BODY + 1}\r\n\r\n".encode()  # and no body
+        )
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.read(200), 5)
+    finally:
+        writer.close()
+
+    assert answer.startswith(b"HTTP/1.1 413")
+    assert not _received(fake)
+
+
+def _wrap(tag: int, payload: bytes) -> bytes:
+    return bytes([tag]) + _length(len(payload)) + payload
+
+
+def _nested_values(count: int) -> bytes:
+    """An export of one span with one attribute whose value is an array of ``count`` empty values (two bytes each)."""
+    key_value = _wrap(0x12, _wrap(0x2A, b"\x0a\x00" * count))  # KeyValue.value = AnyValue.array_value of empty values
+    return _many_spans(1, field=_wrap(0x4A, key_value))  # Span.attributes
+
+
+def _nested_depth(levels: int) -> bytes:
+    """An export of one span with an attribute nested ``levels`` arrays deep."""
+    value = b""
+    for _ in range(levels):
+        value = _wrap(0x2A, _wrap(0x0A, value))  # AnyValue.array_value holding ArrayValue.values
+    return _many_spans(1, field=_wrap(0x4A, _wrap(0x12, value)))
+
+
+async def test_millions_of_empty_values_inside_one_attribute_are_refused_and_nothing_is_sent(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    plain = _nested_values(1_500_000)  # 3 MB: under the body cap, and one attribute in one span
+    packed = gzip.compress(_nested_values(7_000_000), compresslevel=9)  # 14 MB decoded: under the decoded cap too
+    answers: list[Any] = []
+
+    async def send() -> None:
+        answers.append(await _send_export(dict(options.env)[TRACES], plain))
+        answers.append(await _send_export(dict(options.env)[TRACES], packed, **{"Content-Encoding": "gzip"}))
+
+    longest = await _responsive_while(send())
+
+    assert [a.status_code for a in answers] == [413, 413]
+    assert not _received(fake)
+    assert longest < 0.5
+
+
+def test_what_is_nested_in_a_resource_a_scope_an_event_or_a_link_is_walked_too() -> None:
+    from authfi import _claude_steps
+    from authfi._model_proxy import TraceRefused
+
+    key_value = _wrap(0x12, _wrap(0x2A, b"\x0a\x00" * 1_500_000))  # KeyValue.value = array of empty values
+    holders = {
+        # Resource.attributes in ResourceSpans.resource
+        "resource": _wrap(0x0A, _wrap(0x0A, _wrap(0x0A, key_value))),
+        # InstrumentationScope.attributes in ScopeSpans.scope
+        "scope": _wrap(0x0A, _wrap(0x12, _wrap(0x0A, _wrap(0x1A, key_value)))),
+        # Event.attributes in Span.events, Link.attributes in Span.links
+        "event": _many_spans(1, field=_wrap(0x5A, _wrap(0x1A, key_value))),
+        "link": _many_spans(1, field=_wrap(0x6A, _wrap(0x22, key_value))),
+    }
+    for name, body in holders.items():
+        with pytest.raises(TraceRefused) as refused:
+            _claude_steps.AgentNames().rewrite(body, "")
+        assert refused.value.status == 413, name
+
+
+def test_a_value_nested_too_deep_is_refused_and_a_real_nesting_is_not() -> None:
+    from authfi._claude_steps import MAX_DEPTH, AgentNames
+    from authfi._model_proxy import TraceRefused
+
+    with pytest.raises(TraceRefused) as refused:
+        AgentNames().rewrite(_nested_depth(MAX_DEPTH + 10), "")
+    assert (refused.value.status, refused.value.kind) == (413, "too-deep")
+    assert b"claude_code" in AgentNames().rewrite(_nested_depth(3), "")

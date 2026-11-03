@@ -11,6 +11,13 @@ in the environment of every tool Claude Code runs, so it does not stand for the 
 other method or path, including the rest of the gateway's model and cloud routes, is refused unsent. Whatever
 credential the caller sends is dropped; the gateway sees only this process's.
 
+When the application exports Claude Code's steps (``export_steps``), a second route relays Claude Code's trace export to
+AuthFI (:meth:`ModelProxy.relay_traces`): the same listener and secret, one fixed target, with a short list of the
+caller's headers (its ``Authorization``, which is the helper's token Claude Code sends AuthFI, ``DPoP``, ``User-Agent``,
+``traceparent`` and ``Content-Type``), and a rewrite of the body that names each span's agent.
+The export is untrusted input: its body has a cap of its own, the rewrite runs on a worker thread, one at a time, and
+an export that is over a cap, cannot be read or cannot be named is refused, never sent on unnamed.
+
 The caller's ``traceparent`` is kept when it is one: Claude Code sends the one of the model request span it exports
 (``CLAUDE_CODE_PROPAGATE_TRACEPARENT``), so the gateway's record of the call names that step. The proxy also reads the
 tool calls the answer asks for, so that the call made for a tool can name the model request that asked for it.
@@ -22,8 +29,10 @@ import asyncio
 import hmac
 import re
 import secrets
+import time
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -48,6 +57,14 @@ _MAX_BODY = 64 * 1024 * 1024
 #: gateway is reachable through the proxy, whoever holds its secret (the secret is in the environment of every tool
 #: Claude Code runs): not the cloud credential door, not the other model routes, not the tools.
 ROUTES = frozenset({("POST", "/v1/messages")})
+#: The route of Claude Code's trace export, served only after :meth:`ModelProxy.relay_traces`.
+TRACE_ROUTE = ("POST", "/otlp/v1/traces")
+#: The most of a trace export's body that is read (a model request carries a conversation; an export carries spans).
+_MAX_TRACE_BODY = 4 * 1024 * 1024
+#: The headers of a trace export that are sent on. The body is sent decoded, so its Content-Encoding is not one.
+_TRACE_HEADERS = frozenset({"content-type", "authorization", "dpop", "user-agent", "traceparent"})
+#: How often one kind of refusal is logged at warning level, in seconds; the rest are debug.
+_LOG_EVERY = 60.0
 _QUERY = re.compile(r"[A-Za-z0-9_=&.-]{0,128}")
 
 #: How long a connection may take to send its head, and then its body. A caller without the secret never gets past
@@ -109,6 +126,28 @@ class _ToolUses:
         return {(a or b).decode() for a, b in _TOOL_USE.findall(window)}
 
 
+@dataclass(frozen=True, slots=True)
+class TraceRelay:
+    """Where Claude Code's trace export goes, and how its body is rewritten on the way.
+
+    ``rewrite`` takes the body and its ``Content-Encoding`` and returns the new body (not compressed), or raises
+    :class:`TraceRefused`. It is blocking: it is run on a worker thread.
+    """
+
+    url: str
+    rewrite: Callable[[bytes, str], bytes]
+
+
+class TraceRefused(Exception):
+    """A trace export that is not sent on: ``status`` is what Claude Code is told, ``kind`` what the log says."""
+
+    def __init__(self, status: int, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.kind = kind
+        self.message = message
+
+
 class _BadRequest(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
@@ -144,6 +183,22 @@ class ModelProxy:
         self._preauth: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         #: Tool call id -> the ``traceparent`` of the model request whose answer asked for it, oldest first.
         self._asked_by: OrderedDict[str, str] = OrderedDict()
+        self._traces: TraceRelay | None = None
+        self._trace_client: httpx.AsyncClient | None = None
+        #: One export is rewritten at a time, so a flood of them cannot use every core or all the memory.
+        self._rewriting = asyncio.Semaphore(1)
+        self._logged: dict[str, float] = {}
+
+    def relay_traces(self, relay: TraceRelay) -> str:
+        """Serve Claude Code's trace export at the returned URL, sent on to ``relay.url``. Needs :meth:`start` first."""
+        if self._base_url is None:
+            raise RuntimeError("relay_traces needs the proxy started")
+        self._traces = relay
+        return self._base_url + TRACE_ROUTE[1]
+
+    def stop_relaying_traces(self) -> None:
+        """Stop serving the trace export route, as before :meth:`relay_traces`."""
+        self._traces = None
 
     def asked_by(self, tool_use_id: str | None) -> str | None:
         """The ``traceparent`` of the model request that asked for the tool call ``tool_use_id``, if it was seen."""
@@ -178,6 +233,9 @@ class ModelProxy:
             await asyncio.gather(*tasks, return_exceptions=True)
         if server is not None:
             await server.wait_closed()
+        client, self._trace_client, self._traces = self._trace_client, None, None
+        if client is not None:
+            await client.aclose()
 
     def __repr__(self) -> str:
         return f"ModelProxy({'listening' if self._base_url else 'stopped'})"
@@ -214,12 +272,16 @@ class ModelProxy:
                 method, target, headers = await asyncio.wait_for(_read_head(reader), _HEAD_SECONDS)
                 url = self._route(method, target)  # the secret and the route, before a byte of the body is read
                 self._preauth.pop(self._self(), None)
-                body = await asyncio.wait_for(_read_body(reader, writer, headers), _BODY_SECONDS)
+                limit = _MAX_BODY if url is not None else _MAX_TRACE_BODY
+                body = await asyncio.wait_for(_read_body(reader, writer, headers, limit), _BODY_SECONDS)
             except _BadRequest as bad:
                 logger.info("a request to the model proxy was refused: %d %s", bad.status, bad.message)
                 await _answer(writer, bad.status, bad.message)
                 return
-            await self._forward(writer, method, url, headers, body)
+            if url is None:
+                await self._forward_traces(writer, headers, body)
+            else:
+                await self._forward(writer, method, url, headers, body)
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             logger.debug("a model call ended before it was answered")
         except TimeoutError:
@@ -231,13 +293,15 @@ class ModelProxy:
         finally:
             writer.close()
 
-    def _route(self, method: str, target: str) -> str:
-        """The gateway URL a request names, or ``_BadRequest`` unless it is a listed route under the secret."""
+    def _route(self, method: str, target: str) -> str | None:
+        """The gateway URL a request names (``None`` for the trace export), or ``_BadRequest`` unless it is listed."""
         path, _, query = target.partition("?")
         given, _, rest = path[1:].partition("/")
         if not hmac.compare_digest(given.encode(), self._secret.encode()):
             raise _BadRequest(404, "not found")
         route = "/" + rest
+        if (method, route) == TRACE_ROUTE and self._traces is not None and not query:
+            return None
         if (method, route) not in ROUTES or not _QUERY.fullmatch(query):
             self._gateway.project.logger.info("the model proxy does not forward %s %r", method, route[:64])
             raise _BadRequest(404, "not found")
@@ -276,6 +340,59 @@ class ModelProxy:
         finally:
             await response.aclose()
 
+    def _said(self, kind: str, message: str) -> None:
+        """Log a refusal at warning level once a minute for each kind, and at debug level between."""
+        now = time.monotonic()
+        loud = now - self._logged.get(kind, -_LOG_EVERY) >= _LOG_EVERY
+        if loud:
+            self._logged[kind] = now
+        self._gateway.project.logger.log(
+            30 if loud else 10, "a Claude Code trace export was refused (%s): %s", kind, message
+        )
+
+    async def _forward_traces(self, writer: asyncio.StreamWriter, headers: list[tuple[str, str]], body: bytes) -> None:
+        """Send Claude Code's trace export to AuthFI with its own credential, the body naming each span's agent.
+
+        An export that is over a cap, cannot be read or cannot be named is answered 4xx or 5xx and not sent: unnamed,
+        a sub-agent's spans would be read as its parent's. Claude Code is told why: 4xx for an export that is over a
+        cap or cannot be read, which no retry mends, and 5xx for a failure of the rewrite, which may be retried.
+        """
+        relay = self._traces
+        if relay is None:  # not served, or stopped while the body was read
+            await _answer(writer, 404, "not found")
+            return
+        encoding = next((v for n, v in headers if n.lower() == "content-encoding"), "")
+        try:
+            async with self._rewriting:
+                rewritten = await asyncio.to_thread(relay.rewrite, body, encoding)
+        except TraceRefused as refused:
+            self._said(refused.kind, refused.message)
+            await _answer(writer, refused.status, refused.message)
+            return
+        except Exception as error:  # a bug here is the proxy's, not the export's: a 5xx, which an exporter may retry
+            self._said("internal", type(error).__name__)
+            await _answer(writer, 500, "the export could not be processed")
+            return
+        sent = [(name, value) for name, value in headers if name.lower() in _TRACE_HEADERS]
+        if self._trace_client is None:
+            self._trace_client = httpx.AsyncClient(
+                follow_redirects=False, timeout=httpx.Timeout(15.0), limits=httpx.Limits(max_connections=8)
+            )
+        request = self._trace_client.build_request("POST", relay.url, headers=sent, content=rewritten)
+        request.headers["Accept-Encoding"] = "identity"
+        try:
+            response = await self._trace_client.send(request, stream=True)
+        except httpx.HTTPError as error:
+            self._gateway.project.logger.warning(
+                "a Claude Code trace export could not reach AuthFI: %s", type(error).__name__
+            )
+            await _answer(writer, 502, "AuthFI could not be reached")
+            return
+        try:
+            await _relay(writer, "POST", response)
+        finally:
+            await response.aclose()
+
 
 async def _read_head(reader: asyncio.StreamReader) -> tuple[str, str, list[tuple[str, str]]]:
     try:
@@ -298,7 +415,7 @@ async def _read_head(reader: asyncio.StreamReader) -> tuple[str, str, list[tuple
 
 
 async def _read_body(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: list[tuple[str, str]]
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, headers: list[tuple[str, str]], limit: int = _MAX_BODY
 ) -> bytes:
     names = [name.lower() for name, _ in headers]
     fields = {name.lower(): value for name, value in headers}
@@ -310,12 +427,12 @@ async def _read_body(
         writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
         await writer.drain()
     if "chunked" in fields.get("transfer-encoding", "").lower():
-        return await _read_chunked(reader)
+        return await _read_chunked(reader, limit)
     declared = fields.get("content-length", "0")
     if not _CONTENT_LENGTH.fullmatch(declared):
         raise _BadRequest(400, "a malformed Content-Length")
     length = int(declared)
-    if length > _MAX_BODY:
+    if length > limit:
         raise _BadRequest(413, "the request is too large")
     return await reader.readexactly(length) if length else b""
 
@@ -327,7 +444,7 @@ async def _line(reader: asyncio.StreamReader) -> bytes:
         raise _BadRequest(400, "a malformed chunk") from error
 
 
-async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
+async def _read_chunked(reader: asyncio.StreamReader, limit: int = _MAX_BODY) -> bytes:
     body = bytearray()
     while True:
         size_text = (await _line(reader)).split(b";")[0].strip().decode("latin-1")
@@ -339,7 +456,7 @@ async def _read_chunked(reader: asyncio.StreamReader) -> bytes:
                 if not (await _line(reader)).strip():
                     return bytes(body)
             raise _BadRequest(400, "too many trailers")
-        if len(body) + size > _MAX_BODY:
+        if len(body) + size > limit:
             raise _BadRequest(413, "the request is too large")
         body += await reader.readexactly(size)
         if await reader.readexactly(2) != b"\r\n":
@@ -389,6 +506,8 @@ async def _answer(writer: asyncio.StreamWriter, status: int, message: str) -> No
         404: "Not Found",
         408: "Request Timeout",
         413: "Payload Too Large",
+        415: "Unsupported Media Type",
+        500: "Internal Server Error",
         431: "Header Fields Too Large",
     }.get(status, "Bad Gateway")
     body = ('{"type":"error","error":{"type":"api_error","message":"' + message + '"}}').encode()

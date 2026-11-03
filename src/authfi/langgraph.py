@@ -344,11 +344,16 @@ class LangGraphIntegration:
         *,
         checkpointer: BaseCheckpointSaver[Any] | bool | None = None,
         prompt: str | None = None,
+        name: str | None = None,
     ) -> CompiledStateGraph[Any, Any, Any, Any]:
         """A tool-calling agent: the model, LangGraph's tool node, and the approval node after it.
 
         ``model`` is :meth:`chat_model` (or any chat model), ``tools`` the list from :meth:`tools`.
         Approvals need a checkpointer: ``interrupt()`` pauses the run in it.
+
+        ``name`` is the agent's name, the graph's (as ``StateGraph.compile(name=...)``): the steps
+        :meth:`export_steps` sends say ``gen_ai.agent.name`` with it, for the graph's own calls and for a
+        sub-agent's graph run inside a tool. A graph given no name has LangGraph's default, ``LangGraph``.
         """
         bound = model.bind_tools(list(tools)) if tools else model
 
@@ -369,7 +374,9 @@ class LangGraphIntegration:
             graph.add_conditional_edges(APPROVAL_NODE, route_after_tools, [APPROVAL_NODE, "agent"])
         else:
             graph.add_edge("agent", END)
-        return graph.compile(checkpointer=checkpointer)  # pyright: ignore[reportUnknownMemberType]
+        if name is None:
+            return graph.compile(checkpointer=checkpointer)  # pyright: ignore[reportUnknownMemberType]
+        return graph.compile(checkpointer=checkpointer, name=name)  # pyright: ignore[reportUnknownMemberType]
 
 
 _HELD_KEY = "authfi_held_approval_id"
