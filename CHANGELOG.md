@@ -10,6 +10,12 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- The steps name their agents in the OpenTelemetry GenAI standard: the agent behind a step or a gateway call is the
+  nearest `gen_ai.agent.name` above it. LangGraph: the run of each compiled graph is an `invoke_agent` step named for
+  the graph (`agent_graph(..., name=...)`; `LangGraph` when LangGraph gave it none), so a sub-agent's graph run names
+  the sub-agent. Claude Agent SDK: with `export_steps`, Claude Code's trace goes through the loopback proxy, which
+  says `gen_ai.agent.name` on each span: a sub-agent's type (from the `SubagentStart` hook) and the main loop's name
+  (`options(agent_name=...)`, else `claude_code`).
 - A gateway call names the step that made it. With `export_steps()`, every tool call, model call and cloud
   credential request carries the `traceparent` (trace id and span id) of the OpenAI Agents, LangChain, LangGraph,
   ADK or Claude Agent SDK step executing when it is made, as that step is exported to `/otlp/v1/traces`; model

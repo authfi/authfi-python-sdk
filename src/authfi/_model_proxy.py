@@ -11,6 +11,10 @@ in the environment of every tool Claude Code runs, so it does not stand for the 
 other method or path, including the rest of the gateway's model and cloud routes, is refused unsent. Whatever
 credential the caller sends is dropped; the gateway sees only this process's.
 
+When the application exports Claude Code's steps (``export_steps``), a second route relays Claude Code's trace export to
+AuthFI (:meth:`ModelProxy.relay_traces`): the same listener and secret, one fixed target, with the caller's own headers
+(the helper's token, which is what Claude Code sends AuthFI), and a rewrite of the body that names each span's agent.
+
 The caller's ``traceparent`` is kept when it is one: Claude Code sends the one of the model request span it exports
 (``CLAUDE_CODE_PROPAGATE_TRACEPARENT``), so the gateway's record of the call names that step. The proxy also reads the
 tool calls the answer asks for, so that the call made for a tool can name the model request that asked for it.
@@ -24,6 +28,7 @@ import re
 import secrets
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -48,6 +53,8 @@ _MAX_BODY = 64 * 1024 * 1024
 #: gateway is reachable through the proxy, whoever holds its secret (the secret is in the environment of every tool
 #: Claude Code runs): not the cloud credential door, not the other model routes, not the tools.
 ROUTES = frozenset({("POST", "/v1/messages")})
+#: The route of Claude Code's trace export, served only after :meth:`ModelProxy.relay_traces`.
+TRACE_ROUTE = ("POST", "/otlp/v1/traces")
 _QUERY = re.compile(r"[A-Za-z0-9_=&.-]{0,128}")
 
 #: How long a connection may take to send its head, and then its body. A caller without the secret never gets past
@@ -109,6 +116,18 @@ class _ToolUses:
         return {(a or b).decode() for a, b in _TOOL_USE.findall(window)}
 
 
+@dataclass(frozen=True, slots=True)
+class TraceRelay:
+    """Where Claude Code's trace export goes, and how its body is rewritten on the way.
+
+    ``rewrite`` takes the body and its ``Content-Encoding`` and returns the new body (not compressed), or ``None`` to
+    send the export on as it came.
+    """
+
+    url: str
+    rewrite: Callable[[bytes, str], bytes | None]
+
+
 class _BadRequest(Exception):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
@@ -144,6 +163,15 @@ class ModelProxy:
         self._preauth: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         #: Tool call id -> the ``traceparent`` of the model request whose answer asked for it, oldest first.
         self._asked_by: OrderedDict[str, str] = OrderedDict()
+        self._traces: TraceRelay | None = None
+        self._trace_client: httpx.AsyncClient | None = None
+
+    def relay_traces(self, relay: TraceRelay) -> str:
+        """Serve Claude Code's trace export at the returned URL, sent on to ``relay.url``. Needs :meth:`start` first."""
+        if self._base_url is None:
+            raise RuntimeError("relay_traces needs the proxy started")
+        self._traces = relay
+        return self._base_url + TRACE_ROUTE[1]
 
     def asked_by(self, tool_use_id: str | None) -> str | None:
         """The ``traceparent`` of the model request that asked for the tool call ``tool_use_id``, if it was seen."""
@@ -178,6 +206,9 @@ class ModelProxy:
             await asyncio.gather(*tasks, return_exceptions=True)
         if server is not None:
             await server.wait_closed()
+        client, self._trace_client, self._traces = self._trace_client, None, None
+        if client is not None:
+            await client.aclose()
 
     def __repr__(self) -> str:
         return f"ModelProxy({'listening' if self._base_url else 'stopped'})"
@@ -219,7 +250,10 @@ class ModelProxy:
                 logger.info("a request to the model proxy was refused: %d %s", bad.status, bad.message)
                 await _answer(writer, bad.status, bad.message)
                 return
-            await self._forward(writer, method, url, headers, body)
+            if url is None:
+                await self._forward_traces(writer, headers, body)
+            else:
+                await self._forward(writer, method, url, headers, body)
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             logger.debug("a model call ended before it was answered")
         except TimeoutError:
@@ -231,13 +265,15 @@ class ModelProxy:
         finally:
             writer.close()
 
-    def _route(self, method: str, target: str) -> str:
-        """The gateway URL a request names, or ``_BadRequest`` unless it is a listed route under the secret."""
+    def _route(self, method: str, target: str) -> str | None:
+        """The gateway URL a request names (``None`` for the trace export), or ``_BadRequest`` unless it is listed."""
         path, _, query = target.partition("?")
         given, _, rest = path[1:].partition("/")
         if not hmac.compare_digest(given.encode(), self._secret.encode()):
             raise _BadRequest(404, "not found")
         route = "/" + rest
+        if (method, route) == TRACE_ROUTE and self._traces is not None and not query:
+            return None
         if (method, route) not in ROUTES or not _QUERY.fullmatch(query):
             self._gateway.project.logger.info("the model proxy does not forward %s %r", method, route[:64])
             raise _BadRequest(404, "not found")
@@ -273,6 +309,44 @@ class ModelProxy:
             await _relay(
                 writer, method, response, None if step is None else lambda found: self._note_asked(step, found)
             )
+        finally:
+            await response.aclose()
+
+    async def _forward_traces(self, writer: asyncio.StreamWriter, headers: list[tuple[str, str]], body: bytes) -> None:
+        """Send Claude Code's trace export to AuthFI with its own headers, the body naming each span's agent."""
+        relay = self._traces
+        if relay is None:  # not served, or stopped while the body was read
+            await _answer(writer, 404, "not found")
+            return
+        logger = self._gateway.project.logger
+        encoding = next((v for n, v in headers if n.lower() == "content-encoding"), "")
+        try:
+            rewritten = relay.rewrite(body, encoding)
+        except Exception:  # an export must reach AuthFI even when its spans cannot be named
+            logger.warning("a Claude Code trace export could not be rewritten; it is sent as it was", exc_info=True)
+            rewritten = None
+        else:
+            if rewritten is None:
+                logger.warning("a Claude Code trace export could not be read; it is sent without agent names")
+        sent = [
+            (name, value)
+            for name, value in headers
+            if name.lower() not in _NOT_FORWARDED and not (rewritten is not None and name.lower() == "content-encoding")
+        ]
+        if self._trace_client is None:
+            self._trace_client = httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(15.0))
+        request = self._trace_client.build_request(
+            "POST", relay.url, headers=sent, content=body if rewritten is None else rewritten
+        )
+        request.headers["Accept-Encoding"] = "identity"
+        try:
+            response = await self._trace_client.send(request, stream=True)
+        except httpx.HTTPError as error:
+            logger.warning("a Claude Code trace export could not reach AuthFI: %s", type(error).__name__)
+            await _answer(writer, 502, "AuthFI could not be reached")
+            return
+        try:
+            await _relay(writer, "POST", response)
         finally:
             await response.aclose()
 

@@ -455,9 +455,11 @@ async def test_without_export_steps_claude_code_exports_nothing_to_authfi(claude
 async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshing_token(
     fake: FakeGateway, claude: ClaudeAgentIntegration
 ) -> None:
+    pytest.importorskip("opentelemetry.proto")  # the proxy reads the export with the protocol types of extra otel
     options = await claude.options(model="claude-haiku-5-5", export_steps=True)
     env = dict(options.env)
-    assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == fake.issuer + "/otlp/v1/traces"
+    # through the loopback proxy, which names each span's agent and sends the export on to AuthFI
+    assert env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] == env["ANTHROPIC_BASE_URL"] + "/otlp/v1/traces"
     assert env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] == "http/protobuf"
     assert env["OTEL_TRACES_EXPORTER"] == "otlp"
     assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
@@ -517,3 +519,231 @@ def test_a_helper_command_is_quoted_for_the_shell_that_runs_it(monkeypatch: pyte
     assert claude_agent._shell_word(r"C:\Python\python.exe") == r"C:\Python\python.exe"
     monkeypatch.setattr("os.name", "posix")
     assert claude_agent._shell_word(path) == f"'{path}'"
+
+
+# --- the agent behind each exported span ------------------------------------------------------------------
+
+
+def _export(*spans: dict[str, str]) -> bytes:
+    """An OTLP trace export of spans with these string attributes, as Claude Code sends it."""
+    pytest.importorskip("opentelemetry.proto")
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
+
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    for number, attributes in enumerate(spans, start=1):
+        span = scope.spans.add(name="claude_code.llm_request", span_id=number.to_bytes(8, "big"))
+        span.trace_id = b"\x01" * 16
+        for key, value in attributes.items():
+            span.attributes.append(KeyValue(key=key, value=AnyValue(string_value=value)))
+    return bytes(request.SerializeToString())
+
+
+MAIN = {"session.id": "s1", "gen_ai.conversation.id": "s1"}
+WIKI = {"session.id": "s1", "agent_id": "a1", "gen_ai.conversation.id": "a1"}
+WIKI_BY_CONVERSATION = {"session.id": "s1", "gen_ai.conversation.id": "a1"}  # a span that does not say agent_id
+STRANGER = {"session.id": "s1", "agent_id": "a9", "gen_ai.conversation.id": "a9"}
+TRACES = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+
+
+async def _send_export(url: str, body: bytes, **headers: str) -> Any:
+    import httpx
+
+    async with httpx.AsyncClient() as http:
+        return await http.post(
+            url,
+            content=body,
+            headers={"Content-Type": "application/x-protobuf", "Authorization": "Bearer tok-claude-code", **headers},
+        )
+
+
+def _agent_names(fake: FakeGateway) -> list[str | None]:
+    """``gen_ai.agent.name`` of each span AuthFI received, ``None`` where a span has none."""
+    return [s["attributes"].get("gen_ai.agent.name") or None for s in fake.exported_spans()]
+
+
+def _received(fake: FakeGateway) -> list[dict[str, Any]]:
+    return [r for r in fake.requests if r["path"] == "/otlp/v1/traces"]
+
+
+async def test_each_exported_span_names_its_agent_a_sub_agent_by_its_type_and_the_main_loop_by_its_name(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+    started: Any = options.hooks["SubagentStart"][0].hooks[0]  # type: ignore[index]
+    await started({"hook_event_name": "SubagentStart", "agent_id": "a1", "agent_type": "wiki_researcher"}, None, {})
+
+    answer = await _send_export(
+        dict(options.env)[TRACES], _export(MAIN, WIKI, WIKI_BY_CONVERSATION), **{"X-Request-Id": "run-1"}
+    )
+
+    assert answer.status_code == 200
+    assert _agent_names(fake) == ["support", "wiki_researcher", "wiki_researcher"]
+    (sent,) = _received(fake)
+    assert sent["headers"]["authorization"] == "Bearer tok-claude-code"  # Claude Code's own token, to AuthFI only
+    assert sent["headers"]["x-request-id"] == "run-1"
+
+
+async def test_the_main_loop_is_named_claude_code_unless_the_application_names_it(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    await _send_export(dict(options.env)[TRACES], _export(MAIN))
+
+    assert _agent_names(fake) == ["claude_code"]
+    with pytest.raises(ConfigurationError, match="agent_name"):
+        await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name=" ")
+
+
+async def test_a_sub_agent_whose_start_was_never_seen_is_not_named_for_its_parent(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+
+    await _send_export(dict(options.env)[TRACES], _export(MAIN, STRANGER))
+
+    assert _agent_names(fake) == [
+        "support",
+        "a9",
+    ]  # its id, which is true; "support" would read its calls as the parent's
+
+
+async def test_a_tool_hook_inside_a_sub_agent_teaches_its_type_when_its_start_was_missed(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    ask: Any = options.hooks["PreToolUse"][-1].hooks[0]  # type: ignore[index]
+
+    await ask({"tool_name": "Read", "agent_id": "a1", "agent_type": "wiki_researcher"}, None, {})
+    await _send_export(dict(options.env)[TRACES], _export(WIKI))
+
+    assert _agent_names(fake) == ["wiki_researcher"]
+
+
+async def test_a_span_that_already_names_its_agent_keeps_it(fake: FakeGateway, claude: ClaudeAgentIntegration) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    await _send_export(dict(options.env)[TRACES], _export({**MAIN, "gen_ai.agent.name": "theirs"}))
+
+    assert _agent_names(fake) == ["theirs"]
+
+
+async def test_a_compressed_export_is_read_and_sent_on_uncompressed(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    import gzip
+
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True, agent_name="support")
+
+    await _send_export(dict(options.env)[TRACES], gzip.compress(_export(MAIN)), **{"Content-Encoding": "gzip"})
+
+    assert _agent_names(fake) == ["support"]
+    assert "content-encoding" not in _received(fake)[0]["headers"]
+
+
+@pytest.mark.parametrize("encoding", ["", "br", "gzip"])
+async def test_an_export_that_cannot_be_read_still_reaches_authfi_as_it_was(
+    fake: FakeGateway, claude: ClaudeAgentIntegration, encoding: str
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    extra = {"Content-Encoding": encoding} if encoding else {}
+
+    answer = await _send_export(dict(options.env)[TRACES], b"\xff\xfe not an export", **extra)
+
+    assert answer.status_code == 200
+    (sent,) = _received(fake)
+    assert sent["body"] == b"\xff\xfe not an export"
+    assert sent["headers"].get("content-encoding", "") == encoding
+
+
+async def test_without_export_steps_the_proxy_does_not_serve_the_trace_route(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5")
+    base = dict(options.env)["ANTHROPIC_BASE_URL"]
+
+    answer = await _send_export(base + "/otlp/v1/traces", _export(MAIN))
+
+    assert answer.status_code == 404
+    assert not _received(fake)
+
+
+async def test_only_the_trace_export_is_served_beside_the_model_call(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    base = dict(options.env)["ANTHROPIC_BASE_URL"]
+
+    refused = [
+        await _send_export(base + "/otlp/v1/metrics", _export(MAIN)),
+        await _send_export(base + "/otlp/v1/traces?x=1", _export(MAIN)),
+        await _send_export(base + "/otlp/v1/traces/", _export(MAIN)),
+        await _send_export(base.rsplit("/", 1)[0] + "/wrong/otlp/v1/traces", _export(MAIN)),
+    ]
+
+    assert [r.status_code for r in refused] == [404] * 4
+    assert not [r for r in fake.requests if r["path"].startswith("/otlp")]
+
+
+async def test_a_hook_input_that_is_not_an_agent_and_its_type_teaches_nothing(claude: ClaudeAgentIntegration) -> None:
+    options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+    started: Any = options.hooks["SubagentStart"][0].hooks[0]  # type: ignore[index]
+
+    for given in (
+        {},
+        {"agent_id": "a1"},
+        {"agent_type": "x"},
+        {"agent_id": 1, "agent_type": "x"},
+        {"agent_id": "", "agent_type": "x"},
+    ):
+        await started(given, None, {})
+
+    assert claude._names.name_of("a1") == "a1"  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_without_the_protocol_types_the_trace_goes_to_authfi_unchanged_and_the_log_says_so(
+    fake: FakeGateway, claude: ClaudeAgentIntegration, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("authfi.claude_agent.agent_names_available", lambda: False)
+
+    with caplog.at_level("WARNING", logger="authfi"):
+        options = await claude.options(model="claude-haiku-5-5", export_steps=True)
+
+    assert dict(options.env)[TRACES] == fake.issuer + "/otlp/v1/traces"
+    assert "pip install 'authfi[otel]'" in caplog.text
+
+
+def test_an_export_is_read_whatever_encoding_the_exporter_chose() -> None:
+    import gzip
+    import zlib
+
+    from authfi._claude_steps import AgentNames
+
+    names = AgentNames("support")
+    body = _export(MAIN)
+
+    for encoded, encoding in (
+        (body, ""),
+        (body, "identity"),
+        (gzip.compress(body), "GZIP"),
+        (zlib.compress(body), "deflate"),
+    ):
+        rewritten = names.rewrite(encoded, encoding)
+        assert rewritten is not None and b"support" in rewritten
+    assert names.rewrite(gzip.compress(body), "br") is None  # an encoding it does not read
+    assert names.rewrite(b"not gzip", "gzip") is None
+    assert names.rewrite(b"\xff\xfe", "") is None
+
+
+def test_it_remembers_a_bounded_number_of_sub_agents(monkeypatch: pytest.MonkeyPatch) -> None:
+    from authfi import _claude_steps
+    from authfi._claude_steps import AgentNames
+
+    monkeypatch.setattr(_claude_steps, "_MAX_AGENTS", 2)
+    names = AgentNames()
+    for number in range(3):
+        names.learn(f"a{number}", f"type{number}")
+
+    assert [names.name_of(f"a{number}") for number in range(3)] == ["a0", "type1", "type2"]  # the oldest is forgotten

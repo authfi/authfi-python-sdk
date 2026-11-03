@@ -10,12 +10,21 @@ started (LangSmith would make it that span's child), so that the trace a call na
 A chat model call is not the current run (LangChain leaves the graph node current, and a streamed call has none), so
 a callback handler on every LangChain run (:func:`observe_model_runs`) says which model run is executing, in
 :data:`MODEL_RUN`.
+
+A LangGraph agent is a compiled graph, and its run is the step that names it: the span of a graph's run carries
+``gen_ai.operation.name=invoke_agent`` and ``gen_ai.agent.name=<the graph's name>``, the name LangGraph gave the run
+(``create_react_agent(name=...)``, ``StateGraph.compile(name=...)``, else its default, ``LangGraph``). A graph run is
+the run its nodes hang under: LangGraph names each node run for the node and gives it a ``langgraph_checkpoint_ns``
+that is its graph's, plus ``node:task``. A graph run inside another (a sub-agent) has the same relation to its own
+nodes, so each graph is told apart by namespaces, never by the name of a tool. The nearest agent above a step is then
+the agent that ran it.
 """
 
 from __future__ import annotations
 
 import threading
 import uuid
+from collections import OrderedDict
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,7 +34,15 @@ from authfi.errors import IntegrationError
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace.id_generator import IdGenerator
 
-__all__ = ["MODEL_RUN", "TESTED", "current_step", "observe_model_runs", "span_id_of", "use_run_ids"]
+__all__ = [
+    "MODEL_RUN",
+    "TESTED",
+    "agent_name_of",
+    "current_step",
+    "observe_model_runs",
+    "span_id_of",
+    "use_run_ids",
+]
 
 #: The langsmith versions the private seam in :func:`use_run_ids` is tested against.
 TESTED = "langsmith 0.14"
@@ -36,10 +53,57 @@ MODEL_RUN: ContextVar[uuid.UUID | None] = ContextVar("authfi_model_run", default
 _observing = threading.Lock()
 _observed = False
 
+#: LangGraph's separator between the segments of a checkpoint namespace (``node:task|node:task``).
+_NS_SEP = "|"
+#: How many graph runs are remembered until their span is made, and how many open chain runs are tracked.
+_MAX_RUNS = 8192
+
+_runs_lock = threading.Lock()
+#: Chain runs that have started and not ended: run id -> (checkpoint namespace, name).
+_open_chains: OrderedDict[uuid.UUID, tuple[str, str]] = OrderedDict()
+#: Runs that are a LangGraph graph (an agent): run id -> the graph's name.
+_graph_runs: OrderedDict[uuid.UUID, str] = OrderedDict()
+
 
 def span_id_of(run_id: uuid.UUID) -> int:
     """The span id of a run's span: a UUIDv7's last eight bytes are random, which a span id needs to be."""
     return int.from_bytes(run_id.bytes[8:], "big")
+
+
+def agent_name_of(run_id: uuid.UUID) -> str | None:
+    """The name of the graph a run is, or ``None`` when it is not a LangGraph graph (or none of its nodes has run)."""
+    with _runs_lock:
+        return _graph_runs.get(run_id)
+
+
+def _bound(table: OrderedDict[uuid.UUID, Any]) -> None:
+    while len(table) > _MAX_RUNS:
+        table.popitem(last=False)
+
+
+def _chain_started(run_id: uuid.UUID, parent_run_id: uuid.UUID | None, name: str | None, metadata: Any) -> None:
+    """Note a chain run; when it is a graph's node, the run it hangs under is that graph.
+
+    A node run is named for its node (``langgraph_node``) and its namespace is its graph's plus ``node:task``. A
+    run inside a node, such as a sub-agent's graph run, has the namespace of the node it is in, which is not one
+    segment longer than that of the run above it, so it is not taken for one of that run's nodes.
+    """
+    meta = cast("dict[str, Any]", metadata) if isinstance(metadata, dict) else {}
+    ns = str(meta.get("langgraph_checkpoint_ns") or "")
+    with _runs_lock:
+        _open_chains[run_id] = (ns, name or "")
+        _bound(_open_chains)
+        if parent_run_id is None or meta.get("langgraph_node") is None or meta.get("langgraph_node") != name:
+            return
+        parent = _open_chains.get(parent_run_id)
+        if parent is not None and ns.rpartition(_NS_SEP)[0] == parent[0] and parent[1]:
+            _graph_runs[parent_run_id] = parent[1]
+            _bound(_graph_runs)
+
+
+def _chain_ended(run_id: uuid.UUID) -> None:
+    with _runs_lock:
+        _open_chains.pop(run_id, None)
 
 
 def current_step() -> Step | None:
@@ -57,7 +121,10 @@ def current_step() -> Step | None:
 
 
 def observe_model_runs() -> None:
-    """Have every LangChain run tell :data:`MODEL_RUN` which model call is executing. Once per process."""
+    """Have every LangChain run tell :data:`MODEL_RUN` which model call is executing, and which runs are graphs.
+
+    Once per process.
+    """
     global _observed
     from langchain_core.callbacks import BaseCallbackHandler
     from langchain_core.tracers.context import register_configure_hook
@@ -77,6 +144,25 @@ def observe_model_runs() -> None:
 
         def on_llm_error(self, error: BaseException, *, run_id: uuid.UUID, **kwargs: Any) -> None:
             MODEL_RUN.set(None)
+
+        def on_chain_start(
+            self,
+            serialized: Any,
+            inputs: Any,
+            *,
+            run_id: uuid.UUID,
+            parent_run_id: uuid.UUID | None = None,
+            metadata: Any = None,
+            name: str | None = None,
+            **kwargs: Any,
+        ) -> None:
+            _chain_started(run_id, parent_run_id, name, metadata)
+
+        def on_chain_end(self, outputs: Any, *, run_id: uuid.UUID, **kwargs: Any) -> None:
+            _chain_ended(run_id)
+
+        def on_chain_error(self, error: BaseException, *, run_id: uuid.UUID, **kwargs: Any) -> None:
+            _chain_ended(run_id)
 
     with _observing:
         if _observed:
@@ -114,11 +200,15 @@ def use_run_ids(client: Any) -> None:
     exporter = getattr(client, "otel_exporter", None)
     tracer = getattr(exporter, "_tracer", None)
     create = getattr(exporter, "_create_span_for_run", None)
-    if not callable(create) or not hasattr(tracer, "id_generator"):
+    if (
+        not callable(create)
+        or not callable(getattr(exporter, "_set_span_attributes", None))
+        or not hasattr(tracer, "id_generator")
+    ):
         raise IntegrationError(
             "authfi.langchain names the run executing in a gateway call's traceparent through the LangSmith "
-            f"client's OpenTelemetry bridge (otel_exporter._create_span_for_run), which this langsmith does not "
-            f"have. It is tested with {TESTED}."
+            "client's OpenTelemetry bridge (otel_exporter._create_span_for_run and _set_span_attributes), which this "
+            f"langsmith does not have. It is tested with {TESTED}."
         )
     ids = _RunSpanIds(cast("Any", tracer).id_generator)
     cast("Any", tracer).id_generator = ids
@@ -134,5 +224,14 @@ def use_run_ids(client: Any) -> None:
                 return base._create_span_for_run(self, op, run_info, None)
             finally:
                 ids.announce(None)
+
+        def _set_span_attributes(self, span: Any, run_info: dict[str, Any], op: Any) -> None:
+            base._set_span_attributes(self, span, run_info, op)
+            # Called when the run starts and again when it ends, which is after its nodes have started: a graph is
+            # known to be one by then.
+            graph = agent_name_of(op.id)
+            if graph is not None:
+                span.set_attribute("gen_ai.operation.name", "invoke_agent")
+                span.set_attribute("gen_ai.agent.name", graph)
 
     cast("Any", exporter).__class__ = RunIdExporter

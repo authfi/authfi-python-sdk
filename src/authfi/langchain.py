@@ -106,6 +106,11 @@ class LangChainIntegration:
 
         A gateway call made while a run executes carries that run's span in its ``traceparent``: the span's id is
         the run's (see :mod:`authfi._langsmith_steps`), so the call can name it before LangSmith has exported it.
+
+        The run of a LangGraph graph is an agent step: its span says ``gen_ai.operation.name=invoke_agent`` and
+        ``gen_ai.agent.name=<the graph's name>``, the name LangGraph gave it (``create_react_agent(name=...)``,
+        ``StateGraph.compile(name=...)``; a graph given none is named ``LangGraph``). A sub-agent is a graph run inside
+        another's tool, and is an agent step of its own, so the agent behind a call is the nearest one above its step.
         """
         try:
             import langsmith

@@ -11,6 +11,7 @@ import pytest
 pytest.importorskip("langgraph")
 
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig  # module level: a tool's annotations are resolved by name
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
@@ -370,6 +371,166 @@ async def test_a_streamed_model_call_names_its_run_too(fake: FakeGateway, langgr
     finally:
         langsmith.configure(client=None, enabled=None)
         provider.shutdown()
+
+
+# --- the agent behind a step is the graph above it ---------------------------------------------------------
+
+
+async def _export(fake: FakeGateway, langgraph: LangGraphIntegration, run: Any) -> list[dict[str, Any]]:
+    """Export steps, call ``run()``, and return the spans AuthFI received."""
+    import asyncio
+
+    import langsmith
+    from langsmith import run_trees
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    try:
+        langgraph.export_steps(tracer_provider=provider)
+        await run()
+        await asyncio.to_thread(run_trees.get_cached_client().flush)  # LangSmith makes the spans from a thread
+        await asyncio.to_thread(provider.force_flush)
+        return fake.exported_spans()
+    finally:
+        langsmith.configure(client=None, enabled=None)
+        provider.shutdown()
+
+
+def _agent_above(spans: list[dict[str, Any]], step: dict[str, Any]) -> str | None:
+    """The one rule: the nearest ``gen_ai.agent.name`` at or above ``step``."""
+    by_id = {(s["trace_id"], s["span_id"]): s for s in spans}
+    node: dict[str, Any] | None = step
+    while node is not None:
+        name = node["attributes"].get("gen_ai.agent.name")
+        if name:
+            return str(name)
+        node = by_id.get((node["trace_id"], node["parent_span_id"]))
+    return None
+
+
+def _step_for(spans: list[dict[str, Any]], headers: dict[str, str]) -> dict[str, Any]:
+    trace_id, span_id, _ = _step_of(headers)
+    (found,) = [s for s in spans if (s["trace_id"], s["span_id"]) == (trace_id, span_id)]
+    return found
+
+
+async def _supervisor(langgraph: LangGraphIntegration, sub_name: str | None, parent_name: str | None) -> Any:
+    """A parent graph whose only tool runs a second graph, which holds the gateway's tools."""
+    from langchain_core.tools import StructuredTool
+
+    model = langgraph.chat_model("claude-haiku-5-5", max_tokens=64)
+    researcher: Any = langgraph.agent_graph(model, await langgraph.tools(), name=sub_name)
+
+    async def ask_wiki_researcher(request: str, config: RunnableConfig) -> str:
+        """Hand a request to the wiki researcher."""
+        out = await researcher.ainvoke(ask(request), config)
+        return str(out["messages"][-1].content)
+
+    delegate = StructuredTool.from_function(coroutine=ask_wiki_researcher, name="ask_wiki_researcher", description="x")
+    return langgraph.agent_graph(model, [delegate], name=parent_name)
+
+
+async def test_the_agent_behind_a_call_is_the_graph_whose_run_made_it(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    graph = await _supervisor(langgraph, "wiki_researcher", "support")
+    fake.model_script += [
+        _use("ask_wiki_researcher", request="r"),  # support asks its sub-agent
+        _use(ALLOWED),  # the sub-agent calls the gateway tool
+        [{"type": "text", "text": "Sections."}],
+        [{"type": "text", "text": "Done."}],
+    ]
+
+    async def run() -> None:
+        await graph.ainvoke(ask("Read the wiki"), CONFIG)
+
+    spans = await _export(fake, langgraph, run)
+
+    (tool_call,) = fake.tool_requests()
+    assert _agent_above(spans, _step_for(spans, tool_call[0])) == "wiki_researcher"
+    models = [_agent_above(spans, _step_for(spans, r["headers"])) for r in fake.model_requests()]
+    assert models == ["support", "wiki_researcher", "wiki_researcher", "support"]
+    graphs = [s for s in spans if s["attributes"].get("gen_ai.agent.name")]
+    assert {(s["name"], s["attributes"]["gen_ai.operation.name"]) for s in graphs} == {
+        ("support", "invoke_agent"),
+        ("wiki_researcher", "invoke_agent"),
+    }
+
+
+async def test_a_graph_given_no_name_is_still_an_agent_and_has_langgraphs_default(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    graph = await _supervisor(langgraph, None, None)
+    fake.model_script += [_use("ask_wiki_researcher", request="r"), _use(ALLOWED)]
+
+    async def run() -> None:
+        await graph.ainvoke(ask("Read the wiki"), CONFIG)
+
+    spans = await _export(fake, langgraph, run)
+
+    (tool_call,) = fake.tool_requests()
+    assert _agent_above(spans, _step_for(spans, tool_call[0])) == "LangGraph"
+    assert [s["name"] for s in spans if s["attributes"].get("gen_ai.agent.name")] == ["LangGraph", "LangGraph"]
+
+
+async def test_only_a_graphs_run_is_an_agent_not_its_nodes_tools_or_models(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    graph = await _graph(langgraph, name="support")
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Done."}]]
+
+    async def run() -> None:
+        await graph.ainvoke(ask("Read the wiki"), CONFIG)
+
+    spans = await _export(fake, langgraph, run)
+
+    assert [s["name"] for s in spans if s["attributes"].get("gen_ai.agent.name")] == ["support"]
+    assert {s["name"] for s in spans} >= {"agent", "tools", ALLOWED, "AuthFIChatAnthropic"}
+
+
+async def test_a_graph_that_is_a_node_of_another_is_one_agent_not_two(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    """A subgraph added as a node runs as the node and as its own graph; only the graph is the agent."""
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    from langchain_core.messages import AIMessage
+    from langgraph.graph import END, START, MessagesState, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+
+    await langgraph.tools()  # the credential has been used, so the exporter can find its event loop
+
+    async def do_work(state: MessagesState) -> dict[str, Any]:
+        return {"messages": [AIMessage("worked")]}
+
+    inner: Any = StateGraph(MessagesState)
+    inner.add_node("work", do_work)
+    inner.add_edge(START, "work")
+    inner.add_edge("work", END)
+    outer: Any = StateGraph(MessagesState)
+    outer.add_node("researcher", inner.compile(name="researcher"))  # the node and its graph share a name
+    outer.add_edge(START, "researcher")
+    outer.add_edge("researcher", END)
+    graph: Any = outer.compile(name="support")
+
+    async def run() -> None:
+        given: Any = {"messages": [("user", "hi")]}
+        await graph.ainvoke(given)
+
+    spans = await _export(fake, langgraph, run)
+
+    named = [s for s in spans if s["name"] == "researcher"]
+    assert len(named) == 2
+    (agent,) = [s for s in named if s["attributes"].get("gen_ai.agent.name")]
+    children = {s["name"] for s in spans if s["parent_span_id"] == agent["span_id"]}
+    assert children == {"work"}  # the graph run is the one the inner node hangs under
+    (step,) = [s for s in spans if s["name"] == "work"]
+    assert _agent_above(spans, step) == "researcher"
 
 
 async def test_without_export_steps_no_run_is_named(fake: FakeGateway, langgraph: LangGraphIntegration) -> None:

@@ -99,6 +99,11 @@ options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps
   spans, on the global OpenTelemetry provider. Claude Agent SDK: Claude Code's own trace export (a Claude Code
   beta feature) pointed at AuthFI, with the headers from `python -m authfi headers`, and its spans carry the
   run the gateway counts the process's calls on.
+- **The agent behind a step.** The steps name their agents in the OpenTelemetry GenAI standard: an agent is an
+  `invoke_agent` span (or any span) with `gen_ai.agent.name`, and the agent behind a step, or a gateway call, is the
+  nearest `gen_ai.agent.name` at or above it. Each framework's own notion of an agent is translated, never guessed:
+  OpenAI Agents, the `Agent`; ADK and Vercel AI, their own spans; LangGraph, the compiled graph; Claude Agent SDK,
+  Claude Code's main loop and each sub-agent (see the two sections below).
 - For any other OpenTelemetry-instrumented code, `authfi.otel.register(af)` adds the exporter to the SDK
   provider (or makes one); `authfi.otel.exporter(af)` is the exporter alone, for your own processor.
 
@@ -159,6 +164,14 @@ while "__interrupt__" in state:
     # ... the person decides in AuthFI, then:
     state = await graph.ainvoke(Command(resume=True), config)
 ```
+
+**Agents.** A LangGraph agent is a compiled graph, and `export_steps()` makes the run of each graph an agent step:
+`gen_ai.operation.name=invoke_agent` and `gen_ai.agent.name=<the name LangGraph gave the run>`, which is the graph's
+`name` (`agent_graph(..., name="support")`, `StateGraph.compile(name=...)`, `create_react_agent(name=...)`). A graph
+given no name is still an agent and is named `LangGraph`, LangGraph's default; give each graph of a team its own
+name, or their calls read alike. A sub-agent is a graph run inside a node or a tool of another graph, its own agent
+step, so a call made inside it names the sub-agent and the parent's own calls name the parent. A graph run is told
+apart from its nodes by LangGraph's `langgraph_checkpoint_ns`, never by the name of a tool.
 
 **Tools.** `tools()` lists the gateway's MCP tools under the gateway's names (`<server>__<tool>`).
 Every call carries the agent's current token, an `X-Request-Id` and a `traceparent`. A tool the
@@ -311,6 +324,14 @@ leaves no time for the export, and the run's steps are never sent. The helper ne
 (`AgentKey.from_file` or `AUTHFI_AGENT_KEY_FILE`); its Bearer token cannot carry the key's proof, so the options
 name the gateway's run for the trace (`authfi.run_id`), which the gateway told the integration when it first listed
 the tools.
+
+**The agents.** Claude Code's trace names no agent, so the options have it export through the proxy, which says
+`gen_ai.agent.name` on each span as it passes (needs `authfi[otel]`; without it the trace goes to AuthFI unchanged and a
+warning says so). A sub-agent's spans, which Claude Code marks with its `agent_id`, say the sub-agent's type: its name in
+`agents=`, which the `SubagentStart` hook (and the tool hooks) report. Every other span says the main loop's name,
+`agent_name=` in `options()`, else `claude_code`, Claude Code's own name for it. A sub-agent whose start was not seen
+is named by its agent id, never by its parent's name. A span that already names its agent keeps it. Nothing else in the
+export is changed, and the headers are Claude Code's own.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code

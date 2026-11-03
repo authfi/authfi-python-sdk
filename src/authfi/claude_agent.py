@@ -72,8 +72,10 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
+from authfi._claude_steps import DEFAULT_MAIN_NAME, AgentNames
+from authfi._claude_steps import available as agent_names_available
 from authfi._holds import Decided, Held, HeldCalls
-from authfi._model_proxy import RUN_HEADER, ModelProxy
+from authfi._model_proxy import RUN_HEADER, ModelProxy, TraceRelay
 from authfi._protocol.urls import origin_of
 from authfi.agents.agent import AsyncAgentAuth, AsyncDelegatedToken, DelegatedToken
 from authfi.agents.task import AsyncTask, Task
@@ -231,6 +233,7 @@ class ClaudeAgentIntegration:
         self.gateway.project._track(self._proxy)  # pyright: ignore[reportPrivateUsage]
         self._calls = HeldCalls(self.gateway, ttl=MEMORY_SECONDS)
         self._other: CanUseTool | None = None
+        self._names = AgentNames()
 
     # --- the gateway's tools --------------------------------------------------------------------------
 
@@ -377,9 +380,21 @@ class ClaudeAgentIntegration:
             return PermissionResultDeny(message=HOLD_MESSAGE)
         return PermissionResultAllow(updated_input=args)
 
+    async def _subagent_started(
+        self, input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        """Learn the type of a sub-agent as Claude Code starts it, so its steps are exported under its name."""
+        given = cast(Mapping[str, Any], input_data)
+        self._names.learn(given.get("agent_id"), given.get("agent_type"))
+        return {}
+
     async def _ask(self, input_data: HookInput, tool_use_id: str | None, context: HookContext) -> HookJSONOutput:
         """Send the gateway's tools to the permission flow, so no allow rule skips ``can_use_tool``."""
         name = cast(Mapping[str, Any], input_data).get("tool_name")
+        # A tool hook inside a sub-agent says which one, so the type is known even if its start was not seen.
+        self._names.learn(
+            cast(Mapping[str, Any], input_data).get("agent_id"), cast(Mapping[str, Any], input_data).get("agent_type")
+        )
         if not isinstance(name, str) or not name.startswith(self.prefix):
             return {}
         return {
@@ -407,10 +422,20 @@ class ClaudeAgentIntegration:
         return self._gateway_run_id
 
     def _trace_env(self) -> dict[str, str]:
-        return {
-            **_TRACE_SWITCHES,
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": origin_of(self.gateway.project.issuer) + "/otlp/v1/traces",
-        }
+        """Claude Code's trace settings: its export goes through the loopback proxy, which names each span's agent.
+
+        Without the OpenTelemetry protocol types (extra ``otel``) the proxy cannot read an export, so it goes to AuthFI
+        directly, and the spans name no agent.
+        """
+        endpoint = origin_of(self.gateway.project.issuer) + "/otlp/v1/traces"
+        if agent_names_available():
+            endpoint = self._proxy.relay_traces(TraceRelay(endpoint, self._names.rewrite))
+        else:
+            self.gateway.project.logger.warning(
+                "export_steps sends Claude Code's trace to AuthFI as it is, naming no agent on its spans: "
+                "pip install 'authfi[otel]' to have each span say which agent made it"
+            )
+        return {**_TRACE_SWITCHES, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint}
 
     def helper_env(self) -> dict[str, str]:
         """What ``python -m authfi token`` needs to sign as this agent: names and a path, never the key.
@@ -439,6 +464,7 @@ class ClaudeAgentIntegration:
         capture_content: bool = False,
         include_never_allowed: bool = False,
         export_steps: bool = False,
+        agent_name: str | None = None,
         **claude_options: Any,
     ) -> ClaudeAgentOptions:
         """``ClaudeAgentOptions`` for this agent on the gateways.
@@ -451,8 +477,17 @@ class ClaudeAgentIntegration:
         ``export_steps`` has Claude Code send its own trace to AuthFI (``<issuer origin>/otlp/v1/traces``),
         authenticated by ``python -m authfi headers`` on every refresh, with prompts and tool content off
         unless ``capture_content``. Claude Code's trace export is a beta feature of Claude Code.
+
+        With ``export_steps`` every exported span says ``gen_ai.agent.name``: a sub-agent's spans, its type (its name in
+        ``agents=``, as Claude Code's ``SubagentStart`` hook reports it), and every other span ``agent_name``, the
+        main loop's name, which is ``claude_code`` (Claude Code's own name for it) unless given. A sub-agent whose
+        start was not seen is named by its agent id, never by its parent's name. This needs ``authfi[otel]``, whose
+        protocol types read the export.
         """
         await self.gateway.project.resolve_api_origin()
+        if agent_name is not None and not agent_name.strip():
+            raise ConfigurationError("agent_name is the main loop's name for the steps it exports: it cannot be empty")
+        self._names.main = agent_name or DEFAULT_MAIN_NAME
         if claude_options.get("permission_mode") == "bypassPermissions":
             raise ConfigurationError(
                 "permission_mode bypassPermissions skips can_use_tool, and with it AuthFI approvals"
@@ -473,6 +508,7 @@ class ClaudeAgentIntegration:
             )
         # Before the environment: this first call to the gateway is what tells us the run the trace belongs to.
         servers[self.server_name] = await self.mcp_server(include_never_allowed=include_never_allowed)
+        proxy_url = await self._proxy.start()
         resource = {"authfi.agent_id": self.agent_id}
         if self._gateway_run_id:
             resource["authfi.run_id"] = self._gateway_run_id
@@ -480,7 +516,7 @@ class ClaudeAgentIntegration:
             **given_env,
             # Claude Code starts with this process's environment under these: blank, so none reaches it.
             **dict.fromkeys(_FIXED_CREDENTIALS, ""),
-            "ANTHROPIC_BASE_URL": await self._proxy.start(),
+            "ANTHROPIC_BASE_URL": proxy_url,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_SMALL_FAST_MODEL": model,
             # The AI gateway serves the models the project configures; Anthropic's experimental
@@ -501,6 +537,10 @@ class ClaudeAgentIntegration:
             settings["otelHeadersHelper"] = f"{_shell_word(sys.executable)} -m authfi headers"
         hooks = dict(claude_options.pop("hooks", None) or {})
         hooks["PreToolUse"] = [*hooks.get("PreToolUse", []), HookMatcher(matcher=None, hooks=[self._ask])]
+        hooks["SubagentStart"] = [
+            *hooks.get("SubagentStart", []),
+            HookMatcher(matcher=None, hooks=[self._subagent_started]),
+        ]
         self._other = claude_options.pop("can_use_tool", None)
         claude_options.setdefault("permission_mode", "default")
         return ClaudeAgentOptions(
