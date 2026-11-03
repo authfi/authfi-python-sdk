@@ -372,16 +372,17 @@ async def test_a_streamed_model_call_names_its_run_too(fake: FakeGateway, langgr
         provider.shutdown()
 
 
-async def test_a_call_made_when_steps_are_not_exported_names_no_step(
-    fake: FakeGateway, langgraph: LangGraphIntegration
-) -> None:
+async def test_without_export_steps_no_run_is_named(fake: FakeGateway, langgraph: LangGraphIntegration) -> None:
+    from authfi._protocol.ids import step_traceparent
+
     graph = await _graph(langgraph)
     fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Done."}]]
 
     await graph.ainvoke(ask("Summarise the wiki"), CONFIG)
 
-    for headers in [r["headers"] for r in fake.model_requests()] + [h for h, _ in fake.tool_requests()]:
-        assert _step_of(headers)[2] == "00"
+    assert step_traceparent(langgraph.source) is None  # nothing is exported, so there is no step to name
+    # (what the call carries then is the active OpenTelemetry span, if the application has one, else a fresh value)
+    assert all("traceparent" in r["headers"] for r in fake.model_requests())
 
 
 def test_a_langsmith_whose_bridge_moved_is_refused() -> None:

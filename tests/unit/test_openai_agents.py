@@ -19,6 +19,7 @@ from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
 
 from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
+from authfi._protocol.ids import step_traceparent
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from authfi.openai_agents import AuthFIMCPServer, AuthFITraceProcessor, OpenAIAgentsIntegration
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
@@ -664,8 +665,9 @@ async def test_a_call_made_when_steps_are_not_exported_names_no_step(
 
     await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config())
 
+    assert step_traceparent(integration.source) is None  # nothing is exported, so there is no step to name
     for headers in [r["headers"] for r in fake.model_requests()] + [h for h, _ in fake.tool_requests()]:
-        assert _step_of(headers)[2] == "00"  # fresh and unsampled: there is no exported step to name
+        assert "traceparent" in headers
 
 
 async def test_a_model_call_outside_any_step_is_fresh(fake: FakeGateway, integration: OpenAIAgentsIntegration) -> None:

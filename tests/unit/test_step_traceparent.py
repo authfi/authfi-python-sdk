@@ -38,6 +38,21 @@ class Owner:
     """Stands for a credential: anything that can be weakly referenced."""
 
 
+class Slotted:
+    """A slotted credential: it cannot be weakly referenced."""
+
+    __slots__ = ()
+
+
+def test_a_credential_that_cannot_be_weakly_referenced_has_a_step_too() -> None:
+    owner = Slotted()
+    register_step_source(owner, lambda: (TRACE, SPAN))
+    headers: dict[str, str] = {}
+    inject_traceparent(headers, owner)
+    assert headers["traceparent"] == STEP
+    assert step_traceparent(Slotted()) is None  # another credential of the class has none
+
+
 def test_the_registered_step_is_the_traceparent_and_is_sampled() -> None:
     owner = Owner()
     register_step_source(owner, lambda: (TRACE, SPAN))

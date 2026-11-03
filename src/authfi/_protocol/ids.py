@@ -49,7 +49,9 @@ StepSource = Callable[[], Step | None]
 
 _LOG = logging.getLogger("authfi")
 
-_sources: weakref.WeakKeyDictionary[object, list[StepSource]] = weakref.WeakKeyDictionary()
+#: Owner id -> (the owner, weakly where a class allows it, else held; its sources). An id is what is looked up
+#: because some credentials are slotted classes that cannot be weakly referenced or hashed by value.
+_sources: dict[int, tuple[object, list[StepSource]]] = {}
 _sources_lock = threading.Lock()
 
 
@@ -97,14 +99,27 @@ def register_step_source(owner: object, source: StepSource) -> None:
     source twice adds nothing, and the registration ends with ``owner``.
     """
     with _sources_lock:
-        found = _sources.setdefault(owner, [])
-        if source not in found:
-            found.append(source)
+        held = _sources.get(id(owner))
+        if held is None:
+            key = id(owner)
+            try:
+                ref: object = weakref.ref(owner, lambda _: _forget(key))
+            except TypeError:  # a slotted class without __weakref__: kept for the life of the process
+                ref = owner
+            held = _sources[key] = (ref, [])
+        if source not in held[1]:
+            held[1].append(source)
+
+
+def _forget(key: int) -> None:
+    with _sources_lock:
+        _sources.pop(key, None)
 
 
 def _step_of(owner: object | None) -> Step | None:
     with _sources_lock:
-        sources = list(_sources.get(owner, ())) if owner is not None else []
+        held = _sources.get(id(owner)) if owner is not None else None
+        sources = list(held[1]) if held is not None else []
     for source in sources:
         try:
             step = source()
