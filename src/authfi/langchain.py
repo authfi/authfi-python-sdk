@@ -21,7 +21,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from authfi import _langsmith_steps
 from authfi._adapters import agent_id_of, configure_langsmith, gateway_for
+from authfi._protocol.ids import register_step_source
 from authfi.errors import ConfigurationError
 from authfi.tokens import AsyncTokenSource, TokenSource
 
@@ -101,6 +103,9 @@ class LangChainIntegration:
         LangSmith's client turns each run into spans on the OpenTelemetry provider, where the AuthFI exporter
         (see :func:`authfi.otel.register`) sends them with the agent's current token. Nothing goes to
         LangSmith, and runs carry no content unless ``capture_content``. Call it once, before the first run.
+
+        A gateway call made while a run executes carries that run's span in its ``traceparent``: the span's id is
+        the run's (see :mod:`authfi._langsmith_steps`), so the call can name it before LangSmith has exported it.
         """
         try:
             import langsmith
@@ -112,7 +117,12 @@ class LangChainIntegration:
         from authfi import otel
 
         provider = otel.register(self.source, capture_content=capture_content, **options)
-        configure_langsmith(capture_content=capture_content, tracing_mode="otel", otel_tracer_provider=provider)
+        client = configure_langsmith(
+            capture_content=capture_content, tracing_mode="otel", otel_tracer_provider=provider
+        )
+        _langsmith_steps.use_run_ids(client)
+        _langsmith_steps.observe_model_runs()
+        register_step_source(self.source, _langsmith_steps.current_step)
         langsmith.configure(enabled=True)
         return provider
 

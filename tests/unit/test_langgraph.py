@@ -298,3 +298,109 @@ async def test_export_steps_is_the_langchain_integrations_and_the_run_is_shared(
     finally:
         langsmith.configure(client=None, enabled=None)
         provider.shutdown()
+
+
+# --- every gateway call names the step that made it -------------------------------------------------------
+
+
+def _step_of(headers: dict[str, str]) -> tuple[str, str, str]:
+    """``(trace id, span id, flags)`` of a request's ``traceparent``."""
+    _, trace_id, span_id, flags = headers["traceparent"].split("-")
+    return trace_id, span_id, flags
+
+
+async def test_a_model_call_and_a_tool_call_name_the_run_that_made_them(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    import asyncio
+
+    import langsmith
+    from langsmith import run_trees
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    try:
+        langgraph.export_steps(tracer_provider=provider)
+        graph = await _graph(langgraph)
+        fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Done."}]]
+
+        await graph.ainvoke(ask("Summarise the wiki"), CONFIG)
+        await asyncio.to_thread(run_trees.get_cached_client().flush)  # LangSmith makes the spans from a thread
+        await asyncio.to_thread(provider.force_flush)
+
+        exported = {(s["trace_id"], s["span_id"]): s["name"] for s in fake.exported_spans()}
+        models = [_step_of(r["headers"]) for r in fake.model_requests()]
+        calls = [_step_of(headers) for headers, _ in fake.tool_requests()]
+        assert len(models) == 2 and len(calls) == 1
+        for trace_id, span_id, flags in models:
+            # the chat model's own run, not the graph node that LangChain leaves current
+            assert exported[(trace_id, span_id)] == "AuthFIChatAnthropic" and flags == "01"
+        assert models[0][1] != models[1][1]
+        assert exported[calls[0][:2]] == ALLOWED and calls[0][2] == "01"
+    finally:
+        langsmith.configure(client=None, enabled=None)
+        provider.shutdown()
+
+
+async def test_a_streamed_model_call_names_its_run_too(fake: FakeGateway, langgraph: LangGraphIntegration) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    import asyncio
+
+    import langsmith
+    from langsmith import run_trees
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    try:
+        langgraph.export_steps(tracer_provider=provider)
+        model = langgraph.chat_model("claude-haiku-5-5", max_tokens=64)
+        fake.model_script += [[{"type": "text", "text": "Done."}]]
+
+        chunks = [chunk async for chunk in model.astream("hi")]
+        await asyncio.to_thread(run_trees.get_cached_client().flush)
+        await asyncio.to_thread(provider.force_flush)
+
+        assert chunks
+        trace_id, span_id, flags = _step_of(fake.model_requests()[0]["headers"])
+        exported = {(s["trace_id"], s["span_id"]): s["name"] for s in fake.exported_spans()}
+        assert exported[(trace_id, span_id)] == "AuthFIChatAnthropic" and flags == "01"
+    finally:
+        langsmith.configure(client=None, enabled=None)
+        provider.shutdown()
+
+
+async def test_a_call_made_when_steps_are_not_exported_names_no_step(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    graph = await _graph(langgraph)
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Done."}]]
+
+    await graph.ainvoke(ask("Summarise the wiki"), CONFIG)
+
+    for headers in [r["headers"] for r in fake.model_requests()] + [h for h, _ in fake.tool_requests()]:
+        assert _step_of(headers)[2] == "00"
+
+
+def test_a_langsmith_whose_bridge_moved_is_refused() -> None:
+    from types import SimpleNamespace
+
+    from authfi import IntegrationError
+    from authfi._langsmith_steps import use_run_ids
+
+    with pytest.raises(IntegrationError, match="langsmith"):
+        use_run_ids(SimpleNamespace(otel_exporter=None))
+
+
+async def test_the_models_client_does_not_set_a_traceparent_of_its_own(langgraph: LangGraphIntegration) -> None:
+    """The Anthropic SDK's own propagation replaces any traceparent with that of its parentless span."""
+    import anthropic
+
+    model = langgraph.chat_model("claude-haiku-5-5")
+    client = model._async_client  # pyright: ignore[reportPrivateUsage]
+    if not hasattr(client, "open_telemetry"):
+        pytest.skip("this anthropic does not trace")
+    assert client.open_telemetry["propagation"] is False
+    assert isinstance(client, anthropic.AsyncAnthropic)

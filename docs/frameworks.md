@@ -83,8 +83,16 @@ options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps
 - Content is off by default: prompts, answers and tool arguments and results are removed before sending
   (`capture_content=True` is the tenant's decision), and AuthFI drops them again on receipt.
 - Spans carry `authfi.agent_id` (`authfi.client_id` for a machine client) and `authfi.run_id`. AuthFI keeps
-  each span as the token's agent's, whatever the payload says. A gateway call made inside a step carries that
-  step's `traceparent`, so the gateway's record and the steps share a trace id.
+  each span as the token's agent's, whatever the payload says. A gateway call (a tool call, a model call, a cloud
+  credential request) carries the `traceparent` of the step executing when it is made: the trace id and span id
+  of that step as it is exported, so the gateway's record of the call names the step that made it. With no step
+  executing, or when steps are not exported, the value is fresh with the sampled flag off.
+  OpenAI Agents: the call is the `chat` or `execute_tool` span the SDK's span became. ADK: the active
+  OpenTelemetry span. LangChain and LangGraph: the run's span; its span id is the last eight bytes of the run's
+  UUID, set when the run starts, because LangSmith otherwise makes the span after the call (a root run also does
+  not join an OpenTelemetry span that was current when it started). Claude Agent SDK: a model request carries
+  the span Claude Code exports for it (`CLAUDE_CODE_PROPAGATE_TRACEPARENT`, set with `export_steps`), and a tool
+  call carries the span of the model request that asked for it.
 - LangChain and LangGraph: LangChain's tracing (LangSmith's client) is switched to OpenTelemetry, so runs go to
   AuthFI and not to LangSmith. OpenAI Agents: the SDK's trace becomes GenAI spans (`invoke_agent`,
   `execute_tool`, `chat`), replacing the SDK's default exporter as `configure_tracing()` does. ADK: its own

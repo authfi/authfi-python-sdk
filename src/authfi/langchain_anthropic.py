@@ -15,7 +15,7 @@ tracer.
 from __future__ import annotations
 
 from functools import cached_property
-from typing import Any, Self
+from typing import Any, Self, TypeVar, cast
 
 try:
     import anthropic
@@ -32,6 +32,8 @@ from authfi.errors import ConfigurationError, IntegrationError
 from authfi.gateway import AsyncGateway, Gateway, token_refusal
 
 __all__ = ["AuthFIChatAnthropic"]
+
+ClientT = TypeVar("ClientT")
 
 #: The langchain-anthropic versions the private seam below is tested against.
 TESTED = "langchain-anthropic 1.7"
@@ -51,6 +53,23 @@ def _check_seam(cls: type) -> None:
 
 
 _check_seam(ChatAnthropic)
+
+
+def _without_propagation(client: ClientT) -> ClientT:
+    """``client`` without trace propagation of its own, where the Anthropic SDK has it.
+
+    Its newer versions put the ``traceparent`` of their own ``anthropic.messages.create`` span on every request, in
+    place of any set earlier, and that span is parentless: the gateway's record would name it, not the run that made
+    the call. The gateway's HTTP client sets the ``traceparent`` of the run instead (see ``_langsmith_steps``). The
+    SDK's spans are kept.
+    """
+    options = getattr(client, "open_telemetry", None)
+    if not isinstance(options, dict):
+        return client
+    return cast(
+        "ClientT",
+        cast("Any", client).with_options(open_telemetry={**cast("dict[str, Any]", options), "propagation": False}),
+    )
 
 
 def _token_refused(error: anthropic.AuthenticationError) -> BaseException:
@@ -104,8 +123,10 @@ class AuthFIChatAnthropic(ChatAnthropic):
                 "this model was made from an asyncio credential: call it with ainvoke or astream, or make it from "
                 "the blocking AuthFI"
             )
-        return anthropic.Client(
-            **self._authfi_params(), http_client=gateway.http_client(httpx_of("anthropic._base_client"))
+        return _without_propagation(
+            anthropic.Client(
+                **self._authfi_params(), http_client=gateway.http_client(httpx_of("anthropic._base_client"))
+            )
         )
 
     @cached_property
@@ -116,6 +137,8 @@ class AuthFIChatAnthropic(ChatAnthropic):
                 "this model was made from a blocking credential: call it with invoke or stream, or make it from "
                 "AsyncAuthFI"
             )
-        return anthropic.AsyncClient(
-            **self._authfi_params(), http_client=gateway.http_client(httpx_of("anthropic._base_client"))
+        return _without_propagation(
+            anthropic.AsyncClient(
+                **self._authfi_params(), http_client=gateway.http_client(httpx_of("anthropic._base_client"))
+            )
         )

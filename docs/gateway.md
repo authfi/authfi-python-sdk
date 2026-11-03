@@ -16,7 +16,11 @@ client = gateway.http_client()
 
 The client puts the current token on every request, sends it to AuthFI's origin only, follows no
 redirect, and sends an `X-Request-Id` and a `traceparent`, so a trace joins the gateway's record of
-the call. It is made once and closed with the project; do not close it yourself.
+the call. The `traceparent` is the framework step executing when the request is made, when the adapter exports
+its steps (`export_steps()`, see [frameworks](frameworks.md)); otherwise the active OpenTelemetry span, else a
+fresh value with the sampled flag off. A header you set is kept. An MCP call that names its step in
+`params._meta.traceparent`, the MCP convention for trace context, is sent with that step: an MCP client sends a
+request from a task that began with its session, which is not necessarily the call's step. It is made once and closed with the project; do not close it yourself.
 `gateway.new_http_client()` makes one you own and close, as an MCP client factory does.
 
 Give it to an MCP client or a provider SDK. The newer `anthropic` and `openai` packages are built

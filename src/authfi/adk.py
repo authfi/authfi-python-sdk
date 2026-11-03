@@ -59,6 +59,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
 from authfi._holds import Held, HeldCalls
+from authfi._protocol.ids import inject_traceparent
 from authfi.errors import ConfigurationError, GatewayTokenRefused, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,
@@ -128,7 +129,9 @@ class AuthFILiteLlm(LiteLlm):
         for attempt in (1, 2):
             config = original.model_copy()
             options = (config.http_options or types.HttpOptions()).model_copy()
-            options.headers = {**(options.headers or {}), **(await gateway.source.headers("POST", url))}
+            headers = {**(options.headers or {}), **(await gateway.source.headers("POST", url))}
+            inject_traceparent(headers, gateway.source)  # LiteLLM's own HTTP client does not stamp it
+            options.headers = headers
             config.http_options = options
             llm_request.config = config
             started = False

@@ -11,8 +11,9 @@ import pytest
 
 pytest.importorskip("agents")
 
-from agents import Agent, Runner, RunResult
+from agents import Agent, ModelSettings, Runner, RunResult
 from agents.items import ToolCallOutputItem
+from agents.models.interface import ModelTracing
 from agents.tracing import TracingProcessor
 from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
@@ -614,3 +615,81 @@ def test_the_steps_processor_survives_spans_it_never_saw_start() -> None:
     assert _nanos(None) is None
     assert _nanos("not a time") is None
     assert _nanos("2026-10-29T10:00:00+00:00") == 1_793_268_000_000_000_000
+
+
+# --- every gateway call names the step that made it -------------------------------------------------------
+
+
+def _step_of(headers: dict[str, str]) -> tuple[str, str, str]:
+    """``(trace id, span id, flags)`` of a request's ``traceparent``."""
+    _, trace_id, span_id, flags = headers["traceparent"].split("-")
+    return trace_id, span_id, flags
+
+
+async def _flushed(integration: OpenAIAgentsIntegration, provider: Any) -> None:
+    integration.configure_tracing()
+    await asyncio.to_thread(provider.force_flush)
+    await asyncio.to_thread(provider.shutdown)
+
+
+async def test_a_model_call_and_a_tool_call_name_the_step_that_made_them(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    integration.export_steps(tracer_provider=provider)
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config())
+    await _flushed(integration, provider)
+
+    exported = {(s["trace_id"], s["span_id"]): s["name"] for s in fake.exported_spans()}
+    models = [_step_of(r["headers"]) for r in fake.model_requests()]
+    calls = [_step_of(headers) for headers, _ in fake.tool_requests()]
+    assert len(models) == 2 and len(calls) == 1
+    for trace_id, span_id, flags in models:
+        assert exported[(trace_id, span_id)].startswith("chat ") and flags == "01"
+    assert models[0][1] != models[1][1]  # each model call is its own step
+    trace_id, span_id, flags = calls[0]
+    assert exported[(trace_id, span_id)] == f"execute_tool {ALLOWED}" and flags == "01"
+
+
+async def test_a_call_made_when_steps_are_not_exported_names_no_step(
+    fake: FakeGateway, integration: OpenAIAgentsIntegration, tools: AuthFIMCPServer
+) -> None:
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    await Runner.run(_agent(integration, tools), PROMPT, run_config=integration.run_config())
+
+    for headers in [r["headers"] for r in fake.model_requests()] + [h for h, _ in fake.tool_requests()]:
+        assert _step_of(headers)[2] == "00"  # fresh and unsampled: there is no exported step to name
+
+
+async def test_a_model_call_outside_any_step_is_fresh(fake: FakeGateway, integration: OpenAIAgentsIntegration) -> None:
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("opentelemetry.exporter.otlp.proto.http")
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    steps = integration.export_steps(tracer_provider=provider)
+    assert steps is provider
+    fake.model_script += [[{"type": "text", "text": "Hi."}]]
+
+    await integration.model("claude-haiku-5-5").get_response(  # not run by the Runner: no SDK span is current
+        system_instructions=None,
+        input="hi",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+    await _flushed(integration, provider)
+
+    assert _step_of(fake.model_requests()[0]["headers"])[2] == "00"

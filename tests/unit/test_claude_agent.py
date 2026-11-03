@@ -485,6 +485,7 @@ async def test_export_steps_points_claude_codes_trace_at_authfi_with_a_refreshin
         "OTEL_TRACES_EXPORT_INTERVAL",
         "CLAUDE_CODE_OTEL_HEADERS_HELPER_DEBOUNCE_MS",
         "CLAUDE_CODE_ENABLE_TELEMETRY",
+        "CLAUDE_CODE_PROPAGATE_TRACEPARENT",
     ],
 )
 async def test_with_export_steps_the_trace_settings_are_the_integrations(
