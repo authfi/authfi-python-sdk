@@ -489,8 +489,8 @@ class ClaudeAgentIntegration:
         ``x-anthropic-billing-header`` system part (whose suffix changes with the first user message); give the
         variable in ``env`` to change it. ``tools`` defaults to ``["Agent"]``, so the model is offered the AuthFI
         tools and Claude Code's sub-agent tool and none of its other built-ins; pass your own ``tools`` list (``[]``
-        for no sub-agent tool, the ``claude_code`` preset or ``None`` for Claude Code's full set). A tool that is
-        offered still goes through ``can_use_tool``, so ``Agent`` runs only if the ``can_use_tool`` you give allows it.
+        for no sub-agent tool, the ``claude_code`` preset or ``None`` for Claude Code's full set). Claude Code starts
+        a sub-agent without asking ``can_use_tool``; every other tool you offer goes through it.
 
         ``export_steps`` has Claude Code send its own trace to AuthFI (``<issuer origin>/otlp/v1/traces``),
         authenticated by ``python -m authfi headers`` on every refresh, with prompts and tool content off

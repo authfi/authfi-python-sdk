@@ -331,8 +331,10 @@ configuration on every run, which is what an approved configuration is checked a
   "claude_code"}` or `None` for Claude Code's own full set. `allowed_tools` does not change what is offered; it only
   says which offered tools run without a prompt.
 
-A tool that is offered still goes through `can_use_tool`. To let the model start a sub-agent, define it with `agents=` and
-give a `can_use_tool` that allows `Agent`; the AuthFI tools a sub-agent calls are decided by the gateway as before.
+`Agent` starts a sub-agent without asking `can_use_tool` (Claude Code does not ask for it), so the model can start sub-agents
+whenever it is offered. A sub-agent has the tools it is offered, here the AuthFI tools and `Agent`, so what it can do is what the
+gateway allows the agent. Define named sub-agents with `agents=`; pass `tools=[]` to offer no sub-agent tool. Any other tool you
+offer goes through `can_use_tool`, which refuses it unless you give one that decides it.
 
 **The steps.** With `export_steps=True`, Claude Code exports a span batch every second (`OTEL_TRACES_EXPORT_INTERVAL`,
 which the options own) and keeps the headers from `python -m authfi headers` for four minutes. Claude Code's
