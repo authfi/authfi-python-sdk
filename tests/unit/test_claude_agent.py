@@ -250,6 +250,32 @@ async def test_content_is_captured_only_when_asked(claude: ClaudeAgentIntegratio
     assert all(dict(options.env)[name] == "1" for name in CONTENT_SWITCHES)
 
 
+async def test_claude_code_sends_no_billing_line_unless_the_owner_says(claude: ClaudeAgentIntegration) -> None:
+    """The billing line's suffix changes with the first user message, so no configuration could be pinned with it."""
+    options = await claude.options(model="claude-haiku-5-5")
+    assert dict(options.env)["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
+
+    owners = await claude.options(model="claude-haiku-5-5", env={"CLAUDE_CODE_ATTRIBUTION_HEADER": "1"})
+    assert dict(owners.env)["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "1"
+
+
+async def test_the_model_is_offered_only_the_agents_tools_and_the_sub_agent_tool(
+    claude: ClaudeAgentIntegration,
+) -> None:
+    """``tools`` is what Claude Code offers the model; ``allowed_tools`` only says what needs no prompt."""
+    options = await claude.options(model="claude-haiku-5-5")
+    assert options.tools == ["Agent"]  # the built-ins are not offered; the AuthFI MCP tools are not built-ins
+
+    chosen = await claude.options(model="claude-haiku-5-5", tools=["Agent", "Read"])
+    assert chosen.tools == ["Agent", "Read"]
+    none = await claude.options(model="claude-haiku-5-5", tools=[])
+    assert none.tools == []
+    everything = await claude.options(model="claude-haiku-5-5", tools={"type": "preset", "preset": "claude_code"})
+    assert everything.tools == {"type": "preset", "preset": "claude_code"}
+    unset = await claude.options(model="claude-haiku-5-5", tools=None)
+    assert unset.tools is None  # Claude Code's own default set
+
+
 @pytest.mark.parametrize(
     ("given", "match"),
     [

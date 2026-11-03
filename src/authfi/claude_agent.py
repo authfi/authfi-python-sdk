@@ -116,6 +116,15 @@ HEADERS_HELPER_TTL_MS = 240_000
 #: capped there), and the first export has to run ``otelHeadersHelper``, a process that takes about a second.
 TRACE_EXPORT_INTERVAL_MS = 1_000
 
+#: Claude Code's first system part is ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...``, and its
+#: three-hex suffix changes with the first user message, so no two runs of one agent send the same system text. "0"
+#: has Claude Code leave the part out. Set by default; the owner's ``env`` (or ``settings["env"]``) wins.
+ATTRIBUTION_HEADER_SWITCH = "CLAUDE_CODE_ATTRIBUTION_HEADER"
+
+#: What the model is offered besides the AuthFI tools: Claude Code's sub-agent tool and none of its built-ins (Bash,
+#: Write, WebFetch, ...). ``ClaudeAgentOptions.tools`` is the set offered; ``allowed_tools`` only skips the prompt.
+DEFAULT_TOOLS = ("Agent",)
+
 #: Environment that would hand Claude Code a fixed credential; the helper is the only way in. Claude
 #: Code inherits this process's environment, so each is also blanked in the environment it is given.
 _FIXED_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY")
@@ -475,6 +484,14 @@ class ClaudeAgentIntegration:
         tools that are not AuthFI's (by default they are refused). A credential in ``env`` is refused,
         and so is ``permission_mode="bypassPermissions"``, which would skip approvals.
 
+        Two defaults make the agent's configuration the same on every run, and the owner can change either.
+        ``CLAUDE_CODE_ATTRIBUTION_HEADER=0`` is set in Claude Code's environment, so it sends no
+        ``x-anthropic-billing-header`` system part (whose suffix changes with the first user message); give the
+        variable in ``env`` to change it. ``tools`` defaults to ``["Agent"]``, so the model is offered the AuthFI
+        tools and Claude Code's sub-agent tool and none of its other built-ins; pass your own ``tools`` list (``[]``
+        for no sub-agent tool, the ``claude_code`` preset or ``None`` for Claude Code's full set). Claude Code starts
+        a sub-agent without asking ``can_use_tool``; every other tool you offer goes through it.
+
         ``export_steps`` has Claude Code send its own trace to AuthFI (``<issuer origin>/otlp/v1/traces``),
         authenticated by ``python -m authfi headers`` on every refresh, with prompts and tool content off
         unless ``capture_content``. Claude Code's trace export is a beta feature of Claude Code.
@@ -516,6 +533,7 @@ class ClaudeAgentIntegration:
         if self._gateway_run_id:
             resource["authfi.run_id"] = self._gateway_run_id
         env = {
+            ATTRIBUTION_HEADER_SWITCH: "0",
             **given_env,
             # Claude Code starts with this process's environment under these: blank, so none reaches it.
             **dict.fromkeys(_FIXED_CREDENTIALS, ""),
@@ -546,6 +564,7 @@ class ClaudeAgentIntegration:
         ]
         self._other = claude_options.pop("can_use_tool", None)
         claude_options.setdefault("permission_mode", "default")
+        claude_options.setdefault("tools", list(DEFAULT_TOOLS))
         return ClaudeAgentOptions(
             model=model,
             env=env,

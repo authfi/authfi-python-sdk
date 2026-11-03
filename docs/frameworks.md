@@ -316,6 +316,26 @@ the integration sets, and `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Claude C
 process's environment as well, so the options blank those two (and `AUTHFI_AGENT_PRIVATE_KEY`) in
 the environment they give it, and log that they were set here.
 
+**What the model is offered, and what Claude Code sends.** `options()` sets two defaults so that one agent sends the same
+configuration on every run, which is what an approved configuration is checked against. Both are the owner's to change.
+
+- *No billing line.* Claude Code starts its system text with `x-anthropic-billing-header: cc_version=...;`, and the three
+  hex digits at the end change with the first user message, so two runs of the same agent differ. The options set
+  `CLAUDE_CODE_ATTRIBUTION_HEADER=0` in Claude Code's environment, which leaves that part out. To send it, give
+  `env={"CLAUDE_CODE_ATTRIBUTION_HEADER": "1"}`.
+- *Only the AuthFI tools and the sub-agent tool.* The options set `tools=["Agent"]`, so the model is offered the
+  agent's AuthFI tools (`mcp__authfi__...`) and Claude Code's sub-agent tool, `Agent`, and none of the other
+  built-ins (Bash, Write, WebFetch and the rest). Without it Claude Code offers all of them, and
+  `can_use_tool` could only refuse them after the model had asked. To change the set, pass `tools=` to
+  `options()`: a list of Claude Code tool names (`["Agent", "Read"]`), `[]` for none, `{"type": "preset", "preset":
+  "claude_code"}` or `None` for Claude Code's own full set. `allowed_tools` does not change what is offered; it only
+  says which offered tools run without a prompt.
+
+`Agent` starts a sub-agent without asking `can_use_tool` (Claude Code does not ask for it), so the model can start sub-agents
+whenever it is offered. A sub-agent has the tools it is offered, here the AuthFI tools and `Agent`, so what it can do is what the
+gateway allows the agent. Define named sub-agents with `agents=`; pass `tools=[]` to offer no sub-agent tool. Any other tool you
+offer goes through `can_use_tool`, which refuses it unless you give one that decides it.
+
 **The steps.** With `export_steps=True`, Claude Code exports a span batch every second (`OTEL_TRACES_EXPORT_INTERVAL`,
 which the options own) and keeps the headers from `python -m authfi headers` for four minutes. Claude Code's
 default is to export every five seconds and to run the helper at the first export, which for a short run is at
