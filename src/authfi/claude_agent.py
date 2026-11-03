@@ -510,6 +510,8 @@ class ClaudeAgentIntegration:
         # Before the environment: this first call to the gateway is what tells us the run the trace belongs to.
         servers[self.server_name] = await self.mcp_server(include_never_allowed=include_never_allowed)
         proxy_url = await self._proxy.start()
+        if not export_steps:
+            self._proxy.stop_relaying_traces()  # an earlier call may have served the route
         resource = {"authfi.agent_id": self.agent_id}
         if self._gateway_run_id:
             resource["authfi.run_id"] = self._gateway_run_id

@@ -330,8 +330,16 @@ the tools.
 warning says so). A sub-agent's spans, which Claude Code marks with its `agent_id`, say the sub-agent's type: its name in
 `agents=`, which the `SubagentStart` hook (and the tool hooks) report. Every other span says the main loop's name,
 `agent_name=` in `options()`, else `claude_code`, Claude Code's own name for it. A sub-agent whose start was not seen
-is named by its agent id, never by its parent's name. A span that already names its agent keeps it. Nothing else in the
-export is changed, and the headers are Claude Code's own.
+is named by its agent id, never by its parent's name. A span that already names its agent keeps it, whatever the type of
+its value. Nothing else in the export is changed; the proxy sends on Claude Code's `Authorization`, `DPoP`, `User-Agent`,
+`traceparent` and `Content-Type`, and nothing else of its headers.
+
+An export is bounded before it is built: 4 MB as it arrives, 16 MB decompressed, 4096 spans, and 262144 fields of
+resources, scopes and spans together, counted from the wire format before any message is made; the rewrite runs on a
+worker thread, one export at a time, so it never holds up your hooks, `can_use_tool` or token renewal. An export over a
+cap (413), malformed or cut short (400), or in an encoding other than gzip or deflate (415) is answered with that status
+and **not sent on**: unnamed, a sub-agent's spans would read as the main loop's. A failure of the rewrite is a 500. Claude
+Code sees the status and can try again. Each kind of refusal is logged once a minute.
 
 **The tools.** The gateway's tools are served to Claude Code by an MCP server in your process
 (`mcp_server()`), which calls the gateway with the current token on every request. In Claude Code
