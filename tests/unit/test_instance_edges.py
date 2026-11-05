@@ -118,7 +118,7 @@ def test_the_instance_key_signs_nothing_an_agent_key_would(platform: InstancePla
     agent = blocking(platform, token_file)
     assert agent.key.alg == _dpop.run_key().alg and agent.key.kid
     assert agent.key.public_jwk() == _dpop.run_key().public_jwk()
-    with pytest.raises(NotSupportedError, match="token exchange"):
+    with pytest.raises(NotSupportedError, match="client assertion"):
         agent.key.sign(b"x")
     assert repr(agent) == f"InstanceAuth(agent_id='{AGENT}', evidence='k8s')"
     agent.project.close()

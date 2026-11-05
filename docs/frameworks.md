@@ -48,6 +48,13 @@ graph = af.langgraph()
 It reads `AUTHFI_ISSUER`, then `AUTHFI_AGENT_ID` with `AUTHFI_AGENT_KEY_FILE` (an agent, and the default
 when both are set) or `AUTHFI_CLIENT_ID` with `AUTHFI_CLIENT_SECRET` (a machine client; its token is for
 `<issuer>/mcp`, or `AUTHFI_CLIENT_RESOURCE`). A missing variable is a `ConfigurationError` that names it.
+A new agent has no approved configuration version yet. While a person has an observation window open for it in
+the console, `AUTHFI_CONFIG_OBSERVE=1` (or `authfi.connect(observe=True)`) signs its instance in naming no version,
+so what it does can be observed and a version approved from it. Without a window the platform refuses it, and the
+error says to ask a person to open one or to set `AUTHFI_CONFIG_VERSION` and `AUTHFI_CONFIG_DIGEST`. Nothing runs
+unapproved by omission: an instance that names no version and does not ask to be observed is refused before
+anything is sent.
+
 `connect()` builds the same objects as `AuthFI.from_env().agent_from_env()` and
 `.client_credentials_from_env()`; they are the way to pass your own options. Close the project when you are
 done: `af.project.close()` (`await af.project.aclose()` for asyncio).

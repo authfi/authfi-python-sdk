@@ -35,14 +35,17 @@ __all__ = [
     "POP_HEADER",
     "POP_TYP",
     "PROOF_TYP",
+    "OBSERVE_ONLY_CODES",
     "Attestation",
     "Configuration",
     "attest_request",
+    "attestation_headers",
     "attested_token_request",
     "challenge_request",
     "jwk_thumbprint",
     "parse_attestation",
     "parse_challenge",
+    "observe_only_refusal",
     "pop_claims",
     "refusal_with_fix",
 ]
@@ -69,6 +72,21 @@ _REFUSED = (
     "used once or older than 600 seconds, the approved configuration version and digest, and a pod the cluster "
     "does not report running are the causes to check."
 )
+#: What the person reading a refusal can do when the instance asked to be observed (it named no approved version).
+#: The attest route still answers the one opaque 401, so the cause cannot be named, but this is the usual one.
+_OBSERVE_REFUSED = (
+    "This instance asked to be observed, which the platform admits only while a person has an observation window "
+    "open for the agent: ask a person to open one in the console, or set AUTHFI_CONFIG_VERSION and "
+    "AUTHFI_CONFIG_DIGEST. The platform's own reason is on the audit tape (agent.attest.refused)."
+)
+#: The refusals of an instance admitted only to be observed: it names no approved version, so the platform will not
+#: let it ask a person or act for one (403 ``unauthorized_client`` at the CIBA start, ``observe_only_instance`` where
+#: a delegated token is minted).
+OBSERVE_ONLY_CODES = ("observe_only_instance", "unauthorized_client")
+_OBSERVE_ONLY_FIX = (
+    "Approve a configuration version for the agent in the console, then run the instance with "
+    "AUTHFI_CONFIG_VERSION and AUTHFI_CONFIG_DIGEST set."
+)
 _UNAVAILABLE = (
     "The platform could not decide just now. Sign in again: the SDK asks for a new challenge, and a "
     "service-account token that may have been spent needs the pod to have rotated to a fresh one."
@@ -81,6 +99,21 @@ class Configuration:
 
     version: int
     digest: str
+
+    @classmethod
+    def observe(cls) -> Configuration:
+        """No version at all: the instance asks to be admitted while a person has an observation window open.
+
+        It is never the default: an instance that names nothing is refused before anything is sent. The platform
+        admits this only for an agent a person is observing, and an instance admitted this way cannot ask a person
+        or act for one.
+        """
+        return cls(0, "")
+
+    @property
+    def is_observe(self) -> bool:
+        """``True`` for :meth:`observe`: version 0 and an empty digest."""
+        return self.version == 0 and self.digest == ""
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -107,10 +140,15 @@ def jwk_thumbprint(jwk: Mapping[str, Any]) -> str | None:
     return b64url(hashlib.sha256(canonical.encode("ascii")).digest())
 
 
-def refusal_with_fix(response: HttpResponse, what: str) -> AuthFIError:
-    """The platform's refusal, with what to check appended to the two answers the attest route gives."""
+def refusal_with_fix(response: HttpResponse, what: str, *, observe: bool = False) -> AuthFIError:
+    """The platform's refusal, with what to check appended to the two answers the attest route gives.
+
+    ``observe`` is true for an instance that named no version: its 401 is then most likely the closed window.
+    """
     error = api_error(response, what)
-    hint = _REFUSED if response.status == 401 else _UNAVAILABLE if response.status == 503 else None
+    hint = (_OBSERVE_REFUSED if observe else _REFUSED) if response.status == 401 else None
+    if response.status == 503:
+        hint = _UNAVAILABLE
     if hint is None or not isinstance(error, APIError):
         return error
     named = APIError(error.code, f"{error.description + '. ' if error.description else ''}{hint}", response.status)
@@ -160,10 +198,12 @@ def attest_request(api_origin: str, body: Mapping[str, Any]) -> HttpRequest:
     )
 
 
-def parse_attestation(response: HttpResponse, *, agent_id: str, key_thumbprint: str, now: float) -> Attestation:
+def parse_attestation(
+    response: HttpResponse, *, agent_id: str, key_thumbprint: str, now: float, observe: bool = False
+) -> Attestation:
     """The attestation, after the checks a client can make: it names this agent and this instance key."""
     if response.status != 200:
-        raise refusal_with_fix(response, "the instance attestation")
+        raise refusal_with_fix(response, "the instance attestation", observe=observe)
     raw = _data(response, "the instance attestation").get("attestation")
     if not isinstance(raw, str) or not raw:
         raise OAuthError("invalid_response", "the attest route answered no attestation", status=response.status)
@@ -205,6 +245,27 @@ def _attestation_problem(
     return None
 
 
+def observe_only_refusal(error: AuthFIError) -> AuthFIError:
+    """``error`` with the fix appended when it is the refusal of an instance admitted only to be observed.
+
+    The platform answers 403 and says so in words; this adds what to do about it. Any other error is returned as it is.
+    """
+    if error.status != 403 or error.code not in OBSERVE_ONLY_CODES or not isinstance(error, OAuthError | APIError):
+        return error
+    said = (error.description or "").rstrip(". ")
+    if error.code == "unauthorized_client" and "observed" not in said:
+        return error
+    named = type(error)(error.code, f"{said + '. ' if said else ''}{_OBSERVE_ONLY_FIX}", status=error.status)
+    named.request_id = error.request_id
+    named.run_id = error.run_id
+    return named
+
+
+def attestation_headers(attestation: Attestation, pop: str) -> dict[str, str]:
+    """The two headers that present an attestation at the token endpoint: the attestation and the key's proof."""
+    return {ATTESTATION_HEADER: attestation.token.reveal(), POP_HEADER: pop}
+
+
 def attested_token_request(
     token_endpoint: str,
     agent_id: str,
@@ -224,7 +285,7 @@ def attested_token_request(
         form["resource"] = resource
 
     def attempt() -> Attempt:
-        return Attempt(headers={ATTESTATION_HEADER: attestation.token.reveal(), POP_HEADER: pop(), "DPoP": dpop()})
+        return Attempt(headers={**attestation_headers(attestation, pop()), "DPoP": dpop()})
 
     return HttpRequest(
         "POST",

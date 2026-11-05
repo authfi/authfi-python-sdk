@@ -7,6 +7,14 @@ service-account token for the project's origin, ten minutes at most, single use 
 ``kubernetes.io`` pod claims, from a pod that is live; or the bound device key), the approved configuration, a
 proof signed by the instance key, and then at the token endpoint the attestation chain's signature, the proof of
 possession, and a DPoP proof by the key the attestation names. It refuses a bound token presented as Bearer.
+
+On the routes an agent dials itself (the CIBA start, the approval request and its status read) it takes the
+instance's access token as the credential, with no assertion, as agent-identity's ``instcred`` package does: the
+token must be an active agent token of the tenant, sent with the DPoP scheme, and the DPoP proof must be made by the
+key the token is bound to for this method and URL, with ``ath`` of the token. A refusal there is a 401 with the
+DPoP challenge and no body. At the token endpoint the CIBA grant is authenticated like the mint: attestation,
+proof of possession and a DPoP proof. While ``observe_window`` is open an attestation naming no version
+(version 0, empty digest) is admitted, to be observed; such an instance asks no person (403).
 """
 
 from __future__ import annotations
@@ -27,8 +35,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, utils
 
 from authfi.instance import Configuration
-from tests.agent_platform import AgentPlatform
-from tests.support import json_response
+from tests.agent_platform import CIBA, AgentPlatform
+from tests.support import TENANT, form_of, json_response
 
 ATTEST = "/apis/regional/v1/ai/agents/attest"
 CHALLENGE = ATTEST + "/challenge"
@@ -38,6 +46,11 @@ CONFIG_REF = Configuration(7, "sha256:" + "ab" * 32)
 #: The members the attest route reads; any other is a 400.
 ATTEST_FIELDS = {"agent_id", "evidence", "instance_key", "config", "image_digest", "proof"}
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+#: What agent-identity says to an instance admitted only to be observed.
+OBSERVE_ONLY_WORDS = (
+    "this instance was admitted to be observed, with no approved version: it cannot ask a person until a version "
+    "is approved"
+)
 
 
 def thumbprint(jwk: dict[str, Any]) -> str:
@@ -66,12 +79,21 @@ class InstancePlatform(AgentPlatform):
     token_lifetime: int = 900
     refused: list[str] = field(default_factory=list[str])  # the reasons, as the platform's tape would hold them
     unavailable: bool = False  # answer 503 temporarily_unavailable
+    #: A person has an observation window open for the agent: an attestation naming no version is admitted.
+    observe_window: bool = False
+    ciba_starts: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
+    ciba_redeems: list[httpx.Request] = field(default_factory=list[httpx.Request])
+    #: Each request an instance route accepted: it passed the token and holder check.
+    instance_calls: list[httpx.Request] = field(default_factory=list[httpx.Request])
+    holder_refusals: list[str] = field(default_factory=list[str])
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.route("POST", CHALLENGE, self._challenge)
         self.route("POST", ATTEST, self._attest)
         self.route("GET", "/instance/echo", self._echo)
+        self.route("POST", "/apis/regional/v1/ai/auth/backchannel-authorize", self._instance_ciba_start)
+        self.route("POST", "/apis/regional/v1/ai/auth/request-approval", self._instance_request_approval)
 
     # --- helpers ---------------------------------------------------------------------------------
 
@@ -151,9 +173,13 @@ class InstancePlatform(AgentPlatform):
             return problem
         want: dict[str, Any] = body.get("config") or {}
         approved = self.approved_config
-        if want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix("sha256:") != str(
-            approved["digest"]
-        ).removeprefix("sha256:"):
+        observing = want.get("version") == 0 and want.get("digest") == ""
+        if observing:
+            if not self.observe_window:
+                return self.refuse_with("config_not_approved")
+        elif want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix(
+            "sha256:"
+        ) != str(approved["digest"]).removeprefix("sha256:"):
             return self.refuse_with("config_not_approved")
         image = body.get("image_digest")
         if image and not IMAGE_DIGEST.fullmatch(image):
@@ -227,6 +253,8 @@ class InstancePlatform(AgentPlatform):
         }
         if body.get("image_digest"):
             claims["authfi_instance"]["image_digest"] = body["image_digest"]
+        if body.get("config") == {"version": 0, "digest": ""}:
+            claims["authfi_instance"]["observe"] = True
         headers = {
             "typ": "oauth-client-attestation+jwt",
             "kid": self.keys.ed_kid,
@@ -243,10 +271,8 @@ class InstancePlatform(AgentPlatform):
         return self._attested_token(request)
 
     def _attested_token(self, request: httpx.Request) -> httpx.Response:
-        from tests.support import form_of
-
         form = form_of(request)
-        if form.get("grant_type") != "client_credentials" or form.get("client_id") != self.agent_id:
+        if form.get("grant_type") not in ("client_credentials", CIBA) or form.get("client_id") != self.agent_id:
             return self.refuse("invalid_client", 401)
         try:
             attestation = request.headers["oauth-client-attestation"]
@@ -278,14 +304,24 @@ class InstancePlatform(AgentPlatform):
         refusal = self.check_dpop(request, thumbprint(cnf_jwk), access_token=None)
         if refusal is not None:
             return refusal
-        self.minted += 1
         instance = claims["authfi_instance"]
+        observing = bool(instance.get("observe"))
+        if form["grant_type"] == CIBA:
+            self.ciba_redeems.append(request)
+            if observing:
+                return json_response(
+                    {"error": "observe_only_instance", "error_description": OBSERVE_ONLY_WORDS}, status=403
+                )
+            return self._ciba_redeem(form, thumbprint(cnf_jwk))
+        self.minted += 1
+        version: dict[str, Any] = {"cfg_obs": True} if observing else {"cfg_ver": instance["config"]["version"]}
         token = self.agent_token(
             form.get("resource"),
             cnf={"jkt": thumbprint(cnf_jwk)},
             run_id=instance["instance_id"],
             authfi_config=instance.get("config"),
             exp=int(time.time()) + self.token_lifetime,
+            **version,
         )
         return json_response(
             {
@@ -329,6 +365,77 @@ class InstancePlatform(AgentPlatform):
             )
         self.dpop_jtis.add(proof["jti"])
         return None
+
+    # --- the routes an agent dials itself: the instance token is the credential --------------------------
+
+    def _holder_refusal(self, reason: str, nonce: str | None = None) -> httpx.Response:
+        """The 401 the holder check writes: the DPoP challenge, a nonce when that is the remedy, and no body."""
+        self.holder_refusals.append(reason)
+        headers = {"WWW-Authenticate": f'DPoP error="{reason}"'}
+        if nonce:
+            headers["DPoP-Nonce"] = nonce
+        return httpx.Response(401, headers=headers)
+
+    def _instance_agent(self, request: httpx.Request) -> tuple[dict[str, Any] | None, httpx.Response | None]:
+        """The claims of the instance token the request carries, or the refusal; ``(None, None)`` when it has none."""
+        scheme, _, raw = request.headers.get("authorization", "").partition(" ")
+        if not raw:
+            return None, None
+        try:
+            claims: dict[str, Any] = jwt.decode(
+                raw, self.keys.ed_key.public_key(), algorithms=["EdDSA"], options={"verify_aud": False}
+            )
+        except jwt.PyJWTError:
+            return None, self._holder_refusal("agent_token_invalid")
+        if not str(claims.get("sub", "")).startswith("agt_") or claims.get("tenant_id") != TENANT:
+            return None, self._holder_refusal("agent_token_invalid")
+        jkt = str(claims.get("cnf", {}).get("jkt", ""))
+        if jkt and scheme.lower() != "dpop":
+            return None, self._holder_refusal("token_dpop_proof_required")
+        refusal = self.check_dpop(request, jkt, access_token=raw)
+        if refusal is not None:
+            body: dict[str, Any] = json.loads(refusal.content)
+            return None, self._holder_refusal(str(body.get("error")), refusal.headers.get("DPoP-Nonce"))
+        self.instance_calls.append(request)
+        return claims, None
+
+    def _instance_ciba_start(self, request: httpx.Request) -> httpx.Response:
+        claims, refusal = self._instance_agent(request)
+        if refusal is not None:
+            return refusal
+        if claims is None:
+            return self._ciba_start(request)
+        form = form_of(request)
+        if form.get("client_id", claims["sub"]) != claims["sub"] or "client_assertion" in form:
+            return self.refuse("invalid_client", 401)
+        if claims.get("cfg_obs"):
+            return json_response(
+                {"error": "unauthorized_client", "error_description": OBSERVE_ONLY_WORDS}, status=403
+            )
+        self.ciba_starts.append(form)
+        return json_response({"auth_req_id": "req-123", "expires_in": 300, "interval": 5})
+
+    def _instance_request_approval(self, request: httpx.Request) -> httpx.Response:
+        claims, refusal = self._instance_agent(request)
+        if refusal is not None:
+            return refusal
+        if claims is None:
+            return self._request_approval(request)
+        body: dict[str, Any] = json.loads(request.content)
+        if body.get("agent_id") != claims["sub"] or "client_assertion" in body:
+            return self.refuse("unauthorized", 401)
+        return self._approval_accepted(body)
+
+    def _read_approval(self, request: httpx.Request) -> httpx.Response:
+        claims, refusal = self._instance_agent(request)
+        if refusal is not None:
+            return refusal
+        if claims is None:
+            return super()._read_approval(request)
+        self.approval_reads += 1
+        if isinstance(self.approval_status, int):
+            return self.refuse("forbidden", self.approval_status)
+        return self._approval_answer(request)
 
     def _echo(self, request: httpx.Request) -> httpx.Response:
         """A resource that takes a DPoP-bound token only (C4)."""
