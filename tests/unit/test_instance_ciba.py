@@ -473,3 +473,15 @@ def test_an_observe_refusal_keeps_its_code_status_and_ids_and_gains_the_fix(kind
     assert kept == ("observe_only_instance", 403, "req-1", "run-1")
     assert str(named).count("admitted to be observed") == 1
     assert "Approve a configuration version" in str(named)
+
+
+def test_an_instance_token_is_never_given_to_an_address_off_the_project(
+    platform: InstancePlatform, token_file: Path
+) -> None:
+    """The instance's token and a proof of its key are made only for AuthFI's own addresses."""
+    agent = connect(platform, token_file)
+    with pytest.raises(AuthFIError):
+        agent.headers("POST", "https://evil.example/ciba")
+    good = agent.headers("POST", platform.issuer + START)
+    assert good["Authorization"].startswith("DPoP ")
+    agent.project.close()
