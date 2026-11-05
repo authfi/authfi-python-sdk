@@ -3,7 +3,7 @@
 All notable changes to this package. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — 0.2.0
+## [0.2.0]
 
 The SDK is rebuilt on one core that every area shares: people signing in, APIs verifying tokens,
 machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md).
@@ -25,7 +25,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   LangSmith's OpenTelemetry bridge now makes a run's span from the run's UUID, so the id is known when the run
   starts.
 - A model call that goes to the AI gateway with no DPoP proof is said once in the log: the gateway refuses such a
-  call once its model proof check (`MCP_MODEL_PROOF_CHECK=enforce`) is on, unless the workload is caged.
+  call once it enforces proofs on model calls, unless the workload is caged.
   `authfi.gateway.learn_nonce_from` keeps the nonce a gateway asked for in an answer the caller cannot resend.
 - CrewAI's model calls answer the gateway's DPoP nonce: the nonce is kept and the provider SDK is told to try
   again, where a nonce challenge was reported as a refused token and never learned.
@@ -77,7 +77,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   request id on every error.
 - `resolve_api_origin()` on both clients, for building a machine-API URL on a project with a custom domain.
 - Typed errors with stable codes (`AuthFIError.code`), including the platform's token refusal
-  codes, generated from the AuthFI kernel.
+  codes.
 - `Secret`, which does not print, pickle or serialise a credential.
 - `TokenSource` and `AsyncTokenSource`: one interface for every credential, each refusing to be
   sent to an origin it was not made for.
@@ -179,7 +179,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   replaces them.
 - Verifying a token without an audience, or without a `kid`, and accepting a JWT that is not an
   access token. These are intended breaks; see the migration guide.
-- `AgentAuth`'s default project (`https://platform.authfi.io`): an agent's project must be named.
+- `AgentAuth` no longer has a default project: an agent's project must be named.
 - CIBA and token exchange return a `DelegatedToken`, not the token response `dict`, which put a
   person's token in a printable value.
 - The single-module `authfi.py` layout. The names it exported are kept at the top level.
