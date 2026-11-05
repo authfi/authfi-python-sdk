@@ -44,8 +44,21 @@ def test_opting_out_of_dpop_warns_once_at_warning_level(
     assert "sender-constrained" in warned[0].getMessage()
 
 
-def test_a_bound_agent_makes_no_bearer_warning(gw: AgentGateway, key: AgentKey, caplog: pytest.LogCaptureFixture) -> None:
+def test_a_bound_agent_makes_no_bearer_warning(
+    gw: AgentGateway, key: AgentKey, caplog: pytest.LogCaptureFixture
+) -> None:
     """The control leg: the default agent binds its token and has nothing to warn about."""
     with AuthFI(gw.issuer) as af, caplog.at_level(logging.INFO):
         af.agent(AGENT, key).token(force=True)
     assert bearer_warnings(caplog) == []
+
+
+def test_a_project_whose_algorithm_this_process_cannot_sign_warns_once(caplog: pytest.LogCaptureFixture) -> None:
+    """The other cause: the project accepts no DPoP algorithm this process has, so the token stays Bearer."""
+    with caplog.at_level(logging.INFO), AgentGateway(nonce=True, dpop_algs=("PS256",)) as gateway:
+        with AuthFI(gateway.issuer) as af:
+            agent = af.agent(AGENT, AgentKey.generate(kid="k1"))
+            agent.token(force=True)
+            agent.token(force=True)
+    assert len(bearer_warnings(caplog)) == 1, [r.getMessage() for r in caplog.records]
+    assert "stay Bearer" in bearer_warnings(caplog)[0].getMessage()
