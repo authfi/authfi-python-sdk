@@ -239,6 +239,7 @@ executionEnvironments = [
 target-version = "py311"
 line-length = 120
 src = ["src", "tests", "scripts"]
+extend-exclude = ["runner/scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "UP", "S", "D", "ANN", "ASYNC", "PT", "RUF", "TID", "I"]
@@ -257,6 +258,7 @@ ignore = [
 "tests/**" = ["D", "S101", "ANN", "PT011", "PT018"]
 "tests/compat/test_main_*.py" = ["PT009", "PT027"]  # main's unittest style, kept as written
 "scripts/**" = ["S603", "S607"]
+"runner/**" = ["D", "S101", "S606", "ANN", "T201", "INP001", "PT009", "PT027", "UP031"]  # unittest style; execv hands the pod to the script
 "examples/**" = ["T201", "INP001"]
 
 [tool.ruff.lint.flake8-tidy-imports]
