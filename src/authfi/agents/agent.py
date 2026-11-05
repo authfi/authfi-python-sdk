@@ -297,6 +297,7 @@ class _AgentBase:
         self._log = project.logger
         #: The key of the token whose headers were last made: what a gateway call signs its proof with.
         self._last_key: _dpop.DPoPKey | None = None
+        self._bearer_warned = False
 
     def _refuse_customer_resource(self, project: AuthFI | AsyncAuthFI, send_to: Sequence[str]) -> None:
         """The agent's own token is for AuthFI; a customer API's token is ``for_resource(...)``.
@@ -337,12 +338,27 @@ class _AgentBase:
         Only a token for AuthFI itself is bound. One for a customer's API is a Bearer token: that API verifies it,
         and an API verifying with this SDK does not take a proof.
         """
-        if not self.dpop or not self._project_ref.names_authfi(resource):
+        if not self._project_ref.names_authfi(resource):
+            return None
+        if not self.dpop:
+            self._warn_bearer("dpop=False: this agent's tokens for AuthFI are Bearer")
             return None
         key = _dpop.key_for(metadata.dpop_signing_alg_values_supported)
         if key is None:
-            self._log.info("the project accepts no DPoP algorithm this process has: agent tokens stay Bearer")
+            self._warn_bearer("the project accepts no DPoP algorithm this process has: agent tokens stay Bearer")
         return key
+
+    def _warn_bearer(self, why: str) -> None:
+        """Say once, at warning level, that this agent's token is not bound to a key.
+
+        A project can require sender-constrained agent tokens, and a new project does: the platform then refuses to
+        mint an unbound token, so the fallback that used to be silent is a failure waiting for the day the project
+        moves. The first sight of it is a warning, not an INFO line nobody reads.
+        """
+        if self._bearer_warned:
+            return
+        self._bearer_warned = True
+        self._log.warning("%s. A project that requires sender-constrained agent tokens will refuse it.", why)
 
     def _signer(self, key: _dpop.DPoPKey | None) -> Callable[[str, str, str | None], str] | None:
         return _dpop.signer(key, self._clock.time) if key is not None else None
