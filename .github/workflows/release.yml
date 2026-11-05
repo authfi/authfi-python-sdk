@@ -36,7 +36,7 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a version tag (vMAJOR.MINOR.PATCH)"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
           v="${TAG#v}"
-          grep -Eq "^## \[?${v//./\.}\]?( |$)" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $v"; exit 1; }
+          grep -Eq "^## \[?${v//./\\.}\]?( |$)" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $v"; exit 1; }
       - uses: astral-sh/setup-uv@3259c6206f993105e3a61b142c2d97bf4b9ef83d # v7.1.0
         with:
           python-version: "3.12"
