@@ -225,7 +225,7 @@ def test_an_instance_opens_and_reads_an_approval_with_its_token(platform: Instan
     assert approval.approval_id == "apr-1"
     opened = platform.approvals_opened[0]
     assert "client_assertion" not in opened and opened["agent_id"] == AGENT
-    sent = [r for r in platform.instance_calls if r.url.path == APPROVE][0]
+    sent = next(r for r in platform.instance_calls if r.url.path == APPROVE)
     token = agent.token()
     assert sent.headers["authorization"] == "DPoP " + token
     proof = claims_of(sent.headers["dpop"])
