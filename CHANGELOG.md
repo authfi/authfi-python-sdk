@@ -172,6 +172,16 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Changed
 
+- The AI gateway is its own door, `<issuer>/llm`. `model_base_url("anthropic")` is `<issuer>/llm` and `("openai")`
+  is `<issuer>/llm/v1` (were `<issuer>/mcp` and `<issuer>/mcp/v1`), the red team sends to `/llm/v1/...`, and
+  `Gateway.llm_url` names the door. Each door takes only a token requested for it, so a gateway now holds a second
+  token, requested with `resource=<issuer>/llm` on the same key (one run) and cached apart from the tool token: model
+  calls carry it, tool calls and the cloud credential calls carry the other, and neither goes to the other door or to
+  a customer's API. A credential that cannot make a model token (a token an agent holds for a person) is refused at
+  `/llm` instead of being sent there. A task's root is the one token both doors take.
+- Cloud credentials are issued by the `cloud.credentials` tool, a `tools/call` on `<issuer>/mcp`, and the secret is
+  redeemed once at `POST <issuer>/mcp/cloud/credentials/{credential_id}/secret`. The `POST /mcp/v1/cloud/credentials`
+  door is gone; `Gateway.cloud_credentials` and `agent.cloud.credentials` are called as before.
 - Python 3.11 or later is required (was 3.8).
 - The package is configured by issuer. `tenant`, `api_key`, `api_url` and `base_domain` are no
   longer how a project is named.

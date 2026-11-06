@@ -163,6 +163,10 @@ class Task(_TaskState, TokenSource):
         super().__init__(agent, response, key, time)
         self._gateway: Gateway | None = None
 
+    def for_llm(self, llm_url: str) -> Task:
+        """The task itself: a mandate root is the one token both doors accept, as one task has one ledger."""
+        return self
+
     def gateway(self) -> Gateway:
         """The gateways (tools, models, cloud credentials) with this task as the credential."""
         if self._gateway is None:
@@ -199,6 +203,10 @@ class AsyncTask(_TaskState, AsyncTokenSource):
     ) -> None:
         super().__init__(agent, response, key, time)
         self._gateway: AsyncGateway | None = None
+
+    def for_llm(self, llm_url: str) -> AsyncTask:
+        """See :meth:`Task.for_llm`."""
+        return self
 
     def gateway(self) -> AsyncGateway:
         """See :meth:`Task.gateway`."""

@@ -46,6 +46,7 @@ af = AuthFI.from_env()                    # AUTHFI_ISSUER
 agent = af.agent("agt_...", key)          # or af.agent_from_env()
 
 agent.token()                             # its own token, for the AuthFI gateway (<issuer>/mcp)
+agent.for_resource(af.issuer + "/llm")    # its token for the model door: a second token, the same key
 agent.capabilities()                      # the capability names it was granted
 httpx.Client(auth=agent.httpx_auth())     # the current token on every request to AuthFI
 ```
@@ -65,7 +66,7 @@ orders = agent.for_resource("api_orders", send_to=["https://api.example.com"])
 Nothing to write. The first time the agent asks for its token, it proves it holds a key that lives
 only in this process (Ed25519, or P-256 where the runtime or the project has no Ed25519), and the
 platform binds the token to that key (`cnf.jkt`, `token_type` `DPoP`). From then on every call the
-agent makes to the gateway, `/mcp`, `/otlp/v1/traces` and the cloud credential door, is
+agent makes to the gateway, `/mcp` (tools and cloud credentials), `/otlp/v1/traces` and `/llm`, is
 `Authorization: DPoP <token>` with a new proof for that request. A stolen token is of no use without
 the key, and a replayed proof is refused.
 

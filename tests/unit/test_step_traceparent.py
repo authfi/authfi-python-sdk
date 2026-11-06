@@ -26,7 +26,7 @@ from authfi._protocol.ids import (
 from authfi.agents import AgentAuth
 from authfi.gateway import Gateway
 from tests.agent_platform import AGENT, AgentPlatform
-from tests.support import FakeClock, json_response
+from tests.support import FakeClock, fixture_json, json_response
 
 TRACE = "0af7651916cd43dd8448eb211c80319c"
 SPAN = "b7ad6b7169203331"
@@ -243,9 +243,10 @@ def test_cloud_credentials_are_asked_for_by_the_step_executing(agent: AgentAuth,
 
     def door(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return json_response({"data": {"approval_id": "7f1c2a9e-5d1b-4f3a-9a77-2b0c8e1d4f00"}}, status=202)
+        held = fixture_json("mcp/hold-result.json")
+        return json_response({"jsonrpc": "2.0", "id": 1, "result": held})
 
-    platform.route("POST", "/mcp/v1/cloud/credentials", door)
+    platform.route("POST", "/mcp", door)
     gateway = agent.gateway()
     gateway.cloud_credentials("prod", "deployer")
     assert seen[0].headers["traceparent"].endswith("-00")  # no step: the transport's own fresh value

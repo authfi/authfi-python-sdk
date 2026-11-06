@@ -305,7 +305,7 @@ class ModelProxy:
         if (method, route) not in ROUTES or not _QUERY.fullmatch(query):
             self._gateway.project.logger.info("the model proxy does not forward %s %r", method, route[:64])
             raise _BadRequest(404, "not found")
-        return self._gateway.mcp_url + route + ("?" + query if query else "")
+        return self._gateway.llm_url + route + ("?" + query if query else "")
 
     async def _forward(
         self, writer: asyncio.StreamWriter, method: str, url: str, headers: list[tuple[str, str]], body: bytes

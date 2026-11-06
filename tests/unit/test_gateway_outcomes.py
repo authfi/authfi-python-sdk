@@ -21,7 +21,7 @@ from authfi import (
     ToolOutcome,
     ToolRefused,
 )
-from authfi._protocol.gateway import MAX_CLOUD_SECONDS, cloud_request, read_result
+from authfi._protocol.gateway import MAX_CLOUD_SECONDS, cloud_issue_request, read_result
 from authfi.agents import AgentAuth
 from tests.agent_platform import AGENT, AgentPlatform
 from tests.support import FakeClock, fixture_json, json_response
@@ -139,19 +139,21 @@ def test_only_an_error_result_can_be_a_hold() -> None:
 def test_cloud_credentials_cannot_be_asked_for_longer_than_the_platform_allows() -> None:
     assert MAX_CLOUD_SECONDS == 900
     with pytest.raises(ConfigurationError, match="1 to 900 seconds"):
-        cloud_request("https://x", {}, account="a", role="r", expires_in=901, session_policy=None, approval_id=None)
+        cloud_issue_request(
+            "https://x", {}, account="a", role="r", expires_in=901, session_policy=None, approval_id=None
+        )
     with pytest.raises(ConfigurationError, match="1 to 900 seconds"):
-        cloud_request("https://x", {}, account="a", role="r", expires_in=0, session_policy=None, approval_id=None)
-    cloud_request("https://x", {}, account="a", role="r", expires_in=900, session_policy=None, approval_id=None)
+        cloud_issue_request("https://x", {}, account="a", role="r", expires_in=0, session_policy=None, approval_id=None)
+    cloud_issue_request("https://x", {}, account="a", role="r", expires_in=900, session_policy=None, approval_id=None)
 
 
-def test_only_201_and_202_are_an_answer_from_the_cloud_door(agent: AgentAuth, platform: AgentPlatform) -> None:
+def test_only_a_200_is_an_answer_from_the_cloud_tool(agent: AgentAuth, platform: AgentPlatform) -> None:
     platform.route(
-        "POST", "/mcp/v1/cloud/credentials", json_response({"data": {"credential_id": "c", "provider": "aws"}}, 200)
+        "POST", "/mcp", json_response({"jsonrpc": "2.0", "id": 1, "result": {"content": [], "isError": False}}, 201)
     )
     with pytest.raises(AuthFIError) as caught:
         agent.gateway().cloud_credentials("prod", "admin")
-    assert caught.value.status == 200
+    assert caught.value.status == 201
 
 
 def custom_domain(key: AgentKey) -> AgentPlatform:
@@ -166,17 +168,26 @@ def hosts(platform: AgentPlatform, method: str, path: str) -> list[str]:
     return [r.url.host for r in platform.calls(method, path)]
 
 
-def test_a_cold_agent_on_a_custom_domain_asks_the_machine_api_host(key: AgentKey, clock: FakeClock) -> None:
+def test_a_cold_agent_on_a_custom_domain_asks_for_cloud_credentials_at_the_issuer(
+    key: AgentKey, clock: FakeClock
+) -> None:
     platform = custom_domain(key)
+    handle = {"credential_id": "c", "account": "prod", "role": "admin", "scope": "s"}
     platform.route(
         "POST",
-        "/mcp/v1/cloud/credentials",
-        json_response({"data": {"credential_id": "c", "provider": "aws", "access_key_id": "AKIA"}}, 201),
+        "/mcp",
+        json_response({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": handle, "isError": False}}),
+    )
+    platform.route(
+        "POST",
+        "/mcp/cloud/credentials/c/secret",
+        json_response({"data": {"credential_id": "c", "provider": "aws", "access_key_id": "AKIA"}}),
     )
     with AuthFI(platform.issuer, http_client=platform.client(), clock=clock) as af:
         outcome = af.agent(AGENT, key).gateway().cloud_credentials("prod", "admin")
     assert outcome.kind == "issued"
-    assert hosts(platform, "POST", "/mcp/v1/cloud/credentials") == ["acme.authfi.io"]
+    assert hosts(platform, "POST", "/mcp") == ["login.acme.com"]
+    assert hosts(platform, "POST", "/mcp/cloud/credentials/c/secret") == ["login.acme.com"]
 
 
 def test_a_cold_agent_on_a_custom_domain_freezes_actions_at_the_machine_api_host(
@@ -192,16 +203,20 @@ def test_a_cold_agent_on_a_custom_domain_freezes_actions_at_the_machine_api_host
 
 async def test_a_cold_async_agent_on_a_custom_domain_asks_the_machine_api_host(key: AgentKey, clock: FakeClock) -> None:
     platform = custom_domain(key)
+    handle = {"credential_id": "c", "account": "prod", "role": "admin", "scope": "s"}
     platform.route(
         "POST",
-        "/mcp/v1/cloud/credentials",
-        json_response({"data": {"credential_id": "c", "provider": "aws"}}, 201),
+        "/mcp",
+        json_response({"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": handle, "isError": False}}),
+    )
+    platform.route(
+        "POST", "/mcp/cloud/credentials/c/secret", json_response({"data": {"credential_id": "c", "provider": "aws"}})
     )
     async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
         agent = aaf.agent(AGENT, key)
         await agent.gateway().cloud_credentials("prod", "admin")
         await agent.transaction_token("refund")
-    assert hosts(platform, "POST", "/mcp/v1/cloud/credentials") == ["acme.authfi.io"]
+    assert hosts(platform, "POST", "/mcp") == ["login.acme.com"]
     assert hosts(platform, "POST", "/apis/regional/v1/ai/auth/transaction-token") == ["acme.authfi.io"]
 
 

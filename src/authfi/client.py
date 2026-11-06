@@ -121,8 +121,8 @@ class _Project:
     def names_authfi(self, value: str | None) -> bool:
         """``True`` when ``value`` (an audience or a resource) is AuthFI itself.
 
-        That is no value at all, a URL under the issuer or the API origin (``<issuer>/mcp``), or one
-        of AuthFI's own applications.
+        That is no value at all, a URL under the issuer or the API origin (``<issuer>/mcp``, the tool
+        gateway, or ``<issuer>/llm``, the model gateway), or one of AuthFI's own applications.
         """
         if value is None:
             return True
@@ -394,7 +394,7 @@ class AuthFI(LegacyAuthFIMixin, _Project):
     ) -> TokenVerifier:
         """A verifier for access tokens issued to ``audience`` (your API's client id, or your front ends').
 
-        ``audience`` is required and is never AuthFI's own (the issuer, ``<issuer>/mcp``, the
+        ``audience`` is required and is never AuthFI's own (the issuer, ``<issuer>/mcp``, ``<issuer>/llm``, the
         console). Set ``expected_tenant_id`` to pin the tenant tokens must name.
         """
         return TokenVerifier(self, audience, expected_tenant_id=expected_tenant_id, leeway=leeway)
@@ -457,7 +457,8 @@ class AuthFI(LegacyAuthFIMixin, _Project):
         """An AI agent of this project, authenticating with ``key`` (an :class:`~authfi.AgentKey`).
 
         ``resource`` is what its own token is for, and must be AuthFI's own: ``<issuer>/mcp`` (the
-        AuthFI gateway) when absent. For a customer's API, use ``agent.for_resource(resource,
+        AuthFI tool gateway) when absent. Its token for model calls is a second one, for ``<issuer>/llm``,
+        which the gateway asks for by itself on the same key. For a customer's API, use ``agent.for_resource(resource,
         send_to=[...])``: the agent sends its own token to AuthFI's endpoints, so it never holds a
         token for another API by default.
 
