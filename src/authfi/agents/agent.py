@@ -24,7 +24,7 @@ import asyncio
 import math
 import threading
 import warnings
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -327,7 +327,7 @@ class _AgentBase:
         return error
 
     @contextmanager
-    def _explaining(self) -> Iterator[None]:
+    def _explaining(self) -> Generator[None]:
         """Raise what :meth:`_explain` makes of a platform refusal inside the block."""
         try:
             yield
