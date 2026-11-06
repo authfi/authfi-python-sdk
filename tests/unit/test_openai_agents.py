@@ -83,7 +83,7 @@ async def test_the_model_carries_the_agents_token_and_no_openai_key(
 
     assert result.final_output == "Done."
     (request,) = fake.model_requests()
-    assert request["path"] == "/mcp/v1/messages"
+    assert request["path"] == "/llm/v1/messages"
     assert request["headers"]["authorization"] == "Bearer tok-minted-1"
     assert request["headers"].get("x-api-key") in (None, "authfi-sets-the-token-per-request")
 
@@ -96,7 +96,7 @@ async def test_an_openai_compatible_model_uses_the_gateways_client(
 
     assert result.final_output == "Done."
     chat = [r for r in fake.requests if r["path"].endswith("/v1/chat/completions")]
-    assert chat[0]["path"] == "/mcp/v1/chat/completions"
+    assert chat[0]["path"] == "/llm/v1/chat/completions"
     assert chat[0]["headers"]["authorization"] == "Bearer tok-minted-1"
 
 

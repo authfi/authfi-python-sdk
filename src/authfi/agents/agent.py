@@ -7,6 +7,7 @@ code as a machine client's; an API verifies it with the same verifier as a perso
 
     agent = af.agent("agt_123", AgentKey.from_file("/run/secrets/agent.key", kid="k1"))
     agent.token()                                   # its own token, for <issuer>/mcp by default
+    agent.for_resource(af.issuer + "/llm")          # its token for the model door: a second token, the same key
 
     request = agent.request_user_token("priya@acme.com", binding_message="Refund order 4411")
     as_priya = agent.await_user_token(request)      # the person approved on their own device
@@ -733,7 +734,9 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
     """An AI agent, for blocking code. Make it with :meth:`authfi.AuthFI.agent`.
 
     It is a :class:`~authfi.TokenSource` for its own token (``<issuer>/mcp`` unless ``resource``
-    names another), so the gateway helpers and framework adapters take it directly.
+    names another), so the gateway helpers and framework adapters take it directly. Model calls go to
+    ``<issuer>/llm``, which takes only a token requested with that resource: the gateway asks for it
+    through :meth:`for_llm`, signed with the same key as the tool token, so the run stays one.
     """
 
     @overload
@@ -902,6 +905,10 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         if not resource or not resource.strip():
             raise ConfigurationError("resource is required")
         return _AgentResource(self, resource.strip(), self._check_destination_args(resource.strip(), send_to))
+
+    def for_llm(self, llm_url: str) -> TokenSource:
+        """The agent's token for the model door ``llm_url``: its own resource, cached apart from the tool token."""
+        return self.for_resource(llm_url)
 
     # --- acting for a person -------------------------------------------------------------------------
 
@@ -1409,6 +1416,10 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         if not resource or not resource.strip():
             raise ConfigurationError("resource is required")
         return _AsyncAgentResource(self, resource.strip(), self._check_destination_args(resource.strip(), send_to))
+
+    def for_llm(self, llm_url: str) -> AsyncTokenSource:
+        """See :meth:`AgentAuth.for_llm`."""
+        return self.for_resource(llm_url)
 
     async def request_user_token(
         self,

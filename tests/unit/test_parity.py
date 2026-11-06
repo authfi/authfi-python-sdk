@@ -76,6 +76,7 @@ PLAIN_ON_BOTH = {
     "client_credentials",
     "client_credentials_from_env",
     "crewai",
+    "for_llm",
     "for_resource",
     "gateway",
     "governance_of",

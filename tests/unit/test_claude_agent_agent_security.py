@@ -120,7 +120,7 @@ async def test_claude_codes_model_calls_and_the_tools_are_one_run_of_the_key(
 
     assert answer.status_code == 200
     assert b"event: message_start" in answer.content  # the stream came through
-    (model,) = [call for call in gw.run_calls if call[0] == "/mcp/v1/messages"]
+    (model,) = [call for call in gw.run_calls if call[0] == "/llm/v1/messages"]
     tools = [call for call in gw.run_calls if call[0] == "/mcp"]
     assert tools
     assert {run for _, run, _ in [model, *tools]} == {model[1]}  # one run, the tools' and the model's
@@ -136,7 +136,7 @@ async def test_the_gateway_never_sees_what_claude_code_sent_as_its_key(
 
     await _model_call(base_url)
 
-    (request,) = [r for r in gw.requests if r["path"] == "/mcp/v1/messages"]
+    (request,) = [r for r in gw.requests if r["path"] == "/llm/v1/messages"]
     assert "x-api-key" not in request["headers"]
     assert CLAUDE_CODES_KEY not in str(request["headers"])
     assert request["headers"]["authorization"].startswith("DPoP ")
@@ -310,7 +310,7 @@ async def test_a_chunked_model_call_is_forwarded(gw: AgentGateway, project: Asyn
     answer = await _raw(host, port, request)
 
     assert answer.startswith(b"HTTP/1.1 200")
-    assert [r for r in gw.run_calls if r[0] == "/mcp/v1/messages"]
+    assert [r for r in gw.run_calls if r[0] == "/llm/v1/messages"]
 
 
 async def test_a_head_that_never_ends_is_closed(
@@ -396,7 +396,7 @@ async def test_the_callers_user_agent_is_the_calls_client(
         await http.post(base_url + "/v1/messages", headers={"User-Agent": agent}, json=MODEL_REQUEST)
         await http.post(base_url + "/v1/messages", headers={"User-Agent": "authfi-loopback"}, json=MODEL_REQUEST)
 
-    seen = [r["headers"]["user-agent"] for r in gw.requests if r["path"] == "/mcp/v1/messages"]
+    seen = [r["headers"]["user-agent"] for r in gw.requests if r["path"] == "/llm/v1/messages"]
     assert seen == [agent, "authfi-loopback"]
 
 

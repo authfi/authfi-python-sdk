@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import jwt
 import pytest
 
 from authfi import (
@@ -127,8 +128,8 @@ def test_a_model_written_approval_id_is_removed_and_logged(agent: AgentAuth, cap
 def test_model_base_urls(agent: AgentAuth, platform: AgentPlatform) -> None:
     gateway = agent.gateway()
     assert gateway.mcp_url == platform.issuer + "/mcp"
-    assert gateway.model_base_url("anthropic") == platform.issuer + "/mcp"
-    assert gateway.model_base_url("openai") == platform.issuer + "/mcp/v1"
+    assert gateway.model_base_url("anthropic") == platform.issuer + "/llm"
+    assert gateway.model_base_url("openai") == platform.issuer + "/llm/v1"
     with pytest.raises(ConfigurationError):
         gateway.model_base_url("gemini")  # type: ignore[arg-type]
 
@@ -209,7 +210,7 @@ def test_token_refusal_reads_a_provider_sdks_httpx2_answer() -> None:
     import anthropic
     import httpx2
 
-    request = httpx2.Request("POST", "https://acme.authfi.io/mcp/v1/messages")
+    request = httpx2.Request("POST", "https://acme.authfi.io/llm/v1/messages")
     response = httpx2.Response(
         401,
         request=request,
@@ -221,7 +222,7 @@ def test_token_refusal_reads_a_provider_sdks_httpx2_answer() -> None:
     assert found is not None
     assert found.challenge == 'Bearer error="invalid_token"'
     assert found.request_id == "afr-answer"
-    assert "acme.authfi.io/mcp/v1/messages" in str(found)
+    assert "acme.authfi.io/llm/v1/messages" in str(found)
 
 
 def test_token_refusal_ignores_other_statuses_and_bare_responses() -> None:
@@ -322,34 +323,52 @@ def test_a_client_for_another_httpx_package(agent: AgentAuth) -> None:
 
 # --- cloud credentials -----------------------------------------------------------------------------
 
+REDEEM = "/mcp/cloud/credentials/{}/secret"
+HANDLE: dict[str, Any] = {
+    "credential_id": "c1",
+    "account": "prod",
+    "role": "deployer",
+    "expires_at": "2026-10-20T11:00:00Z",
+    "scope": "cloud_role:deployer",
+}
+SECRET: dict[str, Any] = {
+    "credential_id": "c1",
+    "provider": "aws",
+    "access_key_id": "AKIA1",
+    "secret_access_key": "MARKER-SECRET",
+    "session_token": "MARKER-SESSION",
+    "expiration": "2026-10-20T11:00:00Z",
+    "expires_in": 900,
+}
 
-def cloud_route(platform: AgentPlatform, status: int, body: dict[str, Any]) -> list[dict[str, Any]]:
+
+def tool_answer(result: dict[str, Any], status: int = 200) -> httpx.Response:
+    return json_response({"jsonrpc": "2.0", "id": 1, "result": result}, status=status)
+
+
+def handle_result(handle: dict[str, Any] = HANDLE) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(handle)}], "structuredContent": handle, "isError": False}
+
+
+def issue_route(platform: AgentPlatform, answer: httpx.Response) -> list[dict[str, Any]]:
+    """``cloud.credentials`` is a ``tools/call`` on ``/mcp``; the bodies it was called with are kept."""
     seen: list[dict[str, Any]] = []
 
     def door(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        return json_response(body, status=status)
+        return httpx.Response(answer.status_code, headers=answer.headers, content=answer.content)
 
-    platform.route("POST", "/mcp/v1/cloud/credentials", door)
+    platform.route("POST", "/mcp", door)
     return seen
 
 
-def test_cloud_credentials_issued(agent: AgentAuth, platform: AgentPlatform) -> None:
-    seen = cloud_route(
-        platform,
-        201,
-        {
-            "data": {
-                "credential_id": "c1",
-                "provider": "aws",
-                "access_key_id": "AKIA1",
-                "secret_access_key": "MARKER-SECRET",
-                "session_token": "MARKER-SESSION",
-                "expiration": "2026-10-20T11:00:00Z",
-                "expires_in": 900,
-            }
-        },
-    )
+def redeem_route(platform: AgentPlatform, credential_id: str, answer: httpx.Response) -> None:
+    platform.route("POST", REDEEM.format(credential_id), answer)
+
+
+def test_cloud_credentials_issued_by_a_tool_call_and_redeemed_once(agent: AgentAuth, platform: AgentPlatform) -> None:
+    seen = issue_route(platform, tool_answer(handle_result()))
+    redeem_route(platform, "c1", json_response({"data": SECRET}))
     outcome = agent.gateway().cloud_credentials("prod", "deployer", session_policy={"Version": "2012-10-17"})
     assert outcome.kind == "issued"
     credential = outcome.credential
@@ -357,45 +376,112 @@ def test_cloud_credentials_issued(agent: AgentAuth, platform: AgentPlatform) -> 
     assert credential.access_key_id == "AKIA1"
     assert credential.secret_access_key == Secret("MARKER-SECRET")
     assert "MARKER" not in repr(credential)
-    assert seen[0] == {
-        "account": "prod",
-        "role": "deployer",
-        "duration_seconds": 900,
-        "session_policy": {"Version": "2012-10-17"},
+    assert seen[0]["method"] == "tools/call"
+    assert seen[0]["params"] == {
+        "name": "cloud.credentials",
+        "arguments": {
+            "account": "prod",
+            "role": "deployer",
+            "duration_seconds": 900,
+            "session_policy": {"Version": "2012-10-17"},
+        },
     }
-    assert len(platform.calls("POST", "/mcp/v1/cloud/credentials")) == 1
+    assert len(platform.calls("POST", "/mcp")) == 1
+    assert len(platform.calls("POST", REDEEM.format("c1"))) == 1
+    assert platform.calls("POST", "/mcp/v1/cloud/credentials") == []  # the issuing door is gone
+
+
+def test_the_issue_and_the_redeem_carry_the_tool_token_never_the_model_token(
+    agent: AgentAuth, platform: AgentPlatform
+) -> None:
+    issue_route(platform, tool_answer(handle_result()))
+    redeem_route(platform, "c1", json_response({"data": SECRET}))
+    agent.gateway().cloud_credentials("prod", "deployer")
+    for request in (platform.calls("POST", "/mcp")[0], platform.calls("POST", REDEEM.format("c1"))[0]):
+        token = request.headers["authorization"].split(" ", 1)[1]
+        assert jwt.decode(token, options={"verify_signature": False})["aud"] == platform.issuer + "/mcp"
 
 
 def test_cloud_credentials_held_then_retried_with_the_approval(agent: AgentAuth, platform: AgentPlatform) -> None:
-    seen = cloud_route(platform, 202, {"data": {"status": "approval_required", "approval_id": "apr-9", "message": "m"}})
+    issue_route(platform, tool_answer(fixture_json("mcp/hold-result.json")))
     outcome = agent.gateway().cloud_credentials("prod", "admin")
     assert outcome.kind == "approval_required"
-    assert outcome.approval_id == "apr-9"
-    cloud_route(
-        platform, 201, {"data": {"credential_id": "c2", "provider": "gcp", "access_token": "T", "expires_in": 600}}
-    )
-    issued = agent.gateway().cloud_credentials("prod", "admin", approval_id="apr-9")
+    assert outcome.approval_id == HOLD_ID
+    assert platform.calls("POST", REDEEM.format("c1")) == []  # nothing was issued, so nothing is redeemed
+    seen = issue_route(platform, tool_answer(handle_result({**HANDLE, "credential_id": "c2", "role": "admin"})))
+    redeem_route(platform, "c2", json_response({"data": {"provider": "gcp", "access_token": "T", "expires_in": 600}}))
+    issued = agent.gateway().cloud_credentials("prod", "admin", approval_id=HOLD_ID)
+    assert seen[0]["params"]["arguments"][APPROVAL_ARGUMENT] == HOLD_ID
     assert issued.credential is not None
     assert issued.credential.provider == "gcp"
+    assert issued.credential.credential_id == "c2"
     assert issued.credential.expires_at is not None
-    del seen
+
+
+def refusal_result(code: str) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": f"Refused ({code}): no grant."}],
+        "isError": True,
+        "_meta": {"io.authfi/refusal": {"code": code, "reason": "no grant"}},
+    }
 
 
 @pytest.mark.parametrize(
-    ("status", "body", "error"),
+    ("answer", "error", "code"),
     [
-        (403, {"error": "ECLOUD004", "error_description": "role not granted"}, APIError),
-        (401, {"error": "unauthorized"}, GatewayTokenRefused),
-        (202, {"data": {"status": "approval_required"}}, APIError),
-        (201, {}, APIError),
+        (tool_answer(refusal_result("ECLOUDCRED003")), APIError, "ECLOUDCRED003"),
+        (tool_answer(refusal_result("ECLOUDCRED011")), APIError, "ECLOUDCRED011"),
+        (tool_answer({"content": [{"type": "text", "text": "boom"}], "isError": True}), APIError, "invalid_response"),
+        (tool_answer({"content": [], "isError": False}), APIError, "invalid_response"),
+        (
+            json_response({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "tool call failed"}}),
+            APIError,
+            "rpc_error",
+        ),
+        (json_response({"error": "unauthorized"}, status=401), GatewayTokenRefused, None),
+        (
+            json_response({"error": "ECLOUDCRED010", "error_description": "not configured"}, status=501),
+            APIError,
+            "ECLOUDCRED010",
+        ),
     ],
 )
 def test_cloud_credentials_refusals(
-    agent: AgentAuth, platform: AgentPlatform, status: int, body: dict[str, Any], error: type[Exception]
+    agent: AgentAuth, platform: AgentPlatform, answer: httpx.Response, error: type[Exception], code: str | None
 ) -> None:
-    cloud_route(platform, status, body)
-    with pytest.raises(error):
+    issue_route(platform, answer)
+    with pytest.raises(error) as caught:
         agent.gateway().cloud_credentials("prod", "admin")
+    if code is not None:
+        assert cast(APIError, caught.value).code == code
+    assert platform.calls("POST", REDEEM.format("c1")) == []
+
+
+@pytest.mark.parametrize(("status", "code"), [(404, "ECLOUDCRED013"), (410, "ECLOUDCRED014"), (410, "ECLOUDCRED015")])
+def test_a_redeem_the_gateway_refuses_is_the_platforms_code(
+    agent: AgentAuth, platform: AgentPlatform, status: int, code: str
+) -> None:
+    issue_route(platform, tool_answer(handle_result()))
+    redeem_route(platform, "c1", json_response({"error": code, "error_description": "refused"}, status=status))
+    with pytest.raises(APIError) as caught:
+        agent.gateway().cloud_credentials("prod", "deployer")
+    assert (caught.value.code, caught.value.status) == (code, status)
+    assert len(platform.calls("POST", REDEEM.format("c1"))) == 1  # a secret is given once: never asked for again
+
+
+def test_the_issue_call_is_never_sent_again_after_it_went(agent: AgentAuth, platform: AgentPlatform) -> None:
+    issue_route(platform, json_response({"error": "unavailable"}, status=503))
+    with pytest.raises(APIError):
+        agent.gateway().cloud_credentials("prod", "deployer")
+    assert len(platform.calls("POST", "/mcp")) == 1
+
+
+def test_a_credential_id_that_is_not_an_id_is_not_put_in_a_url(agent: AgentAuth, platform: AgentPlatform) -> None:
+    issue_route(platform, tool_answer(handle_result({**HANDLE, "credential_id": "../../v1/x"})))
+    with pytest.raises(APIError) as caught:
+        agent.gateway().cloud_credentials("prod", "deployer")
+    assert caught.value.code == "invalid_response"
+    assert [r.url.path for r in platform.requests if r.method == "POST" and r.url.path != "/oauth/token"] == ["/mcp"]
 
 
 def test_cloud_credentials_arguments(agent: AgentAuth) -> None:
@@ -426,11 +512,12 @@ async def test_the_async_gateway(platform: AgentPlatform, key: AgentKey, clock: 
         own = gateway.new_http_client({"X-Extra": "1"})
         assert isinstance(own, httpx.AsyncClient)
         await own.aclose()
-        cloud_route(platform, 202, {"data": {"approval_id": "apr-1"}})
-        assert (await gateway.cloud_credentials("a", "r")).approval_id == "apr-1"
-        cloud_route(platform, 201, {"data": {"credential_id": "c", "provider": "aws"}})
+        issue_route(platform, tool_answer(fixture_json("mcp/hold-result.json")))
+        assert (await gateway.cloud_credentials("a", "r")).approval_id == HOLD_ID
+        issue_route(platform, tool_answer(handle_result()))
+        redeem_route(platform, "c1", json_response({"data": SECRET}))
         assert (await gateway.cloud_credentials("a", "r")).kind == "issued"
-        cloud_route(platform, 401, {})
+        issue_route(platform, json_response({}, status=401))
         with pytest.raises(GatewayTokenRefused):
             await gateway.cloud_credentials("a", "r")
         with pytest.raises(ConfigurationError):
@@ -491,12 +578,12 @@ def test_learn_nonce_from_keeps_the_nonce_of_a_use_dpop_nonce_answer_and_nothing
     from authfi import _dpop
     from authfi.gateway import learn_nonce_from
 
-    url = "https://nonce-learner.authfi.io/mcp/v1/messages"
+    url = "https://nonce-learner.authfi.io/llm/v1/messages"
     asked = httpx.Response(401, headers={"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "n-1"})
     assert learn_nonce_from(asked, url)
     assert _dpop.nonces.get(url) == "n-1"
 
-    other = "https://other-learner.authfi.io/mcp/v1/messages"
+    other = "https://other-learner.authfi.io/llm/v1/messages"
     for answer in (
         httpx.Response(401, headers={"www-authenticate": 'Bearer error="invalid_token"', "dpop-nonce": "n-2"}),
         httpx.Response(403, headers={"www-authenticate": 'DPoP error="use_dpop_nonce"', "dpop-nonce": "n-2"}),

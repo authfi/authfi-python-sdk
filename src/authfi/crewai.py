@@ -276,7 +276,7 @@ class AuthFIInterceptor(BaseInterceptor[httpx.Request, httpx.Response]):
     @override
     def on_outbound(self, message: httpx.Request) -> httpx.Request:
         loop = self._loop or _loop_of(self.gateway.source)
-        headers = _on_loop(loop, self.gateway.source.headers(message.method, str(message.url)))
+        headers = _on_loop(loop, self.gateway.headers(message.method, str(message.url)))
         return self._stamp(message, headers)
 
     @override
@@ -285,7 +285,7 @@ class AuthFIInterceptor(BaseInterceptor[httpx.Request, httpx.Response]):
 
     @override
     async def aon_outbound(self, message: httpx.Request) -> httpx.Request:
-        return self._stamp(message, await self.gateway.source.headers(message.method, str(message.url)))
+        return self._stamp(message, await self.gateway.headers(message.method, str(message.url)))
 
     @override
     async def aon_inbound(self, message: httpx.Response) -> httpx.Response:

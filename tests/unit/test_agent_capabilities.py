@@ -41,7 +41,7 @@ from authfi import (
 )
 from authfi._protocol.oauth import b64url
 from authfi.agents import AgentAuth, AsyncAgentAuth
-from tests.fake_agent_gateway import CLOUD_PATH, OUTSIDE, AgentGateway, Template, thumbprint
+from tests.fake_agent_gateway import OUTSIDE, REDEEM_PREFIX, AgentGateway, Template, thumbprint
 from tests.fake_gateway import ALLOWED, STEP_UP
 from tests.support import FakeClock
 
@@ -201,7 +201,7 @@ def test_a_replayed_proof_is_refused(gw: AgentGateway, key: AgentKey) -> None:
 def test_a_proof_for_another_url_is_refused(gw: AgentGateway, key: AgentKey) -> None:
     with AuthFI(gw.issuer) as af:
         agent = af.agent(AGENT, key)
-        headers = agent.headers("POST", gw.issuer + "/mcp/v1/messages")
+        headers = agent.headers("POST", gw.issuer + "/llm/v1/messages")
         assert httpx.post(gw.mcp_url, json=rpc("tools/list"), headers=headers).status_code == 401
     assert gw.refused_proofs[-1] == "dpop_proof_htu_mismatch"
 
@@ -294,8 +294,12 @@ def test_cloud_credentials_are_short_lived_and_proved(gw: AgentGateway, key: Age
     assert outcome.credential.access_key_id == "ASIAFAKE"
     assert "fake-secret" not in repr(outcome.credential)
     assert gw.cloud_calls[-1]["request"] == {"account": "prod", "role": "deployer", "duration_seconds": 300}
-    proof = [p for p in gw.proofs if p["path"] == CLOUD_PATH][-1]
-    assert proof["claims"]["htm"] == "POST" and "ath" in proof["claims"]
+    issue = [p for p in gw.proofs if p["path"] == "/mcp"][-1]
+    assert issue["claims"]["htm"] == "POST" and "ath" in issue["claims"]
+    redeem = [p for p in gw.proofs if p["path"].startswith(REDEEM_PREFIX)][-1]
+    assert redeem["claims"]["htm"] == "POST" and "ath" in redeem["claims"]
+    assert redeem["path"] == f"{REDEEM_PREFIX}{outcome.credential.credential_id}/secret"
+    assert gw.redeems == [outcome.credential.credential_id]
 
 
 def test_a_cloud_role_that_is_not_granted_is_refused_with_the_platforms_code(gw: AgentGateway, key: AgentKey) -> None:

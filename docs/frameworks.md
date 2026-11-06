@@ -308,7 +308,7 @@ run). The proxy sends each call to the AI gateway with your process's credential
 on every request, and the call's `X-Request-Id`. The model calls and the tools are therefore one run of the
 key (`gateway_run_id`), and the gateway admits them while its model proof check (`MCP_MODEL_PROOF_CHECK`) is
 enforced. The proxy forwards exactly one request, `POST /v1/messages` (the Anthropic Messages API, which is all
-Claude Code calls), to `<issuer>/mcp/v1/messages`. Every other method and path answers 404 and is never sent on:
+Claude Code calls), to `<issuer>/llm/v1/messages`. Every other method and path answers 404 and is never sent on:
 not the other model routes, not `/mcp`, not `/v1/cloud/credentials`. That matters because the proxy's address
 (it holds a secret made for the run) is in the environment of every tool Claude Code runs. The proxy drops whatever
 credential Claude Code sends, and passes its `User-Agent` on, so the call's client in the call tape is Claude

@@ -129,7 +129,7 @@ class AuthFILiteLlm(LiteLlm):
         for attempt in (1, 2):
             config = original.model_copy()
             options = (config.http_options or types.HttpOptions()).model_copy()
-            headers = {**(options.headers or {}), **(await gateway.source.headers("POST", url))}
+            headers = {**(options.headers or {}), **(await gateway.headers("POST", url))}
             inject_traceparent(headers, gateway.source)  # LiteLLM's own HTTP client does not stamp it
             options.headers = headers
             config.http_options = options

@@ -72,8 +72,8 @@ class _Project(Protocol):
 class Destinations:
     """Where one credential may be sent, decided when the credential is made.
 
-    A credential for AuthFI itself (no resource, ``<issuer>/mcp``, the console) may go to the
-    issuer and the API origin, plus any ``send_to`` given. A credential for a customer's API may go
+    A credential for AuthFI itself (no resource, ``<issuer>/mcp``, ``<issuer>/llm``, the console) may go to
+    the issuer and the API origin, plus any ``send_to`` given. A credential for a customer's API may go
     only to ``send_to``, which is then required: its audience is that API, so it has no business
     anywhere else, AuthFI included.
     """
@@ -134,6 +134,16 @@ class TokenSource(abc.ABC):
         """Headers to send ``url`` once more after this answer, or ``None``; a bound credential answers a nonce."""
         return None
 
+    def for_llm(self, llm_url: str) -> TokenSource | None:
+        """This credential's token for the model door ``llm_url`` (``<issuer>/llm``), or ``None`` if it has none.
+
+        The model door refuses a token minted for the tool door and the tool door refuses one minted for the
+        model door, so a credential that calls models needs a second token, requested with ``resource=llm_url``.
+        A source that cannot make one answers ``None``, and the gateway then refuses the model call
+        instead of sending the wrong token.
+        """
+        return None
+
     @overload
     def httpx_auth(self) -> httpx.Auth: ...
 
@@ -178,6 +188,10 @@ class AsyncTokenSource(abc.ABC):
         """See :meth:`TokenSource.retry_headers`."""
         return None
 
+    def for_llm(self, llm_url: str) -> AsyncTokenSource | None:
+        """See :meth:`TokenSource.for_llm`."""
+        return None
+
     @overload
     def httpx_auth(self) -> httpx.Auth: ...
 
@@ -195,14 +209,16 @@ class AsyncTokenSource(abc.ABC):
 
 
 class _SyncSourceAuth(httpx.Auth):
-    def __init__(self, source: TokenSource) -> None:
+    def __init__(self, source: TokenSource, choose: Callable[[str], TokenSource] | None = None) -> None:
         self._source = source
+        self._choose = choose
 
     def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         method, url = request.method, str(request.url)
-        request.headers.update(self._source.headers(method, url))
+        source = self._choose(request.url.path) if self._choose is not None else self._source
+        request.headers.update(source.headers(method, url))
         response = yield request
-        again = self._source.retry_headers(
+        again = source.retry_headers(
             method,
             url,
             response.status_code,
@@ -224,8 +240,9 @@ class _SyncSourceAuth(httpx.Auth):
 
 
 class _AsyncSourceAuth(httpx.Auth):
-    def __init__(self, source: AsyncTokenSource) -> None:
+    def __init__(self, source: AsyncTokenSource, choose: Callable[[str], AsyncTokenSource] | None = None) -> None:
         self._source = source
+        self._choose = choose
 
     def sync_auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         raise ConfigurationError(
@@ -235,9 +252,10 @@ class _AsyncSourceAuth(httpx.Auth):
 
     async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
         method, url = request.method, str(request.url)
-        request.headers.update(await self._source.headers(method, url))
+        source = self._choose(request.url.path) if self._choose is not None else self._source
+        request.headers.update(await source.headers(method, url))
         response = yield request
-        again = await self._source.retry_headers(
+        again = await source.retry_headers(
             method,
             url,
             response.status_code,
@@ -269,6 +287,22 @@ def _auth_class(module: ModuleType, *, blocking: bool) -> type:
         }
         _auth_classes[key] = type(f"{source_class.__name__}_{module.__name__}", (base,), namespace)
     return _auth_classes[key]
+
+
+def door_auth(
+    module: ModuleType | None,
+    source: TokenSource | AsyncTokenSource,
+    choose: Callable[[str], Any],
+) -> Any:
+    """An ``httpx.Auth`` that puts the token ``choose(path)`` names on each request: one credential, one token per door.
+
+    ``source`` is the credential the client is for (its blocking or asyncio kind picks the flow); ``choose`` maps a
+    request path to the source whose token that path takes, so a model call never carries the tool door's token.
+    """
+    blocking = isinstance(source, TokenSource)
+    if module is None or module is httpx:
+        return (_SyncSourceAuth if blocking else _AsyncSourceAuth)(source, choose)  # type: ignore[arg-type]
+    return _auth_class(module, blocking=blocking)(source, choose)
 
 
 @dataclass(frozen=True, slots=True, repr=False, eq=False)
