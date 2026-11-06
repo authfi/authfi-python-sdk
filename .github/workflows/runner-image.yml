@@ -1,0 +1,107 @@
+# The framework test runner images (runner/): tested and built on every pull request that touches them, published
+# to the private Docker Hub org `authfi` only from a tag. One repository per framework, all at the same version:
+#   authfi/authfi-fw-runner-<framework>:X.Y.Z      from the tag  fw-runner-vX.Y.Z  (on main)
+# Self-contained like pipeline.yml: no secrets on pull requests, every action pinned by commit.
+name: Runner image
+
+on:
+  pull_request:
+    paths: ["runner/**", "src/**", "pyproject.toml", ".github/workflows/runner-image.yml"]
+  push:
+    tags: ["fw-runner-v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Offline: the entrypoint's refusals, the copied scripts' hashes, the Dockerfile's non-root user.
+  test:
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: python3 -I runner/test_entrypoint.py
+
+  # Builds the image without pushing, and runs it with nothing supplied: it must stop with exit 3 (BLOCKED).
+  build:
+    needs: test
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [langgraph, openai-agents, google-adk]
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build --build-arg FRAMEWORK=${{ matrix.framework }} -f runner/Dockerfile -t fw-runner:${{ matrix.framework }} .
+      - name: Runs as non-root
+        run: |
+          uid="$(docker run --rm --entrypoint id fw-runner:${{ matrix.framework }} -u)"
+          [ "$uid" = 65532 ] || { echo "::error::the image runs as uid $uid, not 65532"; exit 1; }
+      - name: Refuses to start with nothing supplied
+        run: |
+          set +e
+          docker run --rm fw-runner:${{ matrix.framework }}; rc=$?
+          [ "$rc" = 3 ] || { echo "::error::an unconfigured runner exited $rc, not 3"; exit 1; }
+
+  # Only a tag on main reaches here. The only job with the Docker Hub secrets.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/fw-runner-v')
+    needs: build
+    runs-on: ${{ vars.SDK_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [langgraph, openai-agents, google-adk]
+    env:
+      IMAGE: docker.io/authfi/authfi-fw-runner-${{ matrix.framework }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag is fw-runner-vX.Y.Z and on main
+        id: v
+        run: |
+          v="${GITHUB_REF_NAME#fw-runner-v}"
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag ${GITHUB_REF_NAME} is not fw-runner-vMAJOR.MINOR.PATCH"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::the tag is not on main"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Repository exists and is private
+        env:
+          HUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          name="authfi-fw-runner-${{ matrix.framework }}"
+          jwt="$(curl -fsS -H 'Content-Type: application/json' -d "{\"username\":\"$HUB_USER\",\"password\":\"$HUB_TOKEN\"}" https://hub.docker.com/v2/users/login | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
+          echo "::add-mask::$jwt"
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: JWT $jwt" "https://hub.docker.com/v2/repositories/authfi/$name/")"
+          if [ "$code" = 404 ]; then
+            curl -fsS -H "Authorization: JWT $jwt" -H 'Content-Type: application/json' \
+              -d "{\"namespace\":\"authfi\",\"name\":\"$name\",\"is_private\":true}" https://hub.docker.com/v2/repositories/ >/dev/null
+          elif [ "$code" != 200 ]; then echo "::error::Docker Hub answered $code for $name"; exit 1; fi
+      - name: Refuse to overwrite a released version
+        run: |
+          if docker manifest inspect "$IMAGE:${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::$IMAGE:${{ steps.v.outputs.version }} is already published; release a new version"; exit 1
+          fi
+      - name: Build and push
+        run: |
+          docker build --build-arg FRAMEWORK=${{ matrix.framework }} \
+            --label org.opencontainers.image.version=${{ steps.v.outputs.version }} \
+            --label org.opencontainers.image.revision=${GITHUB_SHA} \
+            -f runner/Dockerfile -t "$IMAGE:${{ steps.v.outputs.version }}" .
+          docker push "$IMAGE:${{ steps.v.outputs.version }}"
