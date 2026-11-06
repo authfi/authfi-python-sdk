@@ -69,9 +69,7 @@ def observing_env(platform: InstancePlatform, token_file: Path, **extra: str) ->
 
 
 def connect(platform: InstancePlatform, token_file: Path, env: dict[str, str] | None = None) -> InstanceAuth:
-    agent = authfi.connect(
-        env or env_for(platform, token_file), http_client=platform.client(), clock=FakeClock()
-    )
+    agent = authfi.connect(env or env_for(platform, token_file), http_client=platform.client(), clock=FakeClock())
     assert isinstance(agent, InstanceAuth)
     return agent
 
@@ -113,9 +111,7 @@ def test_an_instance_asks_a_person_with_its_token_and_a_proof_and_no_assertion(
     agent.project.close()
 
 
-def test_a_proof_by_another_key_is_refused_and_nothing_is_asked(
-    platform: InstancePlatform, token_file: Path
-) -> None:
+def test_a_proof_by_another_key_is_refused_and_nothing_is_asked(platform: InstancePlatform, token_file: Path) -> None:
     agent = connect(platform, token_file)
     token = agent.token()
     other = _dpop.DPoPKey()
@@ -257,9 +253,7 @@ def test_an_approval_request_by_the_wrong_key_is_refused(platform: InstancePlatf
 async def test_the_asyncio_instance_asks_a_person_and_opens_an_approval(
     platform: InstancePlatform, token_file: Path
 ) -> None:
-    agent = authfi.connect_async(
-        env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock()
-    )
+    agent = authfi.connect_async(env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock())
     assert isinstance(agent, AsyncInstanceAuth)
     delegated = await agent.token_as_user("priya@acme.com", binding_message="Refund")
     assert delegated.bound_key() is not None
@@ -272,9 +266,7 @@ async def test_the_asyncio_instance_asks_a_person_and_opens_an_approval(
 
 
 async def test_the_asyncio_instance_with_the_wrong_key_is_refused(platform: InstancePlatform, token_file: Path) -> None:
-    agent = authfi.connect_async(
-        env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock()
-    )
+    agent = authfi.connect_async(env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock())
     assert isinstance(agent, AsyncInstanceAuth)
     token = await agent.token()
     other = _dpop.DPoPKey()
@@ -324,9 +316,7 @@ def test_every_explicit_way_to_ask_to_be_observed_sends_version_0_and_no_digest(
         agent = built
     else:
         project = authfi.AuthFI(platform.issuer, http_client=platform.client(), clock=FakeClock())
-        agent = InstanceAuth(
-            project, AGENT, Evidence("k8s", str(token_file)), config=Configuration.observe()
-        )
+        agent = InstanceAuth(project, AGENT, Evidence("k8s", str(token_file)), config=Configuration.observe())
     agent.token()
     assert platform.attests[0]["config"] == OBSERVE_BODY
     agent.project.close()
@@ -350,9 +340,7 @@ def test_a_version_and_a_request_to_be_observed_are_not_both_accepted(
     platform: InstancePlatform, token_file: Path
 ) -> None:
     with pytest.raises(ConfigurationError, match="not both"):
-        authfi.connect(
-            env_for(platform, token_file, AUTHFI_CONFIG_OBSERVE="1"), http_client=platform.client()
-        )
+        authfi.connect(env_for(platform, token_file, AUTHFI_CONFIG_OBSERVE="1"), http_client=platform.client())
     with pytest.raises(ConfigurationError, match="AUTHFI_CONFIG_OBSERVE is 1"):
         authfi.connect(
             observing_env(platform, token_file, AUTHFI_CONFIG_OBSERVE="maybe"), http_client=platform.client()

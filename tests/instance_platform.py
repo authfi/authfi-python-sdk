@@ -177,9 +177,9 @@ class InstancePlatform(AgentPlatform):
         if observing:
             if not self.observe_window:
                 return self.refuse_with("config_not_approved")
-        elif want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix(
-            "sha256:"
-        ) != str(approved["digest"]).removeprefix("sha256:"):
+        elif want.get("version") != approved["version"] or str(want.get("digest", "")).removeprefix("sha256:") != str(
+            approved["digest"]
+        ).removeprefix("sha256:"):
             return self.refuse_with("config_not_approved")
         image = body.get("image_digest")
         if image and not IMAGE_DIGEST.fullmatch(image):
@@ -409,9 +409,7 @@ class InstancePlatform(AgentPlatform):
         if form.get("client_id", claims["sub"]) != claims["sub"] or "client_assertion" in form:
             return self.refuse("invalid_client", 401)
         if claims.get("cfg_obs"):
-            return json_response(
-                {"error": "unauthorized_client", "error_description": OBSERVE_ONLY_WORDS}, status=403
-            )
+            return json_response({"error": "unauthorized_client", "error_description": OBSERVE_ONLY_WORDS}, status=403)
         self.ciba_starts.append(form)
         return json_response({"auth_req_id": "req-123", "expires_in": 300, "interval": 5})
 
