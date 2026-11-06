@@ -111,6 +111,10 @@ httpx.Client(auth=as_priya.httpx_auth())
   `ConsentExpired` if the request runs out. At your own `timeout` it raises `WaitTimeout`
   (`code == "wait_timeout"`); the request stays open, and waiting on it again continues it.
 - `agent.token_as_user(...)` does both steps.
+- An agent bound to a workload (`authfi.connect()` on its pod or device) does this with no key: it asks with its own
+  access token and a proof of its instance key, and the token you get is bound to that key. If the platform
+  admitted the instance only to be observed (it names no approved version), asking is refused and the error says
+  to approve a version and run with `AUTHFI_CONFIG_VERSION` and `AUTHFI_CONFIG_DIGEST`.
 
 The token is bound to the same key as the agent's own, and `as_priya.headers(method, url)` carries
 its proof. Approving an action (below) and lending an identity (this) are different things: the
@@ -215,6 +219,8 @@ approval = agent.request_approval("refund order 4411", context={"amount": 120})
 approval = agent.wait_for_approval(approval.approval_id)
 if approval.status == "approved": ...
 ```
+
+A bound agent opens and reads approvals with its own access token and a proof of its instance key, as above.
 
 `wait_for_approval(approval_id, timeout=300, poll_interval=3)` returns the approval whatever the
 person decided (`approved`, `denied` or `expired`). At your `timeout` it raises `WaitTimeout`, whose

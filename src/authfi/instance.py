@@ -11,13 +11,21 @@ with ``audience`` = the project's origin and ``expirationSeconds: 600``), or the
 ``AUTHFI_DEVICE_KEY_FILE``. ``AUTHFI_CONFIG_VERSION`` and ``AUTHFI_CONFIG_DIGEST`` name the signed
 configuration the instance runs, and ``AUTHFI_IMAGE_DIGEST`` its image.
 
+A brand-new agent has no approved version yet. While a person has an observation window open for it in the
+console, ``AUTHFI_CONFIG_OBSERVE=1`` (or ``connect(observe=True)``, or ``Configuration.observe()``) signs the
+instance in naming no version, so what it does can be observed and a version approved from it. That is never
+the default: an instance that names nothing is refused before anything is sent. An instance admitted this way
+cannot ask a person or act for one until a version is approved.
+
 Sign-in is challenge and attest, then the token request (``OAuth-Client-Attestation``, ``-PoP`` and
 ``DPoP`` headers). The token is bound to the instance key, so every call carries ``Authorization: DPoP``
 and a fresh proof; ``headers()`` does that, and the gateway and the exporters call it. The attestation is
 renewed before it expires.
 
-Acting for a person (CIBA) and the approval calls still authenticate with an agent key and are refused here
-with the fix; token exchange works.
+Acting for a person (CIBA), the approval calls and token exchange work with the instance's own credentials, and
+need no agent key. Asking a person (``request_user_token``) and opening an approval (``request_approval``)
+present the instance's access token with a DPoP proof of the instance key; waiting for the person
+(``await_user_token``) presents the attestation, as the token request does.
 """
 
 from __future__ import annotations
@@ -25,27 +33,31 @@ from __future__ import annotations
 import os
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from authfi import _dpop
 from authfi._clock import Clock
-from authfi._protocol.http import HttpRequest
+from authfi._protocol.agent import Presenter
+from authfi._protocol.discovery import ServerMetadata
+from authfi._protocol.http import Flow, HttpRequest, call
 from authfi._protocol.instance import POP_TYP as _POP_TYP
 from authfi._protocol.instance import PROOF_TYP as _PROOF_TYP
 from authfi._protocol.instance import (
     Attestation,
     Configuration,
     attest_request,
+    attestation_headers,
     attested_token_request,
     challenge_request,
+    observe_only_refusal,
     parse_attestation,
     parse_challenge,
     pop_claims,
 )
-from authfi._protocol.oauth import b64url, parse_token_response
+from authfi._protocol.oauth import ClientAuth, b64url, parse_token_response
 from authfi._protocol.urls import origin_of
 from authfi._protocol.verify import unverified_claims
 from authfi.agents.agent import (
@@ -57,10 +69,10 @@ from authfi.agents.agent import (
 )
 from authfi.agents.keys import AgentKey, Signer
 from authfi.client import AsyncAuthFI, AuthFI
-from authfi.errors import ConfigurationError, NotSupportedError
+from authfi.errors import AuthFIError, ConfigurationError, NotSupportedError
 from authfi.tokens import AsyncTokenSource, TokenSource, check_destination
 
-__all__ = ["AsyncInstanceAuth", "Configuration", "Evidence", "InstanceAuth", "find_evidence"]
+__all__ = ["AsyncInstanceAuth", "Configuration", "Evidence", "InstanceAuth", "find_evidence", "observe_asked"]
 
 K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 #: What a device key signs, ahead of the nonce, the agent and the instance key (the platform checks these exact bytes).
@@ -91,8 +103,27 @@ def find_evidence(env: Mapping[str, str] | None = None) -> Evidence | None:
     return None
 
 
-def _config_from(env: Mapping[str, str]) -> Configuration | None:
+def observe_asked(env: Mapping[str, str], observe: bool = False) -> bool:
+    """Whether the instance asked, explicitly, to be admitted with no approved version (to be observed)."""
+    if observe:
+        return True
+    raw = env.get("AUTHFI_CONFIG_OBSERVE", "").strip().lower()
+    if raw in ("", "0", "false"):
+        return False
+    if raw in ("1", "true"):
+        return True
+    raise ConfigurationError(f"AUTHFI_CONFIG_OBSERVE is 1 to be observed, or unset; got {raw!r}")
+
+
+def _config_from(env: Mapping[str, str], observe: bool = False) -> Configuration | None:
     version, digest = env.get("AUTHFI_CONFIG_VERSION", "").strip(), env.get("AUTHFI_CONFIG_DIGEST", "").strip()
+    if observe_asked(env, observe):
+        if version or digest:
+            raise ConfigurationError(
+                "an instance runs an approved version or asks to be observed, not both: unset "
+                "AUTHFI_CONFIG_OBSERVE, or unset AUTHFI_CONFIG_VERSION and AUTHFI_CONFIG_DIGEST"
+            )
+        return Configuration.observe()
     if not version and not digest:
         return None
     if not (version.isdigit() and digest.startswith("sha256:")):
@@ -115,16 +146,15 @@ class _InstanceSigner:
         return _dpop.run_key().thumbprint
 
     def sign(self, data: bytes) -> bytes:
-        raise NotSupportedError("instance_assertion", _CIBA_REFUSAL)
+        raise NotSupportedError("instance_assertion", _NO_ASSERTION)
 
     def public_jwk(self) -> dict[str, str]:
         return _dpop.run_key().public_jwk()
 
 
-_CIBA_REFUSAL = (
-    "An instance signs in by attestation, which does not yet cover asking a person (CIBA) or opening an "
-    "approval. Use token exchange for a person who signed in to your app, or sign in with an agent key for "
-    "this call."
+_NO_ASSERTION = (
+    "An instance holds no agent key, so it signs no client assertion: it authenticates with its attestation and its "
+    "DPoP-bound token. This call names the agent by an assertion, which only an agent key can sign."
 )
 
 
@@ -143,7 +173,7 @@ class _Core:
             raise ConfigurationError(
                 "an instance runs one approved configuration: set AUTHFI_CONFIG_VERSION and AUTHFI_CONFIG_DIGEST "
                 "(sha256:<hex>), or pass config=Configuration(version, digest). The platform attests no instance "
-                "without one."
+                "without one. A new agent that a person is observing asks for that with AUTHFI_CONFIG_OBSERVE=1."
             )
         if image_digest is not None and not _IMAGE_DIGEST.fullmatch(image_digest):
             raise ConfigurationError(
@@ -235,6 +265,30 @@ class _Core:
     def pop(self, now: float) -> str:
         return self.key().sign_jwt(pop_claims(self.agent_id, self.issuer, now), typ=_POP_TYP)
 
+    def ensure(self, origin: str, clock: Clock, skew: float) -> Flow[Attestation]:
+        """The held attestation, or a new one (challenge, then attest) when it has less than ``skew`` seconds left."""
+        held = self.reusable(clock.time(), skew)
+        if held is not None:
+            return held
+        nonce = parse_challenge((yield from call(challenge_request(origin))))
+        body = self.attest_body(nonce, clock.time())
+        response = yield from call(attest_request(origin, body))
+        self.attestation = parse_attestation(
+            response,
+            agent_id=self.agent_id,
+            key_thumbprint=self.key().thumbprint,
+            now=clock.time(),
+            observe=self.config.is_observe,
+        )
+        return self.attestation
+
+    def present(self, now: float) -> dict[str, str]:
+        """The headers that present the held attestation at the token endpoint, with a new proof of the key."""
+        held = self.attestation
+        if held is None:
+            raise ConfigurationError("the instance has not been attested; sign in before presenting the attestation")
+        return attestation_headers(held, self.pop(now))
+
     def token_request(self, endpoint: str, attestation: Attestation, resource: str | None, clock: Clock) -> HttpRequest:
         """The token request: attestation, proof of the key, and a DPoP proof, fresh per attempt."""
         key = self.key()
@@ -315,12 +369,22 @@ class InstanceAuth(AgentAuth):
     ) -> None:
         self._init(project, agent_id, cast("Signer", _InstanceSigner()), resource=resource, refresh_skew=refresh_skew)
         self._core = _Core(evidence, self.agent_id, project.issuer, config, image_digest)
+        self._auth = ClientAuth.attested(self.agent_id, lambda: self._core.present(self._clock.time()))
 
     @classmethod
     def from_environment(
-        cls, project: AuthFI, env: Mapping[str, str] | None = None, *, resource: str | None = None
+        cls,
+        project: AuthFI,
+        env: Mapping[str, str] | None = None,
+        *,
+        resource: str | None = None,
+        observe: bool = False,
     ) -> InstanceAuth:
-        """The instance the environment names; :class:`~authfi.ConfigurationError` when it shows no evidence."""
+        """The instance the environment names; :class:`~authfi.ConfigurationError` when it shows no evidence.
+
+        ``observe`` (or ``AUTHFI_CONFIG_OBSERVE=1``) asks to be admitted with no approved version, while a person has
+        an observation window open for the agent.
+        """
         source = os.environ if env is None else env
         evidence = find_evidence(source)
         if evidence is None:
@@ -330,7 +394,7 @@ class InstanceAuth(AgentAuth):
             project,
             _agent_id(source),
             evidence,
-            config=_config_from(source),
+            config=_config_from(source, observe),
             image_digest=source.get("AUTHFI_IMAGE_DIGEST", "").strip() or None,
             resource=chosen,
         )
@@ -342,22 +406,35 @@ class InstanceAuth(AgentAuth):
         return held.instance_id if held else None
 
     def _assertion(self, audience: str) -> str:
-        raise NotSupportedError("instance_assertion", _CIBA_REFUSAL)
+        raise NotSupportedError("instance_assertion", _NO_ASSERTION)
+
+    def _explain(self, error: AuthFIError) -> AuthFIError:
+        return observe_only_refusal(error)
+
+    def _ciba_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
+        return self._core.key()
+
+    def _presenter(self) -> Presenter | None:
+        minted = self._tokens.get("", lambda: self._mint(None))
+        return lambda method, url: self._bearing(minted, method, url, self._project_ref.authfi_origins)
+
+    def _ciba_prepare(self) -> Callable[[], Flow[Any]] | None:
+        origin = self.project.resolve_api_origin()
+        return lambda: self._renewed(origin)
+
+    def _renewed(self, origin: str) -> Flow[Attestation]:
+        return self._core.ensure(origin, self._clock, self.refresh_skew)
 
     def _attest(self) -> Attestation:
-        core, now = self._core, self._clock.time()
-        held = core.reusable(now, self.refresh_skew)
+        core = self._core
+        held = core.reusable(self._clock.time(), self.refresh_skew)
         if held is not None:
             return held
-        origin = self.project.resolve_api_origin()
-        nonce = parse_challenge(self._send(challenge_request(origin)))
-        body = core.attest_body(nonce, now)
-        response = self._send(attest_request(origin, body))
-        core.attestation = parse_attestation(
-            response, agent_id=self.agent_id, key_thumbprint=core.key().thumbprint, now=self._clock.time()
+        attestation = self.project._transport.run(  # pyright: ignore[reportPrivateUsage]
+            self._renewed(self.project.resolve_api_origin())
         )
-        self._log.debug("instance %s of agent %s attested", core.attestation.instance_id, self.agent_id)
-        return core.attestation
+        self._log.debug("instance %s of agent %s attested", attestation.instance_id, self.agent_id)
+        return attestation
 
     def _mint(self, resource: str | None) -> tuple[_Minted, float]:
         metadata = self.project.metadata()
@@ -415,10 +492,16 @@ class AsyncInstanceAuth(AsyncAgentAuth):
             project, agent_id, cast("Signer", _InstanceSigner()), resource=resource, refresh_skew=refresh_skew
         )
         self._core = _Core(evidence, self.agent_id, project.issuer, config, image_digest)
+        self._auth = ClientAuth.attested(self.agent_id, lambda: self._core.present(self._clock.time()))
 
     @classmethod
     def from_environment(
-        cls, project: AsyncAuthFI, env: Mapping[str, str] | None = None, *, resource: str | None = None
+        cls,
+        project: AsyncAuthFI,
+        env: Mapping[str, str] | None = None,
+        *,
+        resource: str | None = None,
+        observe: bool = False,
     ) -> AsyncInstanceAuth:
         """See :meth:`InstanceAuth.from_environment`."""
         source = os.environ if env is None else env
@@ -430,7 +513,7 @@ class AsyncInstanceAuth(AsyncAgentAuth):
             project,
             _agent_id(source),
             evidence,
-            config=_config_from(source),
+            config=_config_from(source, observe),
             image_digest=source.get("AUTHFI_IMAGE_DIGEST", "").strip() or None,
             resource=chosen,
         )
@@ -442,22 +525,36 @@ class AsyncInstanceAuth(AsyncAgentAuth):
         return held.instance_id if held else None
 
     def _assertion(self, audience: str) -> str:
-        raise NotSupportedError("instance_assertion", _CIBA_REFUSAL)
+        raise NotSupportedError("instance_assertion", _NO_ASSERTION)
+
+    def _explain(self, error: AuthFIError) -> AuthFIError:
+        return observe_only_refusal(error)
+
+    def _ciba_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
+        return self._core.key()
+
+    async def _presenter(self) -> Presenter | None:
+        minted = await self._tokens.get("", lambda: self._mint(None))
+        return lambda method, url: self._bearing(minted, method, url, self._project_ref.authfi_origins)
+
+    async def _ciba_prepare(self) -> Callable[[], Flow[Any]] | None:
+        origin = await self.project.resolve_api_origin()
+        return lambda: self._renewed(origin)
+
+    def _renewed(self, origin: str) -> Flow[Attestation]:
+        return self._core.ensure(origin, self._clock, self.refresh_skew)
 
     async def _attest(self) -> Attestation:
-        core, now = self._core, self._clock.time()
-        held = core.reusable(now, self.refresh_skew)
+        core = self._core
+        held = core.reusable(self._clock.time(), self.refresh_skew)
         if held is not None:
             return held
         origin = await self.project.resolve_api_origin()
-        nonce = parse_challenge(await self._send(challenge_request(origin)))
-        body = core.attest_body(nonce, now)
-        response = await self._send(attest_request(origin, body))
-        core.attestation = parse_attestation(
-            response, agent_id=self.agent_id, key_thumbprint=core.key().thumbprint, now=self._clock.time()
+        attestation = await self.project._transport.run(  # pyright: ignore[reportPrivateUsage]
+            self._renewed(origin)
         )
-        self._log.debug("instance %s of agent %s attested", core.attestation.instance_id, self.agent_id)
-        return core.attestation
+        self._log.debug("instance %s of agent %s attested", attestation.instance_id, self.agent_id)
+        return attestation
 
     async def _mint(self, resource: str | None) -> tuple[_Minted, float]:
         metadata = await self.project.metadata()

@@ -55,6 +55,7 @@ __all__ = [
     "AgentEndpoints",
     "ApprovalRecord",
     "CibaStart",
+    "Presenter",
     "TaskDetails",
     "TaskPending",
     "approval_request",
@@ -82,6 +83,9 @@ _JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
 _MAX_TASK_SECONDS = 30 * 24 * 3600
 TRANSACTION_TOKEN_PATH = "/apis/regional/v1/ai/auth/transaction-token"
 _AUTHORIZE_PATH = "/apis/regional/v1/ai/auth/authorize"
+#: ``(method, url) -> headers``: the ``Authorization: DPoP`` and ``DPoP`` headers of an instance's access token for one
+#: attempt of one request. A workload-bound agent presents these in place of a client assertion.
+Presenter = Callable[[str, str], Mapping[str, str]]
 _SLOW_DOWN_STEP = 5.0
 _DEFAULT_INTERVAL = 5.0
 
@@ -152,8 +156,13 @@ def ciba_start_request(
     binding_message: str,
     scope: Sequence[str] | None,
     expires_in: int | None,
+    present: Presenter | None = None,
 ) -> HttpRequest:
-    """Ask a person to approve the agent acting for them (CIBA §7.1). Never retried after send."""
+    """Ask a person to approve the agent acting for them (CIBA §7.1). Never retried after send.
+
+    A workload-bound agent has no assertion: ``present`` makes the headers of its instance token, and the form
+    names the client only.
+    """
     if not _given(login_hint):
         raise ConfigurationError("login_hint is required: the platform must know which person to ask")
     if not _given(binding_message):
@@ -176,7 +185,11 @@ def ciba_start_request(
         headers={"Accept": "application/json"},
         form=form,
         retry=Retry.NEVER_AFTER_SEND,
-        per_attempt=lambda: auth.attempt(audience),
+        per_attempt=(
+            (lambda: Attempt(form={"client_id": auth.client_id}, headers=present("POST", endpoint)))
+            if present is not None
+            else (lambda: auth.attempt(audience))
+        ),
     )
 
 
@@ -210,8 +223,11 @@ def ciba_poll_flow(
     now: Callable[[], float],
     resource: str | None,
     dpop: Callable[[str, str, str | None], str] | None = None,
+    prepare: Callable[[], Flow[None]] | None = None,
 ) -> Flow[TokenResponse]:
     """Poll until the person decides (CIBA §7.3), waiting ``interval`` before the first poll.
+
+    ``prepare`` runs before every poll: an instance renews its attestation there when the wait has outlived it.
 
     ``authorization_pending`` keeps it waiting and ``slow_down`` widens the interval by five
     seconds. A decision is raised at once: :class:`ConsentDenied`, :class:`ConsentExpired`. The next
@@ -228,6 +244,8 @@ def ciba_poll_flow(
                 "the person had not decided in time; the request is still open, and waiting on it again continues it"
             )
         yield from pause(wait)
+        if prepare is not None:
+            yield from prepare()
         form = {"grant_type": CIBA_GRANT, "auth_req_id": auth_req_id.reveal()}
         if resource:
             form["resource"] = resource
@@ -526,13 +544,17 @@ def approval_request(
     endpoint: str,
     *,
     agent_id: str,
-    sign: Callable[[str], str],
+    sign: Callable[[str], str] | None,
     audience: str,
     action: str,
     context: Mapping[str, Any] | None,
     expires_in: int,
+    present: Presenter | None = None,
 ) -> HttpRequest:
     """Open an approval for ``action``, signing a new assertion for ``audience`` on every attempt.
+
+    A workload-bound agent has no assertion to sign (``sign`` is ``None``): ``present`` makes the headers of its
+    instance token, with a new proof on every attempt, and the body carries no credential.
 
     Never retried after send: a retry would open a second one. When it is sent again, because the
     request provably never left or the platform answered 429 or 503 with ``Retry-After``, the
@@ -546,12 +568,17 @@ def approval_request(
     if context:
         body["context"] = dict(context)
     request = _json_request("POST", endpoint, "the approval endpoint", {}, body)
+    if present is not None:
+        return dataclasses.replace(request, per_attempt=lambda: Attempt(headers=present("POST", endpoint)))
+    if sign is None:
+        raise ConfigurationError("an approval is opened with a signed assertion or with the instance's token")
+    signer = sign
     return dataclasses.replace(
         request,
         per_attempt=lambda: Attempt(
             json_body={
                 "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                "client_assertion": sign(audience),
+                "client_assertion": signer(audience),
             }
         ),
     )

@@ -485,10 +485,10 @@ def test_the_token_request_asks_for_no_challenge_of_its_own(platform: InstancePl
 # --- what the instance does not do, and what never leaks -------------------------------------------
 
 
-def test_asking_a_person_with_an_instance_is_refused_with_the_fix(platform: InstancePlatform, token_file: Path) -> None:
+def test_an_instance_signs_no_client_assertion_and_says_why(platform: InstancePlatform, token_file: Path) -> None:
     agent = connect(platform, token_file)
-    with pytest.raises(NotSupportedError, match="token exchange"):
-        agent.request_user_token("priya@acme.com", binding_message="Refund")
+    with pytest.raises(NotSupportedError, match="client assertion"):
+        agent._assertion("aud")  # pyright: ignore[reportPrivateUsage]
     agent.project.close()
 
 

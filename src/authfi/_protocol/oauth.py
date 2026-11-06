@@ -50,7 +50,7 @@ CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 #: RFC 8693 §3: the token type of an OAuth access token.
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
-ClientAuthMethod = Literal["none", "client_secret_basic", "client_secret_post", "private_key_jwt"]
+ClientAuthMethod = Literal["none", "client_secret_basic", "client_secret_post", "private_key_jwt", "attestation"]
 
 #: The token response members held as :class:`Secret` and never kept in ``extra``.
 _SECRET_MEMBERS = frozenset({"access_token", "refresh_token", "id_token"})
@@ -86,6 +86,8 @@ class ClientAuth:
     client_id: str
     secret: Secret | None = None
     assertion: Callable[[str], str] | None = None
+    #: ``attestation``: the headers that present the instance's attestation and its key's proof, made per attempt.
+    presented: Callable[[], Mapping[str, str]] | None = None
 
     @classmethod
     def none(cls, client_id: str) -> ClientAuth:
@@ -107,10 +109,23 @@ class ClientAuth:
         """``private_key_jwt`` (RFC 7523 §2.2): ``assertion(audience)`` signs a fresh assertion."""
         return cls("private_key_jwt", _client_id(client_id), assertion=assertion)
 
+    @classmethod
+    def attested(cls, client_id: str, presented: Callable[[], Mapping[str, str]]) -> ClientAuth:
+        """An agent instance: ``client_id`` in the form, its attestation and proof of possession in the headers.
+
+        ``presented()`` is called once per attempt, so a retry never replays a proof. The request also carries
+        a DPoP proof of the attested key; the caller adds that.
+        """
+        return cls("attestation", _client_id(client_id), presented=presented)
+
     def attempt(self, audience: str) -> Attempt:
         """The form fields and headers that authenticate one attempt. ``audience`` is the endpoint."""
         if self.method == "none":
             return Attempt(form={"client_id": self.client_id})
+        if self.method == "attestation":
+            if self.presented is None:
+                raise ConfigurationError("an attested client needs a function that presents the attestation")
+            return Attempt(form={"client_id": self.client_id}, headers=self.presented())
         if self.method == "private_key_jwt":
             if self.assertion is None:
                 raise ConfigurationError("private_key_jwt needs a function that signs the assertion")

@@ -11,7 +11,7 @@ import httpx
 from authfi.agents.agent import AgentAuth, AsyncAgentAuth
 from authfi.client import AsyncAuthFI, AuthFI, AuthFIOptions
 from authfi.errors import ConfigurationError
-from authfi.instance import AsyncInstanceAuth, InstanceAuth, find_evidence
+from authfi.instance import AsyncInstanceAuth, InstanceAuth, find_evidence, observe_asked
 from authfi.machine import AsyncClientCredentials, ClientCredentials
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ def _legacy_key_note(project: AuthFI | AsyncAuthFI) -> None:
     )
 
 
-def _signs_in_as_instance(env: Mapping[str, str]) -> bool:
+def _signs_in_as_instance(env: Mapping[str, str], observe: bool = False) -> bool:
     """Whether the environment shows an instance: evidence of where it runs, and the configuration it runs.
 
     Every pod has a service-account token, so evidence alone does not say the agent was set up to sign in by
@@ -51,7 +51,14 @@ def _signs_in_as_instance(env: Mapping[str, str]) -> bool:
     if find_evidence(env) is None:
         return False
     named_config = bool(env.get("AUTHFI_CONFIG_VERSION", "").strip() or env.get("AUTHFI_CONFIG_DIGEST", "").strip())
-    return named_config or not _names_key(env)
+    return named_config or observe_asked(env, observe) or not _names_key(env)
+
+
+def _observe_needs_an_instance() -> ConfigurationError:
+    return ConfigurationError(
+        "observe is for an agent that signs in as an instance (a projected service-account token, or "
+        "AUTHFI_DEVICE_KEY_FILE); this environment does not show one"
+    )
 
 
 def _names_client(env: Mapping[str, str]) -> bool:
@@ -75,6 +82,7 @@ def connect(
     *,
     resource: str | None = None,
     run_id: str | None = None,
+    observe: bool = False,
     http_client: httpx.Client | None = None,
     **options: Unpack[AuthFIOptions],
 ) -> AgentAuth | ClientCredentials:
@@ -87,6 +95,10 @@ def connect(
     ``AUTHFI_CLIENT_ID`` with ``AUTHFI_CLIENT_SECRET`` is a machine client. A missing variable is a
     :class:`~authfi.ConfigurationError` that names it. ``run_id`` starts the run under that id.
 
+    ``observe=True`` (or ``AUTHFI_CONFIG_OBSERVE=1``) signs an instance in naming no approved version, for a new
+    agent while a person has an observation window open for it; it is never the default, and an instance that
+    names no version and does not ask for this is refused.
+
     The result carries ``langchain()``, ``langgraph()``, ``openai_agents()``, ``claude_agent()`` and
     ``adk()``, and ``.project`` to close when you are done. The frameworks that run on asyncio need
     :func:`connect_async`.
@@ -96,8 +108,10 @@ def connect(
     try:
         credential: AgentAuth | ClientCredentials
         if _names_agent(source):
-            if _signs_in_as_instance(source):
-                credential = InstanceAuth.from_environment(project, source, resource=resource)
+            if _signs_in_as_instance(source, observe):
+                credential = InstanceAuth.from_environment(project, source, resource=resource, observe=observe)
+            elif observe_asked(source, observe):
+                raise _observe_needs_an_instance()
             elif _names_key(source):
                 _legacy_key_note(project)
                 credential = project.agent_from_env(source, resource=resource)
@@ -119,6 +133,7 @@ def connect_async(
     *,
     resource: str | None = None,
     run_id: str | None = None,
+    observe: bool = False,
     http_client: httpx.AsyncClient | None = None,
     **options: Unpack[AuthFIOptions],
 ) -> AsyncAgentAuth | AsyncClientCredentials:
@@ -131,8 +146,10 @@ def connect_async(
     project = AsyncAuthFI.from_env(source, http_client=http_client, **options)
     credential: AsyncAgentAuth | AsyncClientCredentials
     if _names_agent(source):
-        if _signs_in_as_instance(source):
-            credential = AsyncInstanceAuth.from_environment(project, source, resource=resource)
+        if _signs_in_as_instance(source, observe):
+            credential = AsyncInstanceAuth.from_environment(project, source, resource=resource, observe=observe)
+        elif observe_asked(source, observe):
+            raise _observe_needs_an_instance()
         elif _names_key(source):
             _legacy_key_note(project)
             credential = project.agent_from_env(source, resource=resource)

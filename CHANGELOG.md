@@ -10,6 +10,20 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- A bound agent (`connect()` returning an `InstanceAuth` or `AsyncInstanceAuth`) asks a person and opens approvals with
+  its own credentials and no agent key: `request_user_token` and `request_approval` present its access token with
+  a DPoP proof of the instance key (method, URL and `ath`), `await_user_token` presents its attestation as the token
+  request does and returns a token bound to the instance key, and the approval read works as before. An agent with a
+  key signs in as it did. An instance admitted only to be observed is refused by the platform (403
+  `unauthorized_client` or `observe_only_instance`); the error now says to approve a configuration version and run
+  with `AUTHFI_CONFIG_VERSION` and `AUTHFI_CONFIG_DIGEST`. A wait that outlives the attestation renews it before the
+  next poll.
+- Observe mode: `AUTHFI_CONFIG_OBSERVE=1`, `connect(observe=True)` or `Configuration.observe()` signs an instance in
+  naming no version (`version` 0, empty `digest`), for a new agent while a person has an observation window open
+  for it. It is never the default: an instance that names no version and does not ask for this is still refused
+  before anything is sent, and naming a version with it is a `ConfigurationError`. When the platform refuses it, the
+  error says to ask a person to open an observation window for the agent in the console, or to set the version and
+  digest.
 - Claude Agent SDK: `options()` sets `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, so Claude Code sends no `x-anthropic-billing-header` system part (its suffix changes with the first user message), and `tools=["Agent"]`, so the model is offered the agent's AuthFI tools and the sub-agent tool and none of Claude Code's other built-ins. The owner's `env` and `tools` win; see docs/frameworks.md.
 - The steps name their agents in the OpenTelemetry GenAI standard: the agent behind a step or a gateway call is the
   nearest `gen_ai.agent.name` above it. LangGraph: the run of each compiled graph is an `invoke_agent` step named for

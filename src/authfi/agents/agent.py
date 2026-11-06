@@ -24,7 +24,8 @@ import asyncio
 import math
 import threading
 import warnings
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Self, cast, overload
@@ -40,6 +41,7 @@ from authfi._protocol.agent import (
     AgentEndpoints,
     ApprovalRecord,
     CibaStart,
+    Presenter,
     TaskPending,
     approval_request,
     approval_url,
@@ -60,13 +62,14 @@ from authfi._protocol.agent import (
     transaction_token_url,
 )
 from authfi._protocol.discovery import ServerMetadata, ttl_from_headers
-from authfi._protocol.http import DOCUMENT_LIMIT, HttpRequest, HttpResponse, Retry
+from authfi._protocol.http import DOCUMENT_LIMIT, Flow, HttpRequest, HttpResponse, Retry
 from authfi._protocol.oauth import ClientAuth, TokenResponse, client_credentials_request, parse_token_response
 from authfi.agents._legacy import LegacyAgentMixin, is_legacy_agent, legacy_agent_arguments
 from authfi.agents.keys import Signer, client_assertion
 from authfi.agents.task import AsyncTask, Task, refuse_nested
 from authfi.errors import (
     AuthFIDeprecationWarning,
+    AuthFIError,
     ConfigurationError,
     ConsentExpired,
     DiscoveryError,
@@ -318,6 +321,25 @@ class _AgentBase:
 
     def _assertion(self, audience: str) -> str:
         return client_assertion(self.key, self.agent_id, audience, now=self._clock.time())
+
+    def _explain(self, error: AuthFIError) -> AuthFIError:
+        """``error`` as the caller should read it. An agent key adds nothing; an instance names its own fixes."""
+        return error
+
+    @contextmanager
+    def _explaining(self) -> Generator[None]:
+        """Raise what :meth:`_explain` makes of a platform refusal inside the block."""
+        try:
+            yield
+        except AuthFIError as error:
+            explained = self._explain(error)
+            if explained is error:
+                raise
+            raise explained from error
+
+    def _ciba_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
+        """The key the CIBA redeem is proved with and the delegated token bound to."""
+        return self._proof_key(metadata, resource)
 
     @property
     def send_to(self) -> tuple[str, ...]:
@@ -780,6 +802,26 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
     def _send(self, request: HttpRequest) -> HttpResponse:
         return self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
 
+    def _presenter(self) -> Presenter | None:
+        """How this agent presents its own access token to a route that takes one in place of an assertion.
+
+        ``None`` for an agent that signs an assertion with its key; a workload-bound instance has none to sign.
+        """
+        return None
+
+    def _ciba_prepare(self) -> Callable[[], Flow[Any]] | None:
+        """Work to do before each CIBA poll (an instance renews its attestation); none for an agent key."""
+        return None
+
+    def _send_presented(self, request: HttpRequest, present: Presenter | None) -> HttpResponse:
+        """Send ``request``; when its DPoP-proved token needs the server's nonce, send it once more with it."""
+        response = self._send(request)
+        if present is not None and _dpop.learn_nonce(
+            request.url, response.status, response.header("WWW-Authenticate"), response.header(_dpop.NONCE_HEADER)
+        ):
+            response = self._send(request)
+        return response
+
     # --- its own token -------------------------------------------------------------------------------
 
     def _mint(self, resource: str | None) -> tuple[_Minted, float]:
@@ -878,6 +920,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         """
         metadata = self.project.metadata()
         endpoint = _ciba_endpoint(metadata)
+        present = self._presenter()
         request = ciba_start_request(
             endpoint,
             self._auth,
@@ -886,8 +929,10 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             binding_message=binding_message,
             scope=scope,
             expires_in=expires_in,
+            present=present,
         )
-        start = parse_ciba_start(self._send(request))
+        with self._explaining():
+            start = parse_ciba_start(self._send_presented(request, present))
         self._log.info("agent %s asked a person to approve acting for them", self.agent_id)
         return self._ciba_request(start, self._clock.monotonic())
 
@@ -945,7 +990,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         chosen = self._resource(resource)
         destinations = self._check_destination_args(chosen, send_to)
         metadata = self.project.metadata()
-        key = self._proof_key(metadata, chosen)
+        key = self._ciba_key(metadata, chosen)
         flow = ciba_poll_flow(
             metadata.token_endpoint,
             self._auth,
@@ -956,8 +1001,10 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             now=self._clock.monotonic,
             resource=chosen,
             dpop=self._signer(key),
+            prepare=self._ciba_prepare(),
         )
-        response = self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
+        with self._explaining():
+            response = self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
         self._log.info("agent %s now acts for a person (CIBA)", self.agent_id)
         return DelegatedToken(
             response=response,
@@ -1216,16 +1263,19 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         endpoint = self._agent_endpoints().request_approval
         if endpoint is None:
             raise NotSupportedError("agent_approval", "This AuthFI project does not offer approvals to agents.")
+        present = self._presenter()
         request = approval_request(
             endpoint,
             agent_id=self.agent_id,
-            sign=self._assertion,
+            sign=None if present is not None else self._assertion,
             audience=self.project.issuer,
             action=action,
             context=context,
             expires_in=expires_in,
+            present=present,
         )
-        approval = Approval.of(parse_approval(self._send(request), reading=False))
+        with self._explaining():
+            approval = Approval.of(parse_approval(self._send_presented(request, present), reading=False))
         self._log.info("agent %s asked for approval %s", self.agent_id, approval.approval_id)
         return approval
 
@@ -1281,6 +1331,23 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
 
     async def _send(self, request: HttpRequest) -> HttpResponse:
         return await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+
+    async def _presenter(self) -> Presenter | None:
+        """See :meth:`AgentAuth._presenter`."""
+        return None
+
+    async def _ciba_prepare(self) -> Callable[[], Flow[Any]] | None:
+        """See :meth:`AgentAuth._ciba_prepare`."""
+        return None
+
+    async def _send_presented(self, request: HttpRequest, present: Presenter | None) -> HttpResponse:
+        """See :meth:`AgentAuth._send_presented`."""
+        response = await self._send(request)
+        if present is not None and _dpop.learn_nonce(
+            request.url, response.status, response.header("WWW-Authenticate"), response.header(_dpop.NONCE_HEADER)
+        ):
+            response = await self._send(request)
+        return response
 
     async def _mint(self, resource: str | None) -> tuple[_Minted, float]:
         metadata = await self.project.metadata()
@@ -1354,6 +1421,7 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         """See :meth:`AgentAuth.request_user_token`."""
         metadata = await self.project.metadata()
         endpoint = _ciba_endpoint(metadata)
+        present = await self._presenter()
         request = ciba_start_request(
             endpoint,
             self._auth,
@@ -1362,8 +1430,10 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             binding_message=binding_message,
             scope=scope,
             expires_in=expires_in,
+            present=present,
         )
-        start = parse_ciba_start(await self._send(request))
+        with self._explaining():
+            start = parse_ciba_start(await self._send_presented(request, present))
         self._log.info("agent %s asked a person to approve acting for them", self.agent_id)
         return self._ciba_request(start, self._clock.monotonic())
 
@@ -1380,7 +1450,7 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         chosen = self._resource(resource)
         destinations = self._check_destination_args(chosen, send_to)
         metadata = await self.project.metadata()
-        key = self._proof_key(metadata, chosen)
+        key = self._ciba_key(metadata, chosen)
         flow = ciba_poll_flow(
             metadata.token_endpoint,
             self._auth,
@@ -1391,8 +1461,10 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             now=self._clock.monotonic,
             resource=chosen,
             dpop=self._signer(key),
+            prepare=await self._ciba_prepare(),
         )
-        response = await self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
+        with self._explaining():
+            response = await self.project._transport.run(flow)  # pyright: ignore[reportPrivateUsage]
         self._log.info("agent %s now acts for a person (CIBA)", self.agent_id)
         return AsyncDelegatedToken(
             response=response,
@@ -1638,16 +1710,19 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         endpoint = (await self._agent_endpoints()).request_approval
         if endpoint is None:
             raise NotSupportedError("agent_approval", "This AuthFI project does not offer approvals to agents.")
+        present = await self._presenter()
         request = approval_request(
             endpoint,
             agent_id=self.agent_id,
-            sign=self._assertion,
+            sign=None if present is not None else self._assertion,
             audience=self.project.issuer,
             action=action,
             context=context,
             expires_in=expires_in,
+            present=present,
         )
-        approval = Approval.of(parse_approval(await self._send(request), reading=False))
+        with self._explaining():
+            approval = Approval.of(parse_approval(await self._send_presented(request, present), reading=False))
         self._log.info("agent %s asked for approval %s", self.agent_id, approval.approval_id)
         return approval
 

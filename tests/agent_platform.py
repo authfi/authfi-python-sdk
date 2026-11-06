@@ -136,24 +136,35 @@ class AgentPlatform(Platform):
                 }
             )
         if grant == CIBA:
-            self.ciba_polls.append(form)
-            answer = self.ciba_answers.pop(0) if self.ciba_answers else "ok"
-            if answer == "ok":
-                token = self.agent_token(
-                    form.get("resource"),
-                    sub="user:usr_person",
-                    act={"sub": f"agent:{self.agent_id}"},
-                    scope="send_email",
-                )
-                return json_response(
-                    {"access_token": token, "token_type": "Bearer", "expires_in": 600, "scope": "send_email"}
-                )
-            return self.refuse(
-                {"pending": "authorization_pending", "denied": "access_denied", "expired": "expired_token"}.get(
-                    answer, answer
-                )
-            )
+            return self._ciba_redeem(form)
         return self.refuse("unsupported_grant_type")
+
+    def _ciba_redeem(self, form: dict[str, str], jkt: str | None = None) -> httpx.Response:
+        """A CIBA poll: the next scripted answer. ``jkt`` is the key an instance proved, which the token is bound to."""
+        self.ciba_polls.append(form)
+        answer = self.ciba_answers.pop(0) if self.ciba_answers else "ok"
+        if answer == "ok":
+            bound: dict[str, Any] = {"cnf": {"jkt": jkt}} if jkt else {}
+            token = self.agent_token(
+                form.get("resource"),
+                sub="user:usr_person",
+                act={"sub": f"agent:{self.agent_id}"},
+                scope="send_email",
+                **bound,
+            )
+            return json_response(
+                {
+                    "access_token": token,
+                    "token_type": "DPoP" if jkt else "Bearer",
+                    "expires_in": 600,
+                    "scope": "send_email",
+                }
+            )
+        return self.refuse(
+            {"pending": "authorization_pending", "denied": "access_denied", "expired": "expired_token"}.get(
+                answer, answer
+            )
+        )
 
     def _exchange(self, form: dict[str, str]) -> httpx.Response:
         self.exchanges.append(form)
@@ -233,6 +244,9 @@ class AgentPlatform(Platform):
         error = self.check_assertion(body.get("client_assertion"), self.issuer)
         if error or body.get("agent_id") != self.agent_id:
             return self.refuse("unauthorized", 401)
+        return self._approval_accepted(body)
+
+    def _approval_accepted(self, body: dict[str, Any]) -> httpx.Response:
         self.approvals_opened.append(body)
         return json_response(
             {
@@ -253,7 +267,10 @@ class AgentPlatform(Platform):
             return self.refuse("forbidden", self.approval_status)
         if not self._bearer_agent(request):
             return self.refuse("unauthorized", 401)
-        status: str = self.approval_status
+        return self._approval_answer(request)
+
+    def _approval_answer(self, request: httpx.Request) -> httpx.Response:
+        status = str(self.approval_status)
         return json_response(
             {
                 "data": {
