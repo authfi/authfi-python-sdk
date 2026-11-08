@@ -63,6 +63,7 @@ from authfi._protocol.agent import (
 )
 from authfi._protocol.discovery import ServerMetadata, ttl_from_headers
 from authfi._protocol.http import DOCUMENT_LIMIT, Flow, HttpRequest, HttpResponse, Retry
+from authfi._protocol.ids import link_step_owner
 from authfi._protocol.oauth import ClientAuth, TokenResponse, client_credentials_request, parse_token_response
 from authfi.agents._legacy import LegacyAgentMixin, is_legacy_agent, legacy_agent_arguments
 from authfi.agents.keys import Signer, client_assertion
@@ -450,12 +451,13 @@ class _AgentBase:
 class _AgentResource(TokenSource):
     """The agent's own token for one resource, sent only to that resource's origins."""
 
-    __slots__ = ("_agent", "_destinations", "_resource")
+    __slots__ = ("__weakref__", "_agent", "_destinations", "_resource")
 
     def __init__(self, agent: AgentAuth, resource: str, destinations: Destinations) -> None:
         self._agent = agent
         self._resource = resource
         self._destinations = destinations
+        link_step_owner(self, agent)
 
     @property
     def send_to(self) -> tuple[str, ...]:
@@ -498,7 +500,19 @@ class DelegatedToken(TokenSource):
     It does not print its token and does not pickle: a checkpoint stores an id, never a token.
     """
 
-    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "project", "subject", "via")
+    __slots__ = (
+        "__weakref__",
+        "_current",
+        "_destinations",
+        "_lock",
+        "_renew",
+        "_skew",
+        "_time",
+        "actor",
+        "project",
+        "subject",
+        "via",
+    )
 
     def __init__(
         self,
@@ -512,9 +526,12 @@ class DelegatedToken(TokenSource):
         time: Callable[[], float],
         project: Any = None,
         key: _dpop.DPoPKey | None = None,
+        steps_of: object | None = None,
     ) -> None:
         #: The project that issued the token: what the gateway helpers and adapters attach to.
         self.project = project
+        if steps_of is not None:  # the agent the framework exports its steps for: this token's calls name them
+            link_step_owner(self, steps_of)
         self.via: Literal["ciba", "exchange"] = via
         self._renew = renew
         self._skew = refresh_skew
@@ -601,7 +618,19 @@ class DelegatedToken(TokenSource):
 class AsyncDelegatedToken(AsyncTokenSource):
     """See :class:`DelegatedToken`; for asyncio code."""
 
-    __slots__ = ("_current", "_destinations", "_lock", "_renew", "_skew", "_time", "actor", "project", "subject", "via")
+    __slots__ = (
+        "__weakref__",
+        "_current",
+        "_destinations",
+        "_lock",
+        "_renew",
+        "_skew",
+        "_time",
+        "actor",
+        "project",
+        "subject",
+        "via",
+    )
 
     def __init__(
         self,
@@ -615,9 +644,12 @@ class AsyncDelegatedToken(AsyncTokenSource):
         time: Callable[[], float],
         project: Any = None,
         key: _dpop.DPoPKey | None = None,
+        steps_of: object | None = None,
     ) -> None:
         #: The project that issued the token: what the gateway helpers and adapters attach to.
         self.project = project
+        if steps_of is not None:  # the agent the framework exports its steps for: this token's calls name them
+            link_step_owner(self, steps_of)
         self.via: Literal["ciba", "exchange"] = via
         self._renew = renew
         self._skew = refresh_skew
@@ -1015,6 +1047,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            steps_of=self,
             key=_dpop.bound_key(response, key),
         )
 
@@ -1084,6 +1117,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            steps_of=self,
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
@@ -1475,6 +1509,7 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            steps_of=self,
             key=_dpop.bound_key(response, key),
         )
 
@@ -1544,6 +1579,7 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             refresh_skew=self.refresh_skew,
             time=self._clock.time,
             project=self.project,
+            steps_of=self,
         )
         self._log.info("agent %s now acts for a person (token exchange)", self.agent_id)
         return delegated
@@ -1755,12 +1791,13 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
 class _AsyncAgentResource(AsyncTokenSource):
     """See :class:`_AgentResource`."""
 
-    __slots__ = ("_agent", "_destinations", "_resource")
+    __slots__ = ("__weakref__", "_agent", "_destinations", "_resource")
 
     def __init__(self, agent: AsyncAgentAuth, resource: str, destinations: Destinations) -> None:
         self._agent = agent
         self._resource = resource
         self._destinations = destinations
+        link_step_owner(self, agent)
 
     @property
     def send_to(self) -> tuple[str, ...]:

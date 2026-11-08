@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, Self, cast
 
 from authfi import _dpop
 from authfi._protocol.agent import TaskDetails, task_details
+from authfi._protocol.ids import link_step_owner
 from authfi._protocol.oauth import TokenResponse
 from authfi.errors import ConfigurationError, ConsentExpired
 from authfi.gateway import AsyncCloudAccess, AsyncGateway, CloudAccess, Gateway
@@ -78,6 +79,8 @@ class _TaskState:
         self._time = time
         self._expires = time() + float(response.expires_in or 300)
         self._reset: list[contextvars.Token[bool]] = []
+        # The framework exports its steps for the agent's credential; the task's calls name the step through it.
+        link_step_owner(self, agent)
 
     @property
     def mandate_id(self) -> str:
