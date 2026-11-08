@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Iterator
 
 import httpx
+import jwt
 import pytest
 
 from authfi import AgentKey, AuthFI, _dpop
@@ -60,13 +61,19 @@ def test_a_refusal_never_downgrades_the_next_request_to_bearer(key: AgentKey) ->
     with AgentGateway(nonce=True) as gateway, AuthFI(gateway.issuer) as af:
         client = af.agent(AGENT, key).gateway().http_client()
         assert client.post(gateway.mcp_url, json=_tools_list()).status_code == 200
-        gateway.revoked = True  # the platform now refuses this token whatever the proof
-        refused = client.post(gateway.mcp_url, json=_tools_list())
-        assert refused.status_code == 401
+        for _ in range(
+            3
+        ):  # the nonce rotates: each call is refused with use_dpop_nonce, then answered with a new proof
+            gateway._nonce = "nonce-" + uuid.uuid4().hex  # pyright: ignore[reportPrivateUsage]
+            before = gateway.nonce_challenges
+            assert client.post(gateway.mcp_url, json=_tools_list()).status_code == 200
+            assert gateway.nonce_challenges == before + 1  # asked once, not in a loop
+        gateway.revoked = True  # and a hard refusal, whatever the proof
+        assert client.post(gateway.mcp_url, json=_tools_list()).status_code == 401
         client.post(gateway.mcp_url, json=_tools_list())
 
     schemes = {r["headers"]["authorization"].partition(" ")[0] for r in gateway.requests if r["path"] == "/mcp"}
-    assert schemes == {"DPoP"}  # no attempt went out as Bearer
+    assert schemes == {"DPoP"}  # no attempt, refused or retried, went out as Bearer
     assert "token_dpop_proof_required" not in gateway.refused_proofs
 
 
@@ -90,6 +97,6 @@ def test_a_proof_names_the_url_without_its_query(key: AgentKey) -> None:
     with AgentGateway() as gateway, AuthFI(gateway.issuer) as af:
         agent = af.agent(AGENT, key)
         headers = agent.headers("POST", gateway.mcp_url + "?session=abc#frag")
-    claims = __import__("jwt").decode(headers["DPoP"], options={"verify_signature": False})
+    claims = jwt.decode(headers["DPoP"], options={"verify_signature": False})
     assert claims["htu"] == gateway.mcp_url
     assert claims["htm"] == "POST"

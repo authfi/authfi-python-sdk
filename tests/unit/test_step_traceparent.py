@@ -17,6 +17,8 @@ import pytest
 
 from authfi import AgentKey, AuthFI
 from authfi._protocol.ids import (
+    _parents,
+    _sources,
     inject_traceparent,
     link_step_owner,
     register_step_source,
@@ -288,7 +290,6 @@ def test_a_credentials_own_step_comes_before_its_parents() -> None:
     register_step_source(child, lambda: ("a" * 32, "b" * 16))
     link_step_owner(child, parent)
     assert step_traceparent(child) == "00-" + "a" * 32 + "-" + "b" * 16 + "-01"
-    register_step_source(Owner(), lambda: None)
 
 
 def test_a_link_never_leaks_down_or_loops() -> None:
@@ -308,9 +309,28 @@ def test_a_link_does_not_keep_its_credential_alive() -> None:
     parent, child = Owner(), Owner()
     link_step_owner(child, parent)
     ref = weakref.ref(child)
+    key = id(child)
+    assert key in _parents
     del child
     gc.collect()
     assert ref() is None
+    assert key not in _parents  # the entry goes with the credential: an id reused later inherits nothing
+
+
+def test_a_dead_credentials_entries_do_not_name_a_step_for_a_new_one() -> None:
+    parent = Owner()
+    register_step_source(parent, lambda: (TRACE, SPAN))
+    seen: set[int] = set()
+    for _ in range(200):  # ids are reused once an object is gone
+        child = Owner()
+        assert id(child) not in _parents and id(child) not in _sources
+        assert step_traceparent(child) is None
+        link_step_owner(child, parent)
+        register_step_source(child, lambda: None)
+        seen.add(id(child))
+        del child
+        gc.collect()
+    assert not (seen & set(_parents)) and not (seen & set(_sources))
 
 
 def test_a_task_names_the_step_its_agent_has() -> None:
@@ -338,6 +358,14 @@ def test_a_task_names_the_step_its_agent_has() -> None:
     assert sent[1] != STEP and sent[1].endswith("-00")  # another agent's task has no step of this one's
 
 
+def _person() -> Any:
+    import jwt
+
+    from authfi import Secret
+
+    return Secret(jwt.encode({"sub": "usr_1", "exp": 4_000_000_000}, "k" * 32, algorithm="HS256"))
+
+
 def test_a_person_acting_token_and_a_resource_token_name_the_step_their_agent_has() -> None:
     from tests.fake_agent_gateway import AgentGateway
 
@@ -348,7 +376,48 @@ def test_a_person_acting_token_and_a_resource_token_name_the_step_their_agent_ha
         own = agent.for_resource(gateway.issuer + "/mcp")
         assert step_traceparent(delegated) == STEP
         assert step_traceparent(own) == STEP
+        exchanged = agent.exchange(_person())
+        assert step_traceparent(exchanged) == STEP
         assert (
             step_traceparent(af.agent("agt_steps4", AgentKey.generate(kid="k4")).for_resource(gateway.issuer + "/mcp"))
             is None
         )
+
+
+async def test_an_async_task_names_the_step_its_agent_has() -> None:
+    import jwt
+
+    from authfi import AsyncAuthFI, Secret
+    from tests.fake_agent_gateway import AgentGateway
+
+    person = Secret(jwt.encode({"sub": "usr_1", "exp": 4_000_000_000}, "k" * 32, algorithm="HS256"))
+    body: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    with AgentGateway() as gateway:
+        async with AsyncAuthFI(gateway.issuer) as af:
+            agent = af.agent("agt_asteps1", AgentKey.generate(kid="k1"))
+            register_step_source(agent, lambda: (TRACE, SPAN))
+            async with await agent.task("support.refund", subject_token=person, params={"order": "4411"}) as task:
+                await task.gateway().http_client().post(gateway.mcp_url, json=body)
+            other = af.agent("agt_asteps2", AgentKey.generate(kid="k2"))
+            async with await other.task("support.refund", subject_token=person, params={"order": "4411"}) as task2:
+                await task2.gateway().http_client().post(gateway.mcp_url, json=body)
+    sent = [r["headers"]["traceparent"] for r in gateway.requests if r["path"] == "/mcp"]
+    assert sent[0] == STEP
+    assert sent[1] != STEP and sent[1].endswith("-00")
+
+
+async def test_an_async_person_acting_token_and_resource_token_name_the_step_their_agent_has() -> None:
+    from authfi import AsyncAuthFI
+    from tests.fake_agent_gateway import AgentGateway
+
+    with AgentGateway() as gateway:
+        async with AsyncAuthFI(gateway.issuer) as af:
+            agent = af.agent("agt_asteps3", AgentKey.generate(kid="k3"))
+            register_step_source(agent, lambda: (TRACE, SPAN))
+            delegated = await agent.token_as_user("priya@acme.com", binding_message="Refund order 4411")
+            own = agent.for_resource(gateway.issuer + "/mcp")
+            assert step_traceparent(delegated) == STEP
+            assert step_traceparent(own) == STEP
+            assert step_traceparent(await agent.exchange(_person())) == STEP
+            stranger = af.agent("agt_asteps4", AgentKey.generate(kid="k4"))
+            assert step_traceparent(stranger.for_resource(gateway.issuer + "/mcp")) is None
