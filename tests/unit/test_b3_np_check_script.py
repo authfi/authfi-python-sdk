@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import httpx
 import pytest
 
 from authfi import AgentKey, _dpop
@@ -84,7 +85,11 @@ def test_bearer_and_noproof_do_not_pass_on_a_nonce_challenge(
     """A 401 that only asks for a nonce says nothing about the rule the leg names."""
     path, kid = key_file
     script = _script()
-    monkeypatch.setattr(script, "_reason", lambda response: "use_dpop_nonce")  # pyright: ignore[reportUnknownLambdaType]
+
+    def nonce_challenge(response: httpx.Response) -> str:
+        return "use_dpop_nonce"
+
+    monkeypatch.setattr(script, "_reason", nonce_challenge)
     with AgentGateway(nonce=True) as gateway:
         result = script.check(gateway.issuer, "agt_b3script", str(path), kid)
     assert not result["ok"]
