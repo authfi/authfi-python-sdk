@@ -51,9 +51,14 @@ def _np_only(issuer: str) -> str:
     """Live proofs run in the probe projects on np only: ``https://probe-<name>.np.authfi.io``."""
     parts = urlsplit(issuer)
     host = parts.hostname or ""
-    if parts.scheme != "https" or not host.startswith("probe-") or not host.endswith(".np.authfi.io"):
+    if parts.scheme != "https" or not re.fullmatch(r"probe-[a-z0-9-]+\.np\.authfi\.io", host):
         raise SystemExit(f"refused: {issuer!r} is not an https probe-*.np.authfi.io project")
     return issuer.rstrip("/")
+
+
+def _dpop_headers(dpop: Callable[[str | None], dict[str, str]], make_proof: Callable[[], str]) -> dict[str, str]:
+    """The headers of one attempt: a new proof from ``make_proof`` each time it is called."""
+    return dpop(make_proof())
 
 
 def _reason(response: httpx.Response) -> str:
@@ -144,7 +149,14 @@ def check(issuer: str, agent_id: str, key_file: str, kid: str, *, expect_nonce: 
                 "noproof": dpop(None),
             }.items():
                 r = post(headers)
-                leg(name, "401", str(r.status_code), r.status_code == 401, _reason(r))
+                why = _reason(r)
+                leg(
+                    name,
+                    "401, not for a nonce",
+                    str(r.status_code),
+                    r.status_code == 401 and "use_dpop_nonce" not in why,
+                    why,
+                )
             replayed = proof()
             first, second = post(dpop(replayed)), post(dpop(replayed))
             leg(
@@ -161,7 +173,7 @@ def check(issuer: str, agent_id: str, key_file: str, kid: str, *, expect_nonce: 
                 "ath": partial(proof, tok=wrong_token),
             }
             for name, make_proof in wrong.items():
-                r = settle(lambda make_proof=make_proof: dpop(make_proof()))
+                r = settle(partial(_dpop_headers, dpop, make_proof))
                 why = _reason(r)
                 leg(
                     name,

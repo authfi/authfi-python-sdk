@@ -69,9 +69,24 @@ def test_expecting_a_nonce_fails_when_identity_asks_for_none(key_file: tuple[Pat
         "https://probe-c1.authfi.io",  # not np
         "http://probe-c1.np.authfi.io",  # not https
         "https://probe-c1.np.authfi.io.evil.example",
+        "https://probe-x.anything.np.authfi.io",  # more than one label before np
     ],
 )
 def test_only_a_probe_project_on_np_is_checked(issuer: str) -> None:
     with pytest.raises(SystemExit, match="refused"):
         _script()._np_only(issuer)  # pyright: ignore[reportPrivateUsage]
     assert _script()._np_only("https://probe-c1.np.authfi.io/") == "https://probe-c1.np.authfi.io"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_bearer_and_noproof_do_not_pass_on_a_nonce_challenge(
+    key_file: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 401 that only asks for a nonce says nothing about the rule the leg names."""
+    path, kid = key_file
+    script = _script()
+    monkeypatch.setattr(script, "_reason", lambda response: "use_dpop_nonce")  # pyright: ignore[reportUnknownLambdaType]
+    with AgentGateway(nonce=True) as gateway:
+        result = script.check(gateway.issuer, "agt_b3script", str(path), kid)
+    assert not result["ok"]
+    for name in ("bearer", "noproof"):
+        assert result["legs"][name]["got"] == "401" and not result["legs"][name]["ok"]
