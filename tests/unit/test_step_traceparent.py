@@ -421,3 +421,70 @@ async def test_an_async_person_acting_token_and_resource_token_name_the_step_the
             assert step_traceparent(await agent.exchange(_person())) == STEP
             stranger = af.agent("agt_asteps4", AgentKey.generate(kid="k4"))
             assert step_traceparent(stranger.for_resource(gateway.issuer + "/mcp")) is None
+
+
+def test_a_walk_through_a_loop_with_no_step_ends_with_none() -> None:
+    """Two credentials linked both ways and no source on either: the walk must stop, not spin."""
+    a, b = Owner(), Owner()
+    link_step_owner(a, b)
+    link_step_owner(b, a)
+    assert step_traceparent(a) is None
+    assert step_traceparent(b) is None
+    c = Owner()  # a longer cycle
+    link_step_owner(b, c)
+    link_step_owner(c, a)
+    assert step_traceparent(a) is None
+
+
+def _gone(make: Any) -> None:
+    """Build a credential, check it is linked, drop it, and check nothing of it stays in the tables."""
+    credential = make()
+    key = id(credential)
+    ref = weakref.ref(credential)  # raises TypeError when the class has no __weakref__ slot
+    assert key in _parents
+    del credential, make
+    gc.collect()
+    assert ref() is None
+    assert key not in _parents and key not in _sources
+
+
+def test_the_credentials_made_from_an_agent_are_collected_with_their_last_reference() -> None:
+    from tests.fake_agent_gateway import AgentGateway
+
+    with AgentGateway() as gateway, AuthFI(gateway.issuer) as af:
+        agent = af.agent("agt_gc1", AgentKey.generate(kid="k1"))
+        register_step_source(agent, lambda: (TRACE, SPAN))
+        _gone(lambda: agent.for_resource(gateway.issuer + "/mcp"))
+        _gone(lambda: agent.token_as_user("priya@acme.com", binding_message="Refund order 4411"))
+        _gone(lambda: agent.exchange(_person()))
+        tasks: list[Any] = []
+        with agent.task("support.refund", subject_token=_person(), params={"order": "4411"}) as task:
+            tasks.append(task)
+            assert id(task) in _parents
+        key, ref = id(task), weakref.ref(task)
+        del task
+        tasks.clear()
+        gc.collect()
+        assert ref() is None and key not in _parents
+
+
+async def test_the_async_credentials_made_from_an_agent_are_collected_with_their_last_reference() -> None:
+    from authfi import AsyncAuthFI
+    from tests.fake_agent_gateway import AgentGateway
+
+    with AgentGateway() as gateway:
+        async with AsyncAuthFI(gateway.issuer) as af:
+            agent = af.agent("agt_gc2", AgentKey.generate(kid="k2"))
+            register_step_source(agent, lambda: (TRACE, SPAN))
+            _gone(lambda: agent.for_resource(gateway.issuer + "/mcp"))
+            delegated = await agent.token_as_user("priya@acme.com", binding_message="Refund order 4411")
+            key, ref = id(delegated), weakref.ref(delegated)
+            assert key in _parents
+            del delegated
+            gc.collect()
+            assert ref() is None and key not in _parents
+            async with await agent.task("support.refund", subject_token=_person(), params={"order": "4411"}) as task:
+                tkey, tref = id(task), weakref.ref(task)
+            del task
+            gc.collect()
+            assert tref() is None and tkey not in _parents
