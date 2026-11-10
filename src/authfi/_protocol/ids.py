@@ -21,6 +21,9 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, MutableMapping
+from contextlib import AbstractContextManager
+from functools import partial
+from typing import Any
 
 __all__ = [
     "REQUEST_ID_PATTERN",
@@ -29,6 +32,7 @@ __all__ = [
     "idempotency_key",
     "inject_traceparent",
     "is_valid_request_id",
+    "link_step_owner",
     "register_step_source",
     "request_id",
     "step_traceparent",
@@ -52,7 +56,10 @@ _LOG = logging.getLogger("authfi")
 #: Owner id -> (the owner, weakly where a class allows it, else held; its sources). An id is what is looked up
 #: because some credentials are slotted classes that cannot be weakly referenced or hashed by value.
 _sources: dict[int, tuple[object, list[StepSource]]] = {}
-_sources_lock = threading.Lock()
+#: Owner id -> the credential its steps are exported for. A task or a sub-agent calls with a credential of its own
+#: while the framework's steps are exported for the agent that holds it, so its calls name the step through it.
+_parents: dict[int, tuple[object, object]] = {}
+_sources_lock = threading.RLock()  # a weakref callback (_forget) can run while it is held, in the same thread
 
 
 def _ulid() -> str:
@@ -103,7 +110,7 @@ def register_step_source(owner: object, source: StepSource) -> None:
         if held is None:
             key = id(owner)
             try:
-                ref: object = weakref.ref(owner, lambda _: _forget(key))
+                ref: object = weakref.ref(owner, partial(_forget, key, _sources, _parents, _sources_lock))
             except TypeError:  # a slotted class without __weakref__: kept for the life of the process
                 ref = owner
             held = _sources[key] = (ref, [])
@@ -111,23 +118,57 @@ def register_step_source(owner: object, source: StepSource) -> None:
             held[1].append(source)
 
 
-def _forget(key: int) -> None:
+def link_step_owner(owner: object, parent: object) -> None:
+    """Have ``owner`` name the step ``parent``'s sources say is executing, after any source of its own.
+
+    A credential made from another one (a task from its agent) signs the calls its code makes, while the framework
+    exports its steps for the credential it was started with. The link ends with ``owner``. Linking a credential to
+    itself, or in a loop, adds nothing.
+    """
+    if owner is parent:
+        return
     with _sources_lock:
-        _sources.pop(key, None)
+        key = id(owner)
+        if key in _parents:
+            _parents[key] = (_parents[key][0], parent)
+            return
+        try:
+            ref: object = weakref.ref(owner, partial(_forget, key, _sources, _parents, _sources_lock))
+        except TypeError:  # a slotted class without __weakref__: kept for the life of the process
+            ref = owner
+        _parents[key] = (ref, parent)
+
+
+def _forget(
+    key: int,
+    sources: dict[int, tuple[object, list[StepSource]]],
+    parents: dict[int, tuple[object, object]],
+    lock: AbstractContextManager[Any],
+    _ref: object = None,
+) -> None:
+    """Drop what was kept for a credential that is gone. The tables are passed in: at exit the module's are cleared."""
+    with lock:
+        sources.pop(key, None)
+        parents.pop(key, None)
 
 
 def _step_of(owner: object | None) -> Step | None:
-    with _sources_lock:
-        held = _sources.get(id(owner)) if owner is not None else None
-        sources = list(held[1]) if held is not None else []
-    for source in sources:
-        try:
-            step = source()
-        except Exception:  # a framework that cannot say what is executing must not stop the call it is making
-            _LOG.warning("a step source failed; the call carries no step", exc_info=True)
-            continue
-        if step is not None:
-            return step
+    seen: set[int] = set()
+    while owner is not None and id(owner) not in seen:
+        seen.add(id(owner))
+        with _sources_lock:
+            held = _sources.get(id(owner))
+            sources = list(held[1]) if held is not None else []
+            linked = _parents.get(id(owner))
+        for source in sources:
+            try:
+                step = source()
+            except Exception:  # a framework that cannot say what is executing must not stop the call it is making
+                _LOG.warning("a step source failed; the call carries no step", exc_info=True)
+                continue
+            if step is not None:
+                return step
+        owner = linked[1] if linked is not None else None
     return None
 
 
