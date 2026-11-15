@@ -17,6 +17,9 @@
     authfi headers
         {"Authorization": "Bearer ..."} as JSON (an MCP server's headersHelper); with
         AUTHFI_RUN_ID set, X-Request-Id too
+    authfi claude [--model M] [--small-model M] [-- ARGS]
+        Claude Code, through the AuthFI gateways as the agent the environment names, with no Anthropic
+        sign-in (see :mod:`authfi.claude_code`)
     authfi redteam --origin URL [--baseline FILE] [--send]
         the platform's red-team corpus against your agent's configuration, read back from your call
         tape; without --send it prints what it would send (see :mod:`authfi.redteam`)
@@ -37,7 +40,7 @@ from collections.abc import Sequence
 
 import httpx
 
-from authfi import _login, redteam
+from authfi import _login, claude_code, redteam
 from authfi._protocol.ids import is_valid_request_id
 from authfi.agents.keys import AgentKey, KeyAlgorithm
 from authfi.client import AuthFI
@@ -87,6 +90,12 @@ def _parser() -> argparse.ArgumentParser:
         "--forget-allow", action="store_true", help="also drop every proxy host and value allowed with `authfi login`"
     )
     commands.add_parser("headers", help="print the agent's request headers as JSON")
+    claude = commands.add_parser("claude", help="run Claude Code through the AuthFI gateways")
+    claude.add_argument("--model", default=claude_code.DEFAULT_MODEL, help="the model the session starts on")
+    claude.add_argument(
+        "--small-model", default=claude_code.DEFAULT_MODEL, help="the model Claude Code uses for its background work"
+    )
+    claude.add_argument("args", nargs=argparse.REMAINDER, help="arguments for claude, after --")
     redteam.add_arguments(
         commands.add_parser("redteam", help="run the red-team corpus against your agent (a dry run unless --send)")
     )
@@ -149,6 +158,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     if args.command in ("login", "logout") or (args.command == "token" and args.resource):
         return _person_command(args)
+    if args.command == "claude":
+        passed = list(args.args)
+        return claude_code.command(
+            passed[1:] if passed[:1] == ["--"] else passed, model=args.model, small_model=args.small_model
+        )
     if args.command == "redteam":
         return redteam.command(args, os.environ, print, lambda text: print(text, file=sys.stderr))
     try:

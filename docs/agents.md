@@ -294,6 +294,15 @@ delegated tokens are `AsyncDelegatedToken`. Cancel the task to stop a wait.
 | `authfi keygen --out PATH [--alg ...] [--kid ...]` | the public JWK and its thumbprint |
 | `authfi token` | the agent's current token |
 | `authfi headers` | `{"Authorization": "Bearer ..."}` as JSON, with `X-Request-Id` from `AUTHFI_RUN_ID` |
+| `authfi claude [--model M] [--small-model M] [-- ARGS]` | runs Claude Code, its model calls through the AI gateway as this agent; nothing |
 
 `token` and `headers` read the environment above. A failure prints nothing on standard output and
 exits 1, so a tool that runs them never mistakes an error for a credential.
+
+`authfi claude` runs the interactive Claude Code as the agent the environment names: typically a person's own
+personal-assistant agent bound to their device. Claude Code's model calls go to a loopback proxy in this process, which
+sends them to the project's AI gateway with the agent's credential, so no Anthropic sign-in, subscription or API key is
+used. A person's own `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_BASE_URL` is overridden and named; the
+`AUTHFI_*` variables are not given to Claude Code; its non-essential traffic is off. `--model` is the session's first
+model (`/model` switches among what the gateway serves), `--small-model` the one Claude Code uses for its own
+background work; both default to `claude-haiku-5-5`. The gateway's tools are not given to Claude Code by this command.

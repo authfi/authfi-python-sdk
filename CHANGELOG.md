@@ -35,6 +35,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   is kept in pieces, `login` and `logout` share the renewal's lock, a renewal of unknown outcome is never repeated with
   the spent token, `token --resource llm` prints nothing when its environment would steer the token elsewhere or expose it (another base URL or provider, an unallowed proxy, a CA or TLS variable), and the
   issuer comes from the discovery document.
+- `authfi claude` runs the interactive Claude Code through the AuthFI AI gateway as the agent the environment names (a person's own agent), so a team works in Claude Code with no Anthropic sign-in, subscription or key. It reuses the loopback model proxy of `authfi.claude_agent`; the environment both give Claude Code is now built in one place.
 - `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
   method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`
   holds the SDK to the same rules offline: a renewal after the nonce rotated, no downgrade to Bearer after a refusal.
