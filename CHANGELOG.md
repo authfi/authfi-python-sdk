@@ -10,6 +10,14 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
+  method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`
+  holds the SDK to the same rules offline: a renewal after the nonce rotated, no downgrade to Bearer after a refusal.
+- A task, a person-acting token and a token for one resource name the step their agent's framework is executing.
+  The framework exports its steps for the agent's credential, but a call made under the agent's task is signed with the
+  task's own, so its `traceparent` was fresh and unsampled and joined no stored step. The credential made from another now
+  asks through it (`link_step_owner`), after any source of its own. The registry's lock is re-entrant: a credential
+  collected while it was held, in the same thread, used to wait on itself.
 - A bound agent (`connect()` returning an `InstanceAuth` or `AsyncInstanceAuth`) asks a person and opens approvals with
   its own credentials and no agent key: `request_user_token` and `request_approval` present its access token with
   a DPoP proof of the instance key (method, URL and `ath`), `await_user_token` presents its attestation as the token
