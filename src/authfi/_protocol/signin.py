@@ -180,8 +180,12 @@ def authorize_url(
     scope: Sequence[str],
     login_hint: str | None = None,
     prompt: str | None = None,
+    resource: str | None = None,
 ) -> str:
-    """The URL that starts the sign-in: code flow with PKCE S256, ``state`` and ``nonce``."""
+    """The URL that starts the sign-in: code flow with PKCE S256, ``state`` and ``nonce``.
+
+    ``resource`` (RFC 8707) asks for a token addressed to one API, such as the project's ``/llm`` door.
+    """
     if isinstance(cast(object, scope), str):
         raise ConfigurationError("scope is a sequence of names, such as ('openid', 'profile'), not one string")
     names = [s.strip() for s in scope if s.strip()]
@@ -214,6 +218,8 @@ def authorize_url(
         query["login_hint"] = login_hint
     if prompt:
         query["prompt"] = prompt
+    if resource:
+        query["resource"] = resource
     separator = "&" if urlsplit(authorization_endpoint).query else "?"
     return authorization_endpoint + separator + urlencode(query)
 

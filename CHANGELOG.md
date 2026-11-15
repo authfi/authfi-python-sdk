@@ -10,6 +10,16 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
+  project's `/llm` door (`pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`). The login registers a public client once per machine (RFC 7591),
+  signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`
+  with `openid llm:invoke offline_access`. The refresh token lives in the operating system's credential store and
+  nowhere else: with no usable store the login refuses before it contacts the project. `token --resource llm` renews under a
+  cross-process lock (the refresh token rotates and its reuse ends the sign-in), keeps the access token only in the
+  credential store until shortly before it expires, and on failure prints the reason on stderr and nothing on stdout.
+  `logout` revokes at the revocation endpoint and deletes what is stored. Bare `authfi token` is unchanged. See
+  [docs/claude-code.md](docs/claude-code.md). `ServerMetadata.registration_endpoint`, `WebApp.start_sign_in(resource=...)`
+  and `WebApp.revoke()` (and their async twins) are the pieces it is built from.
 - `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
   method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`
   holds the SDK to the same rules offline: a renewal after the nonce rotated, no downgrade to Bearer after a refusal.

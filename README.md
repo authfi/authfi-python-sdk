@@ -124,6 +124,12 @@ as_her = agent.exchange(Secret(her_access_token))
 Each is a token whose subject is the person and whose actor is the agent. It never prints and
 never pickles.
 
+## Claude Code as yourself
+
+`pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`, then `authfi login --issuer https://acme.authfi.io` signs you in once, and Claude Code
+takes its credential for the project's `/llm` door from `apiKeyHelper: "authfi token --resource llm"`. The refresh
+token stays in your operating system's credential store. See [docs/claude-code.md](docs/claude-code.md).
+
 ## Errors
 
 Every error is an `authfi.AuthFIError`. Branch on its `code`, never on the message:
@@ -154,6 +160,7 @@ to be pickled or serialised, and gives its value only through `reveal()`.
 - [Signing people in to a web app](docs/signin.md)
 - [Protecting an API: the verifier, FastAPI, Flask](docs/verify.md)
 - [Machine clients](docs/machine.md)
+- [Claude Code as yourself: `authfi login` and the `/llm` door](docs/claude-code.md)
 - [AI agents: keys, tokens, acting for a person, the action gate, approvals](docs/agents.md)
 - [The AuthFI gateways: tools, models, cloud credentials](docs/gateway.md)
 - [Agent frameworks: LangChain, LangGraph, OpenAI Agents SDK, Claude Agent SDK, Google ADK](docs/frameworks.md)

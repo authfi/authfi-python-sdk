@@ -200,6 +200,7 @@ class _Config:
         max_age: int | None,
         login_hint: str | None,
         prompt: str | None,
+        resource: str | None = None,
     ) -> PendingSignIn:
         if metadata.authorization_endpoint is None:
             raise NotSupportedError(
@@ -216,6 +217,7 @@ class _Config:
             scope=scope,
             login_hint=login_hint,
             prompt=prompt,
+            resource=resource,
         )
         return PendingSignIn(state, url, key=self.state_key, client_id=self.client_id, redirect_uri=self.redirect_uri)
 
@@ -321,9 +323,13 @@ class WebApp:
         max_age: int | None = None,
         login_hint: str | None = None,
         prompt: Prompt | None = None,
+        resource: str | None = None,
     ) -> PendingSignIn:
-        """A new sign-in: PKCE S256, ``state`` and ``nonce``. Send the browser to ``pending.url``."""
-        return self._config.start(self.project.metadata(), scope, acr_values, max_age, login_hint, prompt)
+        """A new sign-in: PKCE S256, ``state`` and ``nonce``. Send the browser to ``pending.url``.
+
+        ``resource`` (RFC 8707) asks for tokens addressed to one API of the project, such as its ``/llm`` door.
+        """
+        return self._config.start(self.project.metadata(), scope, acr_values, max_age, login_hint, prompt, resource)
 
     def load_pending(self, blob: str) -> PendingSignIn:
         """The pending sign-in ``dump()`` made, checked as :meth:`PendingSignIn.load` does."""
@@ -410,6 +416,17 @@ class WebApp:
         metadata = self.project.metadata()
         transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
         return self._config.userinfo(transport.send(self._config.userinfo_request(metadata, tokens)), tokens)
+
+    def revoke(self, tokens: TokenSet) -> None:
+        """Revoke the refresh token (the access token when there is none) at the revocation endpoint.
+
+        :meth:`sign_out` does this and then sends the browser to end its session; a command-line app has no
+        browser session to end. A refusal raises, so a token is never reported revoked when it was not.
+        """
+        request = self._config.revocation(self.project.metadata(), tokens)
+        response = self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        if response.status != 200:
+            raise api_error(response, "the revocation endpoint")
 
     def sign_out(
         self, tokens: TokenSet, *, post_logout_redirect_uri: str | None = None, state: str | None = None
@@ -507,9 +524,12 @@ class AsyncWebApp:
         max_age: int | None = None,
         login_hint: str | None = None,
         prompt: Prompt | None = None,
+        resource: str | None = None,
     ) -> PendingSignIn:
         """See :meth:`WebApp.start_sign_in`."""
-        return self._config.start(await self.project.metadata(), scope, acr_values, max_age, login_hint, prompt)
+        return self._config.start(
+            await self.project.metadata(), scope, acr_values, max_age, login_hint, prompt, resource
+        )
 
     def load_pending(self, blob: str) -> PendingSignIn:
         """See :meth:`WebApp.load_pending`."""
@@ -586,6 +606,13 @@ class AsyncWebApp:
         metadata = await self.project.metadata()
         transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
         return self._config.userinfo(await transport.send(self._config.userinfo_request(metadata, tokens)), tokens)
+
+    async def revoke(self, tokens: TokenSet) -> None:
+        """See :meth:`WebApp.revoke`."""
+        request = self._config.revocation(await self.project.metadata(), tokens)
+        response = await self.project._transport.send(request)  # pyright: ignore[reportPrivateUsage]
+        if response.status != 200:
+            raise api_error(response, "the revocation endpoint")
 
     async def sign_out(
         self, tokens: TokenSet, *, post_logout_redirect_uri: str | None = None, state: str | None = None
