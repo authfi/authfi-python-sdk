@@ -77,8 +77,9 @@ variable's name in the message and exit code 1, when any of these is present:
 | certificate trust | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` | set, unless you allowed that exact value |
 | | `CLAUDE_CODE_CERT_STORE` | anything but `bundled`, `system` or both |
 | | `NODE_OPTIONS` | it carries `-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--use-openssl-ca`, `--use-bundled-ca`, `--openssl-config` or `--tls-*` (quoted or not), unless you allowed that exact value |
-| code or key log in the helper | `PYTHONPATH`, `PYTHONSTARTUP`, `LD_PRELOAD`, `SSLKEYLOGFILE` | set, unless you allowed that exact absolute path |
-| | `NODE_TLS_REJECT_UNAUTHORIZED` | `0`; this cannot be allowed |
+| code in the helper | `PYTHONPATH`, `PYTHONSTARTUP`, `LD_PRELOAD` | set, unless you allowed that exact absolute path |
+| | `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY` | `0`; this cannot be allowed |
+| TLS session keys | `SSLKEYLOGFILE`, and `--tls-keylog` in `NODE_OPTIONS` | set; this cannot be allowed, because whoever can read the key log can read the token |
 
 The names come from Claude Code's own documentation (the [settings](https://code.claude.com/docs/en/settings),
 [environment variables](https://code.claude.com/docs/en/env-vars),

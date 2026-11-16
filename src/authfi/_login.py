@@ -620,6 +620,10 @@ def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for pair in pairs:
         name, _, value = pair.partition("=")
+        if why := _never_allowed_name(name):
+            raise LoginError(f"--allow-env {name} is refused: it {why}; this cannot be allowed", code="bad_allow")
+        if name == "NODE_OPTIONS" and (why := never_allowed(name, value)):
+            raise LoginError(f"--allow-env NODE_OPTIONS is refused: it {why}; this cannot be allowed", code="bad_allow")
         if name not in TLS_VARIABLES or not value:
             raise LoginError(
                 f"--allow-env takes NAME=VALUE for one of {', '.join(TLS_VARIABLES)}: {name!r}", code="bad_allow"
@@ -771,16 +775,39 @@ TLS_VARIABLES = (
     "CURL_CA_BUNDLE",
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
-    # Variables that run code inside the helper or write the session keys to a file a network observer can read.
+    # Variables that run code inside the helper.
     "PYTHONPATH",
     "PYTHONSTARTUP",
     "LD_PRELOAD",
-    "SSLKEYLOGFILE",
 )
 #: Variables whose value is a path: an allowance for one must be absolute, or a repository's own file would match it.
 _PATH_VARIABLES = frozenset(TLS_VARIABLES) - {"CLAUDE_CODE_CERT_STORE", "NODE_OPTIONS"}
 #: Verification turned off is never allowed.
 TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
+_KEYLOG_OPTION = re.compile(r"(^|\s)--tls-keylog(?![a-z0-9-])")
+
+
+def never_allowed(name: str, value: str) -> str | None:
+    """Why this variable and value can never be allowed, whatever the person records; ``None`` when it can be.
+
+    Each rule either turns certificate verification off or exports the TLS session keys, which lets whoever holds
+    the key log or sits on the path read the token.
+    """
+    plain = value.strip().replace('"', "").replace("'", "")
+    if name in (TLS_OFF, "PYTHONHTTPSVERIFY") and plain == "0":
+        return "turns certificate verification off"
+    if name == "SSLKEYLOGFILE" and plain:
+        return "writes the TLS session keys to a file, so anyone who can read that file can read the token"
+    if name == "NODE_OPTIONS" and _KEYLOG_OPTION.search(plain):
+        return "carries --tls-keylog, which writes the TLS session keys to a file anyone who can read it can use"
+    return None
+
+
+def _never_allowed_name(name: str) -> str | None:
+    """The reason an allowance for ``name`` is refused whatever its value, or ``None``."""
+    return never_allowed(name, "0") if name in (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE") else None
+
+
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 _CERT_STORE_SOURCES = frozenset({"bundled", "system"})
 _NODE_OPTION = re.compile(
@@ -851,8 +878,11 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
                 f"names the proxy {host or 'that is not an address'}, which could read the token",
                 f"unset it, or allow that host once with: authfi login --allow-proxy {host or 'HOST'}",
             )
-    if env.get(TLS_OFF, "").strip() == "0":
-        raise _refuse(TLS_OFF, "turns certificate verification off", "unset it; this cannot be allowed")
+    for name in (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE", "NODE_OPTIONS"):
+        if why := never_allowed(
+            name, env.get(name, "")
+        ):  # before the allowances: a hand-edited login.json cannot lift it
+            raise _refuse(name, why, "unset it; this cannot be allowed")
     for name in TLS_VARIABLES:
         value = env.get(name, "").strip()
         if not value or allow.env.get(name) == value:

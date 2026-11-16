@@ -1190,12 +1190,50 @@ def test_node_options_that_load_code_or_change_tls_stop_the_token(
         assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
 
 
-@pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONSTARTUP", "LD_PRELOAD", "SSLKEYLOGFILE"])
+@pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONSTARTUP", "LD_PRELOAD"])
 def test_variables_that_run_code_or_write_session_keys_stop_the_token(
     platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
 ) -> None:
     signed_in(platform, server, vault, config_dir)
     _refused(platform, vault, config_dir, {name: "/repo/x"}, name)
+
+
+NEVER_ALLOWED = [
+    ("NODE_TLS_REJECT_UNAUTHORIZED", "0", "certificate verification off"),
+    ("PYTHONHTTPSVERIFY", "0", "certificate verification off"),
+    ("SSLKEYLOGFILE", "/home/me/keys.log", "TLS session keys"),
+    ("NODE_OPTIONS", "--tls-keylog=/home/me/keys.log", "TLS session keys"),
+    ("NODE_OPTIONS", '"--tls-keylog=/home/me/keys.log"', "TLS session keys"),
+]
+
+
+@pytest.mark.parametrize(("name", "value", "why"), NEVER_ALLOWED)
+def test_a_variable_that_disables_verification_or_exports_keys_cannot_be_allowed(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str, value: str, why: str
+) -> None:
+    with pytest.raises(LoginError) as caught:
+        _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=[f"{name}={value}"])
+    assert caught.value.code == "bad_allow" and name in caught.value.message and why in caught.value.message
+    assert "cannot be allowed" in caught.value.message
+    assert platform.requests == [] and vault.values == {}  # refused before any call
+
+
+@pytest.mark.parametrize(("name", "value", "why"), NEVER_ALLOWED)
+def test_a_hand_edited_allowance_does_not_lift_a_never_allowed_variable(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str, value: str, why: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={name: value})
+    error = _refused(platform, vault, config_dir, {name: value}, name)
+    assert why in error.message
+
+
+def test_the_never_allowed_variables_are_fine_when_harmless(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    for env in ({"PYTHONHTTPSVERIFY": "1"}, {"SSLKEYLOGFILE": ""}, {"NODE_OPTIONS": "--max-old-space-size=4096"}):
+        assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
 
 
 def test_an_allowance_must_name_a_proxy_host_and_an_absolute_path(
