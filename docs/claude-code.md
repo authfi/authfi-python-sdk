@@ -26,7 +26,7 @@ before it contacts the project and writes nothing. The error names the fix: unin
 `PYTHON_KEYRING_BACKEND`.
 
 A value longer than 900 characters is kept in pieces, so a long refresh token fits the Windows Credential Locker's
-2560-byte limit. The only file is `login.json` in your config directory (`%APPDATA%uthfi`, or
+2560-byte limit. The only file is `login.json` in your config directory (`%APPDATA%\authfi`, or
 `$XDG_CONFIG_HOME/authfi`, or `~/.config/authfi`; `AUTHFI_CONFIG_DIR` changes it), which holds the project origin, the
 client id and no secret. Each config directory is its own sign-in with its own lock, so two of them never share a
 refresh token.
@@ -60,21 +60,62 @@ In `~/.claude/settings.json`:
 With one project, `--issuer` is optional after the first login: the command uses `AUTHFI_ISSUER`, else the project you
 last signed in to.
 
-## A base URL that points elsewhere
+## What the helper checks before it prints a token
 
-The helper runs as a child of the tool and inherits its environment. `authfi token --resource llm` prints a token only
-when `ANTHROPIC_BASE_URL` (and `OPENAI_BASE_URL`, `OPENAI_API_BASE`), if set, is `https://` on this project's origin with
-the path `/llm` or below it. Anything else (another host, `http`, a port, user info, a query, `..`, `/llmx`) is refused
-with the variable's name and nothing on stdout, so settings in a repository cannot steer the token to another server.
+`authfi token --resource llm` runs as a child of the tool and inherits its environment. A repository's
+`.claude/settings.json` can put values in that environment through its `env` block, and Claude Code applies them to the
+process (and so to its helper) once the folder is trusted ([settings](https://code.claude.com/docs/en/settings),
+"Shared project"). So before it prints anything the helper reads its own environment and prints no token, with the
+variable's name in the message and exit code 1, when any of these is present:
 
-What the helper can and cannot see, per tool:
-
-| tool | the helper can see | the helper cannot see |
+| class | variables | refused when |
 |---|---|---|
-| Claude Code (`apiKeyHelper`) | the process environment, which includes `env` from user and project settings files; so `ANTHROPIC_BASE_URL` | a base URL the tool holds only in memory or takes from a command-line flag |
-| a tool that reads its key from a helper and its URL from a config file or flag | the environment only | the URL: the check cannot run, so keep that tool's URL under your own control |
+| tool base URL | `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_API_BASE` | not `https://` on this project's canonical origin with the path `/llm` or below (another host, `http`, a port, user info, a query, `..`, `//`, `/llmx`, and the slug host of a project whose issuer is a custom domain) |
+| another provider's endpoint | `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_BEDROCK_MANTLE_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_AWS_BASE_URL`, `ANTHROPIC_FOUNDRY_BASE_URL`, `ANTHROPIC_FOUNDRY_RESOURCE`, `ANTHROPIC_GOOGLE_CLOUD_BASE_URL` | set to anything |
+| provider switch | `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_MANTLE`, `_FOUNDRY`, `_ANTHROPIC_AWS`, and `CLAUDE_CODE_SKIP_BEDROCK_AUTH`, `_VERTEX_AUTH`, `_MANTLE_AUTH`, `_FOUNDRY_AUTH` | anything but empty, `0`, `false`, `no`, `off` |
+| proxy | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and their lowercase forms | the proxy host is not one you allowed |
+| certificate trust | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` | set, unless you allowed that exact value |
+| | `CLAUDE_CODE_CERT_STORE` | anything but `bundled`, `system` or both |
+| | `NODE_OPTIONS` | it carries `-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--use-openssl-ca`, `--use-bundled-ca`, `--openssl-config` or `--tls-*`, unless you allowed that exact value |
+| | `NODE_TLS_REJECT_UNAUTHORIZED` | `0`; this cannot be allowed |
 
-The check is a guard on the environment, not proof of where the tool sends the token.
+The names come from Claude Code's own documentation (the [settings](https://code.claude.com/docs/en/settings),
+[environment variables](https://code.claude.com/docs/en/env-vars),
+[network configuration](https://code.claude.com/docs/en/network-config),
+[Amazon Bedrock](https://code.claude.com/docs/en/amazon-bedrock) and
+[Google Vertex AI](https://code.claude.com/docs/en/google-vertex-ai) pages, read on 2026-11-16); the OpenAI names are the
+ones its SDKs read, and `CLAUDE_CODE_USE_ANTHROPIC_AWS` and the `CLAUDE_CODE_SKIP_*_AUTH` names beyond Bedrock and
+Mantle are included by pattern without having been found on a page I read. The env-vars page was read only to its
+first 100,000 characters.
+
+A proxy or a certificate you need is allowed once, from your own terminal, and recorded in `login.json`:
+
+```bash
+authfi login --allow-proxy proxy.corp.example
+authfi login --allow-env NODE_EXTRA_CA_CERTS=/etc/ssl/corp-ca.pem
+```
+
+The allowance is by proxy host, and by variable name together with its exact value, so a repository cannot swap the
+file behind an allowed name for another path. Only `login.json` grants it: no environment variable does.
+
+### What this does not cover
+
+The guard reads the helper's environment and nothing else. It cannot see:
+
+- a flag on the tool's command line (for example a `--settings` JSON or a model-endpoint flag) or a base URL the tool
+  holds only in memory;
+- a settings file the tool applies to itself without exporting the value, so any setting that is not an environment
+  variable;
+- `apiKeyHelper` itself: the same repository settings file can set the helper command, and a different command prints
+  no token from this tool at all. Claude Code asks you to trust a folder before it applies a repository's `env`; that
+  trust decision is yours and is not something this command can check;
+- a proxy or CA that the operating system applies outside the environment (a system proxy, a CA in the OS store);
+- an environment variable this list does not name.
+
+What the tests prove is that, for each variable above, the helper refuses with its name and prints nothing on stdout,
+that the proxy and certificate allowances need an exact match, and that removing any one of those checks fails a test.
+They do not prove the tool's behaviour: I did not run Claude Code, and what a given tool inherits into its helper is
+taken from its documentation. The check is a guard on the environment, not proof of where the tool sends the token.
 
 ## Renewing, signing in and out at once
 

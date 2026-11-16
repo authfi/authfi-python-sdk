@@ -22,7 +22,7 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   and `WebApp.revoke()` (and their async twins) are the pieces it is built from. Only the operating system's stores
   are accepted (Keychain, Credential Locker, Secret Service, KWallet; a file backend is refused), a long refresh token
   is kept in pieces, `login` and `logout` share the renewal's lock, a renewal of unknown outcome is never repeated with
-  the spent token, `token --resource llm` prints nothing when `ANTHROPIC_BASE_URL` is not the project's `/llm`, and the
+  the spent token, `token --resource llm` prints nothing when its environment would steer the token elsewhere or expose it (another base URL or provider, an unallowed proxy, a CA or TLS variable), and the
   issuer comes from the discovery document.
 - `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
   method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`

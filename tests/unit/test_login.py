@@ -758,7 +758,7 @@ def test_no_token_is_given_when_the_tools_base_url_is_not_this_projects_llm_door
     signed_in(platform, server, vault, config_dir)  # a valid cached token exists: it must still not be printed
     with pytest.raises(LoginError) as caught:
         _login.access_token(runtime(platform, vault, config_dir, env={name: value}), None)
-    assert caught.value.code == "base_url_mismatch" and name in caught.value.message
+    assert caught.value.code == "environment_refused" and name in caught.value.message
     assert "pw" not in caught.value.message.replace("pw@", "") and "user:" not in caught.value.message
     assert server.refreshes == 0
 
@@ -1018,9 +1018,11 @@ def test_the_issuer_and_the_resource_come_from_discovery_not_from_the_typed_host
     platform.requests.clear()
     token = _login.access_token(runtime(platform, vault, config_dir), ISSUER)
     assert token and platform.requests == []
-    # and the tool's base URL may name either door
-    for door in (ISSUER, CUSTOM):
-        _login.access_token(runtime(platform, vault, config_dir, env={"ANTHROPIC_BASE_URL": door + "/llm"}), ISSUER)
+    # the tool's base URL must name the issuer the token is for, not the alias that was typed
+    _login.access_token(runtime(platform, vault, config_dir, env={"ANTHROPIC_BASE_URL": CUSTOM + "/llm"}), ISSUER)
+    with pytest.raises(LoginError) as refused:
+        _login.access_token(runtime(platform, vault, config_dir, env={"ANTHROPIC_BASE_URL": ISSUER + "/llm"}), ISSUER)
+    assert refused.value.code == "environment_refused"
     assert _login.logout(runtime(platform, vault, config_dir), ISSUER) == 0
     assert vault.values == {} and server.revoked
 
@@ -1033,3 +1035,183 @@ def test_a_discovery_document_that_names_no_usable_issuer_stops_the_login(
         with pytest.raises(LoginError):
             _login.login(runtime(platform, vault, config_dir, opener=browser(server)), ISSUER, timeout=2)
     assert vault.values == {} and server.registrations == []
+
+
+# --- the rest of the environment: other providers, proxies, certificates -----------------------------------
+
+
+def _refused(platform: Platform, vault: MemoryVault, config_dir: Path, env: dict[str, str], name: str) -> LoginError:
+    with pytest.raises(LoginError) as caught:
+        _login.access_token(runtime(platform, vault, config_dir, env=env), None)
+    assert caught.value.code == "environment_refused" and name in caught.value.message
+    return caught.value
+
+
+@pytest.mark.parametrize("name", list(_login.PROVIDER_URL_VARIABLES))
+def test_another_providers_endpoint_variable_stops_the_token(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    for value in ("https://bedrock-runtime.us-east-1.amazonaws.com", LLM, "my-foundry-resource"):
+        _refused(platform, vault, config_dir, {name: value}, name)
+    assert server.refreshes == 0
+
+
+@pytest.mark.parametrize("name", list(_login.PROVIDER_SWITCHES))
+def test_a_provider_switch_stops_the_token_only_when_it_is_on(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    for on in ("1", "true", "TRUE", "yes"):
+        _refused(platform, vault, config_dir, {name: on}, name)
+    for off in ("", "0", "false", "no"):
+        assert _login.access_token(runtime(platform, vault, config_dir, env={name: off}), None)
+
+
+PROXY_NAMES = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"]
+
+
+@pytest.mark.parametrize("name", PROXY_NAMES)
+@pytest.mark.parametrize(
+    "value",
+    ["http://evil.example:3128", "evil.example:3128", "http://user:s3cret@evil.example:3128", "socks5://10.0.0.9"],
+)
+def test_a_proxy_nobody_allowed_stops_the_token_and_its_password_is_not_echoed(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str, value: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    error = _refused(platform, vault, config_dir, {name: value}, name)
+    assert "s3cret" not in error.message and "--allow-proxy" in error.message
+    assert server.refreshes == 0
+
+
+def test_a_proxy_the_person_allowed_by_name_is_let_through_and_no_other_is(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    rt = runtime(platform, vault, config_dir, opener=browser(server))
+    assert _login.login(rt, ISSUER, timeout=10, allow_proxies=["Proxy.Corp.Example"]) == 0
+    ok = {"HTTPS_PROXY": "http://u:p@proxy.corp.example:8080"}
+    assert _login.access_token(runtime(platform, vault, config_dir, env=ok), None)
+    assert _login.access_token(
+        runtime(platform, vault, config_dir, env={"https_proxy": "proxy.corp.example:3128"}), None
+    )
+    _refused(platform, vault, config_dir, {"HTTPS_PROXY": "http://other.corp.example:8080"}, "HTTPS_PROXY")
+    _refused(platform, vault, config_dir, {**ok, "ALL_PROXY": "http://evil.example"}, "ALL_PROXY")
+    # the allowance is read from the person's own file: no environment variable can grant it
+    _refused(
+        platform,
+        vault,
+        config_dir,
+        {"HTTPS_PROXY": "http://evil.example", "AUTHFI_ALLOW_PROXY": "evil.example"},
+        "HTTPS_PROXY",
+    )
+
+
+@pytest.mark.parametrize("value", ["0", " 0 "])
+def test_certificate_verification_turned_off_always_stops_the_token(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    _refused(platform, vault, config_dir, {"NODE_TLS_REJECT_UNAUTHORIZED": value}, "NODE_TLS_REJECT_UNAUTHORIZED")
+    assert _login.access_token(runtime(platform, vault, config_dir, env={"NODE_TLS_REJECT_UNAUTHORIZED": "1"}), None)
+    with pytest.raises(LoginError):  # it cannot be allowed by name
+        _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=["NODE_TLS_REJECT_UNAUTHORIZED=0"])
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"],
+)
+def test_a_trust_store_variable_stops_the_token_unless_that_exact_value_was_allowed(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    _refused(platform, vault, config_dir, {name: "/repo/evil-ca.pem"}, name)
+    assert (
+        _login.login(
+            runtime(platform, vault, config_dir, opener=browser(server)),
+            ISSUER,
+            timeout=10,
+            allow_env=[f"{name}=/etc/ssl/corp-ca.pem"],
+        )
+        == 0
+    )
+    assert _login.access_token(runtime(platform, vault, config_dir, env={name: "/etc/ssl/corp-ca.pem"}), None)
+    _refused(platform, vault, config_dir, {name: "/repo/evil-ca.pem"}, name)  # the name alone allows nothing
+
+
+@pytest.mark.parametrize(
+    ("value", "refused"),
+    [
+        ("bundled", False),
+        ("system", False),
+        ("bundled, system", False),
+        ("bundled,/repo/ca.pem", True),
+        ("/repo/ca.pem", True),
+    ],
+)
+def test_the_cert_store_variable_may_only_narrow_the_built_in_sources(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str, refused: bool
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    env = {"CLAUDE_CODE_CERT_STORE": value}
+    if refused:
+        _refused(platform, vault, config_dir, env, "CLAUDE_CODE_CERT_STORE")
+    else:
+        assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
+
+
+@pytest.mark.parametrize(
+    ("value", "refused"),
+    [
+        ("--max-old-space-size=4096", False),
+        ("--require /repo/hook.js", True),
+        ("-r /repo/hook.js", True),
+        ("--import=/repo/hook.mjs", True),
+        ("--experimental-loader /repo/l.mjs", True),
+        ("--use-openssl-ca", True),
+        ("--tls-min-v1.0", True),
+    ],
+)
+def test_node_options_that_load_code_or_change_tls_stop_the_token(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str, refused: bool
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    env = {"NODE_OPTIONS": value}
+    if refused:
+        _refused(platform, vault, config_dir, env, "NODE_OPTIONS")
+    else:
+        assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
+
+
+def test_allow_env_takes_only_the_names_the_guard_can_allow(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    for bad in ("HTTPS_PROXY=http://x", "ANTHROPIC_BASE_URL=https://evil.example/llm", "NODE_EXTRA_CA_CERTS=", "x"):
+        with pytest.raises(LoginError) as caught:
+            _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=[bad])
+        assert caught.value.code == "bad_allow"
+    assert platform.requests == [] and vault.values == {}  # refused before any call
+
+
+def test_a_clean_environment_and_the_allowed_ones_get_their_token_through_the_command(
+    platform: Platform,
+    server: FakeAS,
+    vault: MemoryVault,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    monkeypatch.setattr(_login, "open_vault", lambda: vault)
+    monkeypatch.setattr(cli_module, "_http_client", lambda: platform.client())
+    monkeypatch.setenv("AUTHFI_CONFIG_DIR", str(config_dir))
+    for name in (*_login.PROXY_VARIABLES, *_login.TLS_VARIABLES, _login.TLS_OFF, *_login.PROVIDER_SWITCHES):
+        monkeypatch.delenv(name, raising=False)
+    assert cli_module.main(["token", "--resource", "llm", "--issuer", ISSUER]) == 0
+    assert capsys.readouterr().out.strip().count(".") == 2
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil.example:3128")
+    assert cli_module.main(["token", "--resource", "llm", "--issuer", ISSUER]) == 1
+    out = capsys.readouterr()
+    assert out.out == "" and "HTTPS_PROXY" in out.err and "evil.example" in out.err

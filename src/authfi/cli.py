@@ -65,6 +65,20 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("--issuer", help="the project origin, such as https://acme.authfi.io")
     login.add_argument("--no-browser", action="store_true", help="print the address instead of opening a browser")
     login.add_argument("--reregister", action="store_true", help="register this machine's client again")
+    login.add_argument(
+        "--allow-proxy",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="let `authfi token` run behind this proxy host",
+    )
+    login.add_argument(
+        "--allow-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="let `authfi token` run with this exact CA or TLS variable value",
+    )
     login.add_argument("--timeout", type=float, default=_login.CALLBACK_TIMEOUT, help="seconds to wait for the browser")
     logout = commands.add_parser("logout", help="revoke the person's refresh token and delete what is stored")
     logout.add_argument("--issuer", help="the project origin; default the one signed in to")
@@ -89,7 +103,13 @@ def _person_command(args: argparse.Namespace) -> int:
         runtime = _login.Runtime(env=os.environ, vault=_login.open_vault(), http_client=_http_client())
         if args.command == "login":
             return _login.login(
-                runtime, args.issuer, browser=not args.no_browser, reregister=args.reregister, timeout=args.timeout
+                runtime,
+                args.issuer,
+                browser=not args.no_browser,
+                reregister=args.reregister,
+                timeout=args.timeout,
+                allow_proxies=args.allow_proxy,
+                allow_env=args.allow_env,
             )
         if args.command == "logout":
             return _login.logout(runtime, args.issuer)

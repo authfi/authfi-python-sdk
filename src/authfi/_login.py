@@ -27,11 +27,12 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -267,6 +268,14 @@ def _object(value: object) -> dict[str, Any]:
     return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
 
 
+@dataclass(frozen=True, slots=True)
+class Allowed:
+    """The proxy hosts and the exact environment values the person allowed by name."""
+
+    proxies: frozenset[str]
+    env: Mapping[str, str]
+
+
 class Config:
     """``login.json``: the issuer last signed in to and, per issuer, the client id registered for it. No secrets."""
 
@@ -303,10 +312,35 @@ class Config:
         value = _object(self._read().get("aliases")).get(typed)
         return value if isinstance(value, str) and value else typed
 
+    def allowed(self) -> Allowed:
+        """What the person allowed with ``authfi login --allow-proxy`` and ``--allow-env``; nothing by default."""
+        entry = _object(self._read().get("allow"))
+        proxies = entry.get("proxies")
+        env = _object(entry.get("env"))
+        return Allowed(
+            proxies=frozenset(p.lower() for p in cast("list[Any]", proxies) if isinstance(p, str))
+            if isinstance(proxies, list)
+            else frozenset(),
+            env={k: v for k, v in env.items() if isinstance(v, str)},
+        )
+
     def save(
-        self, issuer: str, *, client_id: str | None = None, default: bool = True, alias: str | None = None
+        self,
+        issuer: str,
+        *,
+        client_id: str | None = None,
+        default: bool = True,
+        alias: str | None = None,
+        allow_proxies: Sequence[str] = (),
+        allow_env: Mapping[str, str] | None = None,
     ) -> None:
         data = self._read()
+        if allow_proxies or allow_env:
+            allow = _object(data.get("allow"))
+            known = cast("list[str]", allow.get("proxies") or [])
+            allow["proxies"] = sorted({*known, *(p.lower() for p in allow_proxies)})
+            allow["env"] = {**_object(allow.get("env")), **(allow_env or {})}
+            data["allow"] = allow
         clients = _object(data.get("clients"))
         if client_id is not None:
             clients[issuer] = {"client_id": client_id}
@@ -561,6 +595,19 @@ def _sign_in(
         receiver.server_close()
 
 
+def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
+    """``NAME=VALUE`` pairs for the variables the guard can allow; anything else is a :class:`LoginError`."""
+    out: dict[str, str] = {}
+    for pair in pairs:
+        name, _, value = pair.partition("=")
+        if name not in TLS_VARIABLES or not value:
+            raise LoginError(
+                f"--allow-env takes NAME=VALUE for one of {', '.join(TLS_VARIABLES)}: {name!r}", code="bad_allow"
+            )
+        out[name] = value
+    return out
+
+
 def login(
     rt: Runtime,
     issuer_arg: str | None,
@@ -568,6 +615,8 @@ def login(
     browser: bool = True,
     reregister: bool = False,
     timeout: float = CALLBACK_TIMEOUT,
+    allow_proxies: Sequence[str] = (),
+    allow_env: Sequence[str] = (),
 ) -> int:
     """Sign the person in for the project's ``/llm`` door and keep the refresh token in the credential store.
 
@@ -575,6 +624,7 @@ def login(
     repeated; a second refusal is the answer.
     """
     config = rt.config()
+    allowed_env = _allowed_env(allow_env)
     typed = resolve_issuer(issuer_arg, rt.env, config)
     issuer = canonical_issuer(rt, typed)
     try:
@@ -603,7 +653,7 @@ def login(
                 code="store_failed",
             ) from exc
         _store_access(rt, key, tokens)
-        config.save(issuer, client_id=client_id, alias=typed)
+        config.save(issuer, client_id=client_id, alias=typed, allow_proxies=allow_proxies, allow_env=allowed_env)
     rt.out(f"signed in to {issuer} as {signed_in.user.sub}")
     return 0
 
@@ -651,9 +701,61 @@ def _cached(rt: Runtime, issuer: str, min_validity: float) -> str | None:
     return None
 
 
-#: Variables a tool reads to learn where its model calls go. The helper inherits the tool's environment, so a repo's
-#: settings that point one of these elsewhere would otherwise send the person's token there.
+#: Variables through which a tool learns where its model calls go. A repository's settings file can set every one
+#: of them (its ``env`` block reaches the helper's environment), so no token is printed unless each is absent or right.
+#: Sources: Claude Code's settings, env-vars, network-config, amazon-bedrock and google-vertex-ai pages
+#: (code.claude.com/docs/en), read on 2026-11-16; the OpenAI names are those its SDKs read.
+#:
+#: These must name this project's ``/llm`` door.
 BASE_URL_VARIABLES = ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+#: Another provider's endpoint: the request would go to Bedrock, Vertex, Foundry or a cloud gateway, never to ``/llm``.
+PROVIDER_URL_VARIABLES = (
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+)
+#: Switches that send the request to another provider; a truthy value is refused.
+PROVIDER_SWITCHES = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+)
+#: A proxy sees the request, and the bearer in it, unless the person allowed that proxy host.
+PROXY_VARIABLES = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+)
+#: Trust-store and TLS variables: a CA the person did not name lets a proxy read the token in transit.
+TLS_VARIABLES = (
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "CLAUDE_CODE_CERT_STORE",
+    "NODE_OPTIONS",
+)
+#: Verification turned off is never allowed.
+TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
+_FALSE = frozenset({"", "0", "false", "no", "off"})
+_CERT_STORE_SOURCES = frozenset({"bundled", "system"})
+_NODE_OPTION = re.compile(
+    r"(^|\s)(-r|--require|--import|--loader|--experimental-loader|--use-openssl-ca|--use-bundled-ca|--openssl-config|--tls-[a-z0-9-]+)\b"
+)
 
 
 def _is_llm_url(value: str, origins: frozenset[str]) -> bool:
@@ -673,19 +775,67 @@ def _is_llm_url(value: str, origins: frozenset[str]) -> bool:
     return origin in origins and (path.rstrip("/") == LLM_PATH or path.startswith(LLM_PATH + "/"))
 
 
-def check_base_url(env: Mapping[str, str], origins: set[str]) -> None:
-    """Refuse when a tool's base URL names anything but this project's ``/llm`` door."""
-    allowed = frozenset(origin.lower() for origin in origins)
+def _host_of(proxy: str) -> str:
+    """The host a proxy value names, without its credentials or port (``host:port`` with no scheme is accepted)."""
+    text = proxy.strip()
+    try:
+        parts = urlsplit(text if "://" in text else "//" + text)
+        return (parts.hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _refuse(name: str, why: str, fix: str) -> LoginError:
+    return LoginError(f"{name} {why}, so no token is printed; {fix}", code="environment_refused")
+
+
+def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> None:
+    """Refuse to print a token when the environment would steer it to another server or expose it in transit.
+
+    This reads the helper's own environment only. A flag on the tool's command line, a settings file the tool did not
+    load into the environment, or a base URL the tool holds in memory is not visible here.
+    """
+    allow = config.allowed()
+    door = resource_for(issuer)
+    origins = frozenset({issuer.lower()})
     for name in BASE_URL_VARIABLES:
         value = env.get(name, "").strip()
-        if value and not _is_llm_url(value, allowed):
+        if value and not _is_llm_url(value, origins):
             shown = urlsplit(value)
             where = f"{shown.scheme}://{shown.hostname}" if shown.hostname else "a value that is not an address"
-            raise LoginError(
-                f"{name} points at {where}, not at this project's {LLM_PATH} door, so no token is printed; "
-                f"set it to {resource_for(sorted(allowed)[0])} or unset it",
-                code="base_url_mismatch",
+            raise _refuse(
+                name, f"points at {where}, not at this project's {LLM_PATH} door", f"set it to {door} or unset it"
             )
+    for name in PROVIDER_URL_VARIABLES:
+        if env.get(name, "").strip():
+            raise _refuse(name, "sends the request to another provider's endpoint, not to the /llm door", "unset it")
+    for name in PROVIDER_SWITCHES:
+        if env.get(name, "").strip().lower() not in _FALSE:
+            raise _refuse(name, "switches the tool to another provider", "unset it")
+    for name in PROXY_VARIABLES:
+        value = env.get(name, "").strip()
+        host = _host_of(value) if value else ""
+        if value and host not in allow.proxies:
+            raise _refuse(
+                name,
+                f"names the proxy {host or 'that is not an address'}, which could read the token",
+                f"unset it, or allow that host once with: authfi login --allow-proxy {host or 'HOST'}",
+            )
+    if env.get(TLS_OFF, "").strip() == "0":
+        raise _refuse(TLS_OFF, "turns certificate verification off", "unset it; this cannot be allowed")
+    for name in TLS_VARIABLES:
+        value = env.get(name, "").strip()
+        if not value or allow.env.get(name) == value:
+            continue
+        if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:
+            continue  # a subset of the built-in sources only narrows what is trusted
+        if name == "NODE_OPTIONS" and not _NODE_OPTION.search(value):
+            continue
+        raise _refuse(
+            name,
+            "changes which certificates or code the tool trusts",
+            f"unset it, or allow exactly this value once with: authfi login --allow-env {name}=<value>",
+        )
 
 
 def _forget(rt: Runtime, key: str) -> None:
@@ -735,7 +885,7 @@ def access_token(rt: Runtime, issuer_arg: str | None, *, min_validity: float = D
     config = rt.config()
     typed = resolve_issuer(issuer_arg, rt.env, config)
     issuer = config.canonical(typed)
-    check_base_url(rt.env, {typed, issuer})
+    check_environment(rt.env, issuer, config)
     key = slot(issuer, config.directory)
     cached = _cached(rt, key, min_validity)
     if cached is not None:
