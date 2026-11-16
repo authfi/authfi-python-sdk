@@ -9,9 +9,13 @@ the person, not as an agent. The person signs in once in a browser; after that a
   nowhere else. With no usable store nothing is signed in and nothing is written: there is no plaintext fallback.
   The access token is kept there too, only until shortly before it expires. What goes to a file is not secret:
   the issuer and the client id.
-* The server rotates a refresh token on every use and a second use of a spent one ends the whole family, so two
-  helpers running at once (two editor windows) take a cross-process lock around the refresh, and the second finds
-  the first one's token in the store instead of spending the old one again.
+* The server rotates a refresh token on every use and a second use of a spent one ends the whole family, so every
+  command that reads or writes the stored token (``login``, ``logout`` and the renewal) takes one cross-process lock
+  kept in the config directory that names the token, and the second finds the first one's token in the store instead
+  of spending the old one again. A refresh whose outcome is unknown (the answer was lost, the store refused the new
+  token) is never repeated with the old token: the old one is dropped and the person signs in again.
+* The issuer and the ``/llm`` resource come from the project's discovery document (its canonical issuer), not from
+  the host that was typed.
 
 The protocol is the SDK's own: PKCE, ``state``, ``iss`` and the ID token are checked by :class:`~authfi.signin.WebApp`.
 """
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -32,16 +37,24 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import IO, Any, Protocol, cast
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 import httpx
 
 from authfi._protocol.register import parse_registration, registration_request
 from authfi._protocol.verify import unverified_claims
 from authfi.client import AuthFI
-from authfi.errors import AuthFIError, ConfigurationError, NotSupportedError
+from authfi.errors import (
+    AuthFIError,
+    ConfigurationError,
+    DiscoveryError,
+    NotSupportedError,
+    OAuthError,
+    TemporarilyUnavailable,
+    TransportError,
+)
 from authfi.secret import Secret
-from authfi.signin import WebApp
+from authfi.signin import SignedIn, WebApp
 from authfi.tokens import TokenSet
 
 if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
@@ -69,6 +82,7 @@ REGISTERED_REDIRECT = "http://127.0.0.1"
 #: minutes by default, so the token must outlive that, not just the moment the helper printed it.
 DEFAULT_MIN_VALIDITY = 400.0
 LOCK_TIMEOUT = 60.0
+LOCK_NAME = "refresh.lock"
 CALLBACK_TIMEOUT = 300.0
 
 Clock = Callable[[], float]
@@ -109,28 +123,69 @@ class Vault(Protocol):
     def delete(self, issuer: str, name: str) -> None: ...
 
 
+#: Windows Credential Locker refuses a blob over 2560 bytes (CRED_MAX_CREDENTIAL_BLOB_SIZE) and keyring stores it as
+#: UTF-16, so a value over 1280 characters would not fit. A value is kept in pieces of this many characters.
+CHUNK = 900
+_CHUNKS = "chunks:"
+
+
 class KeyringVault:
-    """The :mod:`keyring` store (Credential Manager, Keychain, Secret Service): one entry per issuer and name."""
+    """The :mod:`keyring` store (Credential Manager, Keychain, Secret Service): one entry per issuer and name.
+
+    A value longer than :data:`CHUNK` is split across entries, so a long refresh token fits the Windows blob limit.
+    The head entry names the piece count; a piece that is missing reads as no value.
+    """
 
     def __init__(self, keyring_module: Any) -> None:
         self._keyring = keyring_module
 
     @staticmethod
-    def _user(issuer: str, name: str) -> str:
-        return f"{issuer}#{name}"
+    def _user(issuer: str, name: str, piece: int | None = None) -> str:
+        return f"{issuer}#{name}" if piece is None else f"{issuer}#{name}#{piece}"
 
-    def get(self, issuer: str, name: str) -> str | None:
-        value = self._keyring.get_password("authfi", self._user(issuer, name))
+    def _read(self, issuer: str, name: str, piece: int | None = None) -> str | None:
+        value = self._keyring.get_password("authfi", self._user(issuer, name, piece))
         return value if isinstance(value, str) and value else None
 
-    def set(self, issuer: str, name: str, value: str) -> None:
-        self._keyring.set_password("authfi", self._user(issuer, name), value)
+    def get(self, issuer: str, name: str) -> str | None:
+        head = self._read(issuer, name)
+        if head is None or not head.startswith(_CHUNKS):
+            return head
+        try:
+            count = int(head[len(_CHUNKS) :])
+        except ValueError:
+            return None
+        pieces = [self._read(issuer, name, i) for i in range(count)]
+        return None if count < 1 or any(piece is None for piece in pieces) else "".join(cast("list[str]", pieces))
 
-    def delete(self, issuer: str, name: str) -> None:
+    def set(self, issuer: str, name: str, value: str) -> None:
+        pieces = [value[i : i + CHUNK] for i in range(0, len(value), CHUNK)] or [""]
+        previous = self._count(issuer, name)
+        for index, piece in enumerate(pieces):
+            self._keyring.set_password("authfi", self._user(issuer, name, index), piece)
+        self._keyring.set_password("authfi", self._user(issuer, name), f"{_CHUNKS}{len(pieces)}")
+        for index in range(len(pieces), previous):
+            self._drop(issuer, name, index)
+
+    def _count(self, issuer: str, name: str) -> int:
+        head = self._read(issuer, name)
+        if head is None or not head.startswith(_CHUNKS):
+            return 0
+        try:
+            return int(head[len(_CHUNKS) :])
+        except ValueError:
+            return 0
+
+    def _drop(self, issuer: str, name: str, piece: int | None = None) -> None:
         from keyring.errors import PasswordDeleteError
 
         with contextlib.suppress(PasswordDeleteError):
-            self._keyring.delete_password("authfi", self._user(issuer, name))
+            self._keyring.delete_password("authfi", self._user(issuer, name, piece))
+
+    def delete(self, issuer: str, name: str) -> None:
+        for index in range(self._count(issuer, name)):
+            self._drop(issuer, name, index)
+        self._drop(issuer, name)
 
 
 _NO_STORE = (
@@ -140,24 +195,59 @@ _NO_STORE = (
     "Keyring or KWallet."
 )
 
+#: The backends that keep a secret under the operating system's own protection. Anything else (``keyrings.alt``'s
+#: plaintext and encrypted files, a chain that falls to one, a ``PYTHON_KEYRING_BACKEND`` naming a file store) is
+#: refused, because the refresh token would be readable by any process of the user.
+SECURE_BACKENDS = frozenset(
+    {
+        "keyring.backends.macOS.Keyring",
+        "keyring.backends.Windows.WinVaultKeyring",
+        "keyring.backends.SecretService.Keyring",
+        "keyring.backends.libsecret.Keyring",
+        "keyring.backends.kwallet.DBusKeyring",
+        "keyring.backends.kwallet.DBusKeyringKWallet4",
+    }
+)
+
+
+def _backend_name(backend: object) -> str:
+    kind = type(backend)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def _unsecure_backend(backend: Any) -> str | None:
+    """The name of the first backend in ``backend`` (or its chain) that is not an operating-system store."""
+    members = getattr(backend, "backends", None)
+    if _backend_name(backend) == "keyring.backends.chainer.ChainerBackend":
+        chain = list(members or [])
+        return next((_backend_name(b) for b in chain if _backend_name(b) not in SECURE_BACKENDS), None) or (
+            None if chain else _backend_name(backend)
+        )
+    return None if _backend_name(backend) in SECURE_BACKENDS else _backend_name(backend)
+
 
 def open_vault() -> Vault:
     """The credential store, or a :class:`LoginError` saying why there is none. Called before anything is written."""
     try:
         import keyring
-        import keyring.backends.fail
-        import keyring.backends.null
     except ImportError as exc:
         raise LoginError(
             _NO_STORE.format(why="the keyring package is not installed"), code="no_credential_store"
         ) from exc
     try:
         backend = keyring.get_keyring()
-        unusable = isinstance(backend, (keyring.backends.fail.Keyring, keyring.backends.null.Keyring))
+        refused = _unsecure_backend(backend)
     except Exception as exc:  # a backend that fails while it is being chosen is no backend
         raise LoginError(_NO_STORE.format(why="no keyring backend started"), code="no_credential_store") from exc
-    if unusable:
-        raise LoginError(_NO_STORE.format(why="this machine has no keyring backend"), code="no_credential_store")
+    if refused is not None:
+        raise LoginError(
+            _NO_STORE.format(
+                why=f"the keyring backend {refused} is not an operating-system store (Keychain, Credential Locker, "
+                "Secret Service or KWallet); uninstall keyrings.alt and unset PYTHON_KEYRING_BACKEND and keyringrc.cfg "
+                "if they select it"
+            ),
+            code="no_credential_store",
+        )
     return KeyringVault(keyring)
 
 
@@ -208,12 +298,23 @@ class Config:
         value = entry.get("client_id")
         return value if isinstance(value, str) and value else None
 
-    def save(self, issuer: str, *, client_id: str | None = None, default: bool = True) -> None:
+    def canonical(self, typed: str) -> str:
+        """The issuer the project names for itself, when ``typed`` was another door onto it (a slug host)."""
+        value = _object(self._read().get("aliases")).get(typed)
+        return value if isinstance(value, str) and value else typed
+
+    def save(
+        self, issuer: str, *, client_id: str | None = None, default: bool = True, alias: str | None = None
+    ) -> None:
         data = self._read()
         clients = _object(data.get("clients"))
         if client_id is not None:
             clients[issuer] = {"client_id": client_id}
         data["clients"] = clients
+        if alias is not None and alias != issuer:
+            aliases = _object(data.get("aliases"))
+            aliases[alias] = issuer
+            data["aliases"] = aliases
         if default:
             data["default_issuer"] = issuer
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -224,6 +325,16 @@ class Config:
         with contextlib.suppress(OSError):
             temporary.chmod(0o600)
         os.replace(temporary, self.path)
+
+
+def slot(issuer: str, directory: Path) -> str:
+    """The credential-store key of the sign-in kept for ``issuer`` by the config directory ``directory``.
+
+    The store is shared by every process of the user, so the secret is keyed by the directory whose lock guards it:
+    two config directories hold two sign-ins and never race over one refresh token.
+    """
+    where = os.path.normcase(os.path.abspath(directory))
+    return f"{issuer}#{hashlib.sha256(where.encode()).hexdigest()[:12]}"
 
 
 def resolve_issuer(explicit: str | None, env: Mapping[str, str], config: Config) -> str:
@@ -389,24 +500,48 @@ def _register(af: AuthFI) -> str:
     return parse_registration(response, redirect_uris=[REGISTERED_REDIRECT])
 
 
-def login(
-    rt: Runtime,
-    issuer_arg: str | None,
-    *,
-    browser: bool = True,
-    reregister: bool = False,
-    timeout: float = CALLBACK_TIMEOUT,
-) -> int:
-    """Sign the person in for the project's ``/llm`` door and keep the refresh token in the credential store."""
-    config = rt.config()
-    issuer = resolve_issuer(issuer_arg, rt.env, config)
+def canonical_issuer(rt: Runtime, typed: str) -> str:
+    """The issuer the project's discovery document names, which is not always the host that was typed.
+
+    A project has one issuer, its canonical origin, however many doors lead to it (RFC 8414); the resource and the
+    token audience are built from it. The typed host is the trust anchor: what it publishes is checked as an https
+    origin, and the issuer it names must then publish its own discovery document naming itself.
+    """
+    client = rt.http_client or httpx.Client(timeout=15.0, follow_redirects=False)
+    try:
+        for path in ("/.well-known/openid-configuration", "/.well-known/oauth-authorization-server"):
+            try:
+                response = client.get(typed + path, headers={"Accept": "application/json"})
+            except httpx.HTTPError as exc:
+                raise LoginError(
+                    f"cannot reach {typed} to read its discovery document ({type(exc).__name__})",
+                    code="discovery_failed",
+                ) from exc
+            if response.status_code != 200:
+                continue
+            try:
+                doc: Any = response.json()
+            except ValueError:
+                continue
+            named = cast("dict[str, Any]", doc).get("issuer") if isinstance(doc, dict) else None
+            if isinstance(named, str):
+                return normalise_issuer(named)
+        raise LoginError(f"{typed} publishes no discovery document that names its issuer", code="discovery_failed")
+    finally:
+        if rt.http_client is None:
+            client.close()
+
+
+def _sign_in(
+    rt: Runtime, config: Config, issuer: str, *, browser: bool, register: bool, timeout: float
+) -> tuple[SignedIn, str]:
     receiver = _Receiver()
     try:
         with AuthFI(issuer, http_client=rt.http_client) as af:
             metadata = af.metadata()
             if metadata.authorization_endpoint is None:
                 raise LoginError("this project's discovery names no authorization endpoint", code="not_supported")
-            client_id = None if reregister else config.client_id(issuer)
+            client_id = None if register else config.client_id(issuer)
             if client_id is None:
                 client_id = _register(af)
             web = _web_app(af, client_id, receiver.redirect_uri)
@@ -421,9 +556,34 @@ def login(
                     rt.open_browser(pending.url)
             params = receiver.wait(timeout)
             receiver.server_close()
-            signed_in = web.finish_sign_in(params, pending)
+            return web.finish_sign_in(params, pending), client_id
     finally:
         receiver.server_close()
+
+
+def login(
+    rt: Runtime,
+    issuer_arg: str | None,
+    *,
+    browser: bool = True,
+    reregister: bool = False,
+    timeout: float = CALLBACK_TIMEOUT,
+) -> int:
+    """Sign the person in for the project's ``/llm`` door and keep the refresh token in the credential store.
+
+    A stored client the server no longer knows (``invalid_client``) is registered again once, and the sign-in
+    repeated; a second refusal is the answer.
+    """
+    config = rt.config()
+    typed = resolve_issuer(issuer_arg, rt.env, config)
+    issuer = canonical_issuer(rt, typed)
+    try:
+        signed_in, client_id = _sign_in(rt, config, issuer, browser=browser, register=reregister, timeout=timeout)
+    except OAuthError as error:
+        if error.code != "invalid_client":
+            raise
+        rt.err("this machine's client is no longer registered; registering it again")
+        signed_in, client_id = _sign_in(rt, config, issuer, browser=browser, register=True, timeout=timeout)
     tokens = signed_in.tokens
     if tokens.refresh_token is None:
         raise LoginError(
@@ -432,9 +592,18 @@ def login(
     if tokens.scope and "llm:invoke" not in tokens.scope:
         raise LoginError("the server did not grant llm:invoke; ask your administrator for access to the /llm door")
     _check_audience(tokens.access_token, resource_for(issuer))
-    rt.vault.set(issuer, "refresh", tokens.refresh_token.reveal())
-    _store_access(rt, issuer, tokens)
-    config.save(issuer, client_id=client_id)
+    key = slot(issuer, config.directory)
+    with file_lock(config.directory / LOCK_NAME):
+        try:
+            rt.vault.set(key, "refresh", tokens.refresh_token.reveal())
+        except Exception as exc:
+            raise LoginError(
+                "the credential store refused the refresh token, so nothing is signed in "
+                f"({type(exc).__name__} from the store)",
+                code="store_failed",
+            ) from exc
+        _store_access(rt, key, tokens)
+        config.save(issuer, client_id=client_id, alias=typed)
     rt.out(f"signed in to {issuer} as {signed_in.user.sub}")
     return 0
 
@@ -482,60 +651,151 @@ def _cached(rt: Runtime, issuer: str, min_validity: float) -> str | None:
     return None
 
 
+#: Variables a tool reads to learn where its model calls go. The helper inherits the tool's environment, so a repo's
+#: settings that point one of these elsewhere would otherwise send the person's token there.
+BASE_URL_VARIABLES = ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+
+
+def _is_llm_url(value: str, origins: frozenset[str]) -> bool:
+    try:
+        parts = urlsplit(value.strip())
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        return False
+    if parts.query or parts.fragment or port not in (None, 443):
+        return False
+    path = unquote(unquote(parts.path))
+    if ".." in path.split("/") or "." in path.split("/") or "\\" in path or "//" in path:
+        return False
+    origin = urlunsplit(("https", parts.hostname.lower(), "", "", ""))
+    return origin in origins and (path.rstrip("/") == LLM_PATH or path.startswith(LLM_PATH + "/"))
+
+
+def check_base_url(env: Mapping[str, str], origins: set[str]) -> None:
+    """Refuse when a tool's base URL names anything but this project's ``/llm`` door."""
+    allowed = frozenset(origin.lower() for origin in origins)
+    for name in BASE_URL_VARIABLES:
+        value = env.get(name, "").strip()
+        if value and not _is_llm_url(value, allowed):
+            shown = urlsplit(value)
+            where = f"{shown.scheme}://{shown.hostname}" if shown.hostname else "a value that is not an address"
+            raise LoginError(
+                f"{name} points at {where}, not at this project's {LLM_PATH} door, so no token is printed; "
+                f"set it to {resource_for(sorted(allowed)[0])} or unset it",
+                code="base_url_mismatch",
+            )
+
+
+def _forget(rt: Runtime, key: str) -> None:
+    """Drop the stored tokens (best effort): a refresh token whose use is in doubt is never presented again."""
+    for name in ("refresh", "access"):
+        with contextlib.suppress(Exception):
+            rt.vault.delete(key, name)
+
+
+def _kept_after(error: AuthFIError) -> bool:
+    """``True`` when the failure proves the refresh token was not spent, so it may be presented again."""
+    if isinstance(error, (TemporarilyUnavailable, DiscoveryError, NotSupportedError)):
+        return True
+    if isinstance(error, TransportError):
+        return error.retryable
+    if isinstance(error, OAuthError):
+        return error.status is not None and error.status < 500 and error.code not in ("invalid_grant", "invalid_client")
+    return False
+
+
+def _refresh_failed(rt: Runtime, config: Config, issuer: str, key: str, error: AuthFIError) -> AuthFIError:
+    """The error to raise after a failed refresh; the stored token is dropped unless it is known to be unspent."""
+    if _kept_after(error):
+        return error
+    _forget(rt, key)
+    if isinstance(error, OAuthError) and error.code == "invalid_client":
+        with contextlib.suppress(Exception):  # the dead client is replaced once; the person then signs in
+            with AuthFI(issuer, http_client=rt.http_client) as af:
+                config.save(issuer, client_id=_register(af), default=False)
+        return LoginError(
+            "the server no longer knows this machine's client; it was registered again: "
+            f"run authfi login --issuer {issuer}",
+            code="login_required",
+        )
+    return LoginError(
+        f"the stored sign-in cannot be used again ({error.message}); run authfi login --issuer {issuer}",
+        code="login_required",
+    )
+
+
 def access_token(rt: Runtime, issuer_arg: str | None, *, min_validity: float = DEFAULT_MIN_VALIDITY) -> str:
-    """A person access token for ``/llm``: the cached one while it lasts, otherwise a refresh under the lock."""
+    """A person access token for ``/llm``: the cached one while it lasts, otherwise a refresh under the lock.
+
+    Nothing is returned when a tool's base URL variable names another host. A refresh whose outcome is unknown is not
+    repeated: the stored refresh token is dropped and the person signs in again.
+    """
     config = rt.config()
-    issuer = resolve_issuer(issuer_arg, rt.env, config)
-    cached = _cached(rt, issuer, min_validity)
+    typed = resolve_issuer(issuer_arg, rt.env, config)
+    issuer = config.canonical(typed)
+    check_base_url(rt.env, {typed, issuer})
+    key = slot(issuer, config.directory)
+    cached = _cached(rt, key, min_validity)
     if cached is not None:
         return cached
-    with file_lock(config.directory / "refresh.lock"):
-        cached = _cached(rt, issuer, min_validity)  # another process may have renewed it while this one waited
+    with file_lock(config.directory / LOCK_NAME):
+        cached = _cached(rt, key, min_validity)  # another process may have renewed it while this one waited
         if cached is not None:
             return cached
-        refresh = rt.vault.get(issuer, "refresh")
+        refresh = rt.vault.get(key, "refresh")
         client_id = config.client_id(issuer)
         if refresh is None or client_id is None:
             raise LoginError(f"not signed in to {issuer}: run authfi login --issuer {issuer}", code="not_signed_in")
-        with AuthFI(issuer, http_client=rt.http_client) as af:
-            web = _web_app(af, client_id, REGISTERED_REDIRECT)
-            held = _held(refresh)
-            tokens = web.refresh(held)
+        try:
+            with AuthFI(issuer, http_client=rt.http_client) as af:
+                tokens = _web_app(af, client_id, REGISTERED_REDIRECT).refresh(_held(refresh))
+        except AuthFIError as error:
+            raise _refresh_failed(rt, config, issuer, key, error) from error
         if tokens.refresh_token is None:  # unreachable: from_response carries the previous one forward
-            raise LoginError("the server answered no refresh token", code="no_refresh_token")
+            _forget(rt, key)
+            raise LoginError("the server answered no refresh token; run authfi login again", code="login_required")
         rotated = tokens.refresh_token.reveal()
         if rotated != refresh:
             try:
-                rt.vault.set(issuer, "refresh", rotated)
+                rt.vault.set(key, "refresh", rotated)
             except Exception as exc:
+                _forget(rt, key)  # the old token is spent and the new one is lost: never present the old one
                 raise LoginError(
                     "the server renewed the sign-in but the credential store refused it; run authfi login again",
                     code="store_failed",
                 ) from exc
         _check_audience(tokens.access_token, resource_for(issuer))
-        _store_access(rt, issuer, tokens)
+        _store_access(rt, key, tokens)
         return tokens.access_token.reveal()
 
 
 def logout(rt: Runtime, issuer_arg: str | None) -> int:
-    """Revoke the refresh token at the server, then delete what is stored (also when the revocation fails)."""
+    """Revoke the refresh token at the server (RFC 7009), then delete what is stored (also when it fails).
+
+    Under the same lock as the renewal, so a helper in flight cannot store a rotated token after this deleted it.
+    """
     config = rt.config()
-    issuer = resolve_issuer(issuer_arg, rt.env, config)
-    refresh = rt.vault.get(issuer, "refresh")
-    failure: AuthFIError | None = None
-    client_id = config.client_id(issuer)
-    if refresh is not None and client_id is not None:
-        try:
-            with AuthFI(issuer, http_client=rt.http_client) as af:
-                held = _held(refresh)
-                _web_app(af, client_id, REGISTERED_REDIRECT).revoke(held)
-        except (AuthFIError, NotSupportedError) as error:
-            failure = error
-    rt.vault.delete(issuer, "refresh")
-    rt.vault.delete(issuer, "access")
+    issuer = config.canonical(resolve_issuer(issuer_arg, rt.env, config))
+    key = slot(issuer, config.directory)
+    with file_lock(config.directory / LOCK_NAME):
+        refresh = rt.vault.get(key, "refresh")
+        failure: str | None = None
+        client_id = config.client_id(issuer)
+        if refresh is not None and client_id is None:
+            failure = "this machine has no registered client to revoke with"
+        elif refresh is not None and client_id is not None:
+            try:
+                with AuthFI(issuer, http_client=rt.http_client) as af:
+                    _web_app(af, client_id, REGISTERED_REDIRECT).revoke(_held(refresh))
+            except (AuthFIError, NotSupportedError) as error:
+                failure = error.message
+        rt.vault.delete(key, "refresh")
+        rt.vault.delete(key, "access")
     if failure is not None:
         raise LoginError(
-            f"the stored tokens were deleted but the server did not confirm the revocation ({failure.message}); "
+            f"the stored tokens were deleted but the server did not confirm the revocation ({failure}); "
             "the refresh token stays valid there until it expires",
             code="revocation_failed",
         )

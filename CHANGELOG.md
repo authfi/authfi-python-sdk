@@ -19,7 +19,11 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   credential store until shortly before it expires, and on failure prints the reason on stderr and nothing on stdout.
   `logout` revokes at the revocation endpoint and deletes what is stored. Bare `authfi token` is unchanged. See
   [docs/claude-code.md](docs/claude-code.md). `ServerMetadata.registration_endpoint`, `WebApp.start_sign_in(resource=...)`
-  and `WebApp.revoke()` (and their async twins) are the pieces it is built from.
+  and `WebApp.revoke()` (and their async twins) are the pieces it is built from. Only the operating system's stores
+  are accepted (Keychain, Credential Locker, Secret Service, KWallet; a file backend is refused), a long refresh token
+  is kept in pieces, `login` and `logout` share the renewal's lock, a renewal of unknown outcome is never repeated with
+  the spent token, `token --resource llm` prints nothing when `ANTHROPIC_BASE_URL` is not the project's `/llm`, and the
+  issuer comes from the discovery document.
 - `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
   method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`
   holds the SDK to the same rules offline: a renewal after the nonce rotated, no downgrade to Bearer after a refusal.
