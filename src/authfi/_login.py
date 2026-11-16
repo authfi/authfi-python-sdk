@@ -316,11 +316,10 @@ class Config:
         """What the person allowed with ``authfi login --allow-proxy`` and ``--allow-env``; nothing by default."""
         entry = _object(self._read().get("allow"))
         proxies = entry.get("proxies")
+        listed: list[object] = cast("list[object]", proxies) if isinstance(proxies, list) else []
         env = _object(entry.get("env"))
         return Allowed(
-            proxies=frozenset(p.lower() for p in proxies if isinstance(p, str))
-            if isinstance(proxies, list)
-            else frozenset(),
+            proxies=frozenset(p.lower() for p in listed if isinstance(p, str)),
             env={k: v for k, v in env.items() if isinstance(v, str)},
         )
 
