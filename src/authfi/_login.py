@@ -25,10 +25,13 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import importlib
 import json
 import os
 import re
+import shlex
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -69,6 +72,7 @@ __all__ = [
     "LoginError",
     "Vault",
     "access_token",
+    "helper_command",
     "login",
     "logout",
     "open_vault",
@@ -212,45 +216,69 @@ SECURE_BACKENDS = frozenset(
 )
 
 
-def _backend_name(backend: object) -> str:
-    kind = type(backend)
-    return f"{kind.__module__}.{kind.__qualname__}"
+def helper_command() -> str:
+    """The ``apiKeyHelper`` value that starts the helper isolated: this interpreter, by absolute path, with ``-I``.
+
+    ``-I`` ignores ``PYTHON*`` variables and the user site and keeps the working directory off ``sys.path``, so
+    a repository's environment cannot make Python run its code before the guard looks at that environment. A console
+    script cannot carry the flag, which is why the helper is started as ``python -I -m authfi``.
+    """
+    argv = [sys.executable, "-I", "-m", "authfi", "token", "--resource", "llm"]
+    return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
 
 
-def _unsecure_backend(backend: Any) -> str | None:
-    """The name of the first backend in ``backend`` (or its chain) that is not an operating-system store."""
-    members = getattr(backend, "backends", None)
-    if _backend_name(backend) == "keyring.backends.chainer.ChainerBackend":
-        chain = list(members or [])
-        return next((_backend_name(b) for b in chain if _backend_name(b) not in SECURE_BACKENDS), None) or (
-            None if chain else _backend_name(backend)
-        )
-    return None if _backend_name(backend) in SECURE_BACKENDS else _backend_name(backend)
+def _backend_classes(platform: str) -> list[tuple[str, str]]:
+    """The operating system's own stores for ``platform``, as ``(module, class)``, in the order they are tried.
+
+    keyring is never asked which backend to use: its own choice reads ``keyringrc.cfg`` from a folder the environment
+    names (``XDG_CONFIG_HOME``, ``LOCALAPPDATA``), imports a module from that file's ``keyring-path``, and honours
+    ``PYTHON_KEYRING_BACKEND``, all before this helper could refuse anything. The class is named here and nowhere else.
+    """
+    if platform == "win32":
+        return [("keyring.backends.Windows", "WinVaultKeyring")]
+    if platform == "darwin":
+        return [("keyring.backends.macOS", "Keyring")]
+    return [("keyring.backends.SecretService", "Keyring"), ("keyring.backends.kwallet", "DBusKeyring")]
+
+
+def _started(module: str, name: str) -> Any:
+    """An instance of the named store class when it starts and reports itself usable, else ``None``."""
+    try:
+        backend = getattr(importlib.import_module(module), name)()
+        return backend if backend.priority > 0 else None  # priority raises when the store is not there
+    except Exception:  # a store that fails to start is no store
+        return None
+
+
+def _os_backend() -> Any:
+    """An instance of the first operating-system store that is available here, or ``None``."""
+    for module, name in _backend_classes(sys.platform):
+        if f"{module}.{name}" not in SECURE_BACKENDS:
+            continue  # never instantiate a class that is not an operating-system store
+        backend = _started(module, name)
+        if backend is not None:
+            return backend
+    return None
 
 
 def open_vault() -> Vault:
     """The credential store, or a :class:`LoginError` saying why there is none. Called before anything is written."""
     try:
-        import keyring
+        importlib.import_module("keyring")  # only its backend classes are used; its backend selection is never called
     except ImportError as exc:
         raise LoginError(
             _NO_STORE.format(why="the keyring package is not installed"), code="no_credential_store"
         ) from exc
-    try:
-        backend = keyring.get_keyring()
-        refused = _unsecure_backend(backend)
-    except Exception as exc:  # a backend that fails while it is being chosen is no backend
-        raise LoginError(_NO_STORE.format(why="no keyring backend started"), code="no_credential_store") from exc
-    if refused is not None:
+    backend = _os_backend()
+    if backend is None:
         raise LoginError(
             _NO_STORE.format(
-                why=f"the keyring backend {refused} is not an operating-system store (Keychain, Credential Locker, "
-                "Secret Service or KWallet); uninstall keyrings.alt and unset PYTHON_KEYRING_BACKEND and keyringrc.cfg "
-                "if they select it"
+                why="no operating-system store (Keychain, Credential Locker, Secret Service or KWallet) is available "
+                "here; the helper names that store itself and does not read keyringrc.cfg or PYTHON_KEYRING_BACKEND"
             ),
             code="no_credential_store",
         )
-    return KeyringVault(keyring)
+    return KeyringVault(backend)
 
 
 def config_dir(env: Mapping[str, str]) -> Path:
@@ -652,7 +680,7 @@ def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
         name, _, value = pair.partition("=")
         if why := allowance_problem(name, value):
             raise LoginError(f"--allow-env {name} is refused: {why}", code="bad_allow")
-        out[name] = value.strip()
+        out[name] = value
     return out
 
 
@@ -704,6 +732,7 @@ def login(
         _store_access(rt, key, tokens)
         config.save(issuer, client_id=client_id, alias=typed, allow_proxies=allowed_proxies, allow_env=allowed_env)
     rt.out(f"signed in to {issuer} as {signed_in.user.sub}")
+    rt.out(f'set this in Claude Code\'s settings: "apiKeyHelper": {json.dumps(helper_command())}')
     return 0
 
 
@@ -842,6 +871,7 @@ _NOT_PATHS = frozenset(
         "PYTHONINSPECT",
         "PYTHONSAFEPATH",
         "PYTHONWARNINGS",
+        "NPM_CONFIG_NODE_OPTIONS",
     }
 )
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/]")
@@ -850,9 +880,25 @@ TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
 _NEVER_NAMES = (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE", "GIT_SSL_NO_VERIFY")
 
 
+#: npm reads these in any case and hands the first to what it launches as ``NODE_OPTIONS``; the other two name the
+#: ``.npmrc`` files that can carry ``node-options=`` (the guard cannot see inside them).
+NPM_VARIABLES = frozenset({"NPM_CONFIG_NODE_OPTIONS", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"})
+_NODE_OPTION_NAMES = frozenset({"NODE_OPTIONS", "NPM_CONFIG_NODE_OPTIONS"})
+
+
 def is_guarded(name: str) -> bool:
     """``True`` for a variable the guard refuses when set, unless the person allowed that exact value."""
-    return name in TLS_VARIABLES or name in CODE_VARIABLES or name.startswith(CODE_PREFIXES)
+    return (
+        name in TLS_VARIABLES
+        or name in CODE_VARIABLES
+        or name.startswith(CODE_PREFIXES)
+        or name.upper() in NPM_VARIABLES
+    )
+
+
+def _absolute(member: str) -> bool:
+    """An absolute path on this platform: a drive-letter spelling is a relative name anywhere but Windows."""
+    return PurePosixPath(member).is_absolute() or (sys.platform == "win32" and PureWindowsPath(member).is_absolute())
 
 
 def node_options(value: str) -> list[str]:
@@ -906,7 +952,7 @@ def never_allowed(name: str, value: str) -> str | None:
         return "turns certificate verification off"
     if name == "SSLKEYLOGFILE" and value:  # any non-empty value, blank or quoted too: Python opens it as written
         return "writes the TLS session keys to a file, so anyone who can read that file can read the token"
-    if name == "NODE_OPTIONS" and _carries_keylog(value):
+    if name.upper() in _NODE_OPTION_NAMES and _carries_keylog(value):
         return "carries --tls-keylog, which writes the TLS session keys to a file anyone who can read it can use"
     return None
 
@@ -923,17 +969,17 @@ def allowance_problem(name: str, value: str) -> str | None:
     if not is_guarded(name):
         names = ", ".join((*TLS_VARIABLES, *CODE_VARIABLES))
         return f"it is not one of the variables the guard can allow ({names}, LD_*, DYLD_*)"
-    if not value.strip():
+    if not value:
         return "it needs a value"
     if why := never_allowed(name, value):
         return f"it {why}; this cannot be allowed"
-    if name not in _NOT_PATHS:
+    if name.upper() not in _NOT_PATHS:
         members = [
             member
-            for piece in re.split(r"[;\s]+", value.strip())
-            for member in ([piece] if _WINDOWS_PATH.match(piece) else piece.split(":"))
+            for piece in re.split(r"[;\s]+", value)
+            for member in ([piece] if sys.platform == "win32" and _WINDOWS_PATH.match(piece) else piece.split(":"))
         ]
-        if not all(m and (PurePosixPath(m).is_absolute() or PureWindowsPath(m).is_absolute()) for m in members):
+        if not all(m and _absolute(m) for m in members):
             return f"every path in it must be absolute, not {value!r}"
     return None
 
@@ -1005,13 +1051,13 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
                 f"names the proxy {host or 'that is not an address'}, which could read the token",
                 f"unset it, or allow that host once with: authfi login --allow-proxy {host or 'HOST'}",
             )
-    for name in (*_NEVER_NAMES, "NODE_OPTIONS"):
+    for name in (*_NEVER_NAMES, *sorted(n for n in env if n.upper() in _NODE_OPTION_NAMES)):
         if why := never_allowed(
             name, env.get(name, "")
         ):  # before the allowances: a hand-edited login.json cannot lift it
             raise _refuse(name, why, "unset it; this cannot be allowed")
     for name in sorted(n for n in env if is_guarded(n)):
-        value = env[name].strip()
+        value = env[name]  # as written: an allowance matches byte for byte
         if not value or allow.env.get(name) == value:
             continue
         if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:

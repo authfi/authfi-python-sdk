@@ -40,7 +40,7 @@ In `~/.claude/settings.json`:
 
 ```json
 {
-  "apiKeyHelper": "authfi token --resource llm",
+  "apiKeyHelper": "/usr/bin/python3 -I -m authfi token --resource llm",
   "env": {
     "ANTHROPIC_BASE_URL": "https://acme.authfi.io/llm",
     "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "300000",
@@ -49,6 +49,7 @@ In `~/.claude/settings.json`:
 }
 ```
 
+- The helper must start isolated. Python reads `PYTHONPATH`, `PYTHONUSERBASE` and the user site, and puts the working directory on its path, before any line of this tool runs, so a check made afterwards cannot undo them. `-I` turns all of that off. A console script cannot carry the flag, so use the absolute path of the interpreter that has `authfi` installed, then `-I -m authfi`; `authfi login` prints the exact line for this machine. Started any other way, `authfi token --resource llm` prints the fix on stderr and exits 1 without opening the credential store. The credential store is opened by naming the operating system's store (Keychain, Credential Locker, Secret Service or KWallet) directly: `keyringrc.cfg`, its `keyring-path` and `PYTHON_KEYRING_BACKEND` are never read.
 - `apiKeyHelper` runs the command and uses what it prints. Claude Code sends that value in both `Authorization: Bearer`
   and `x-api-key`. `authfi token --resource llm` prints the access token and a newline and nothing else; on any
   failure it prints the reason on stderr, prints nothing on stdout and exits 1.
@@ -100,7 +101,7 @@ authfi login --allow-env NODE_EXTRA_CA_CERTS=/etc/ssl/corp-ca.pem
 
 An allowance needs a proxy host and, for a path variable, an absolute path in every member of the list (`/opt/lib:.` and a trailing `:` are refused). The same checks run again when the file is read, so a hand-edited entry that would not have been recorded is ignored. On Linux and macOS the allowances in a `login.json` that another user owns, or that its group or others can write, are ignored. `authfi logout --forget-allow` drops all of them; if the file cannot be rewritten it says so and the allowances stay in force.
 
-The allowance is by proxy host, and by variable name together with its exact value, so a repository cannot swap the
+The allowance is by proxy host, and by variable name together with its exact value, compared as written: no trimming, so a trailing space or a Unicode space is a different value, so a repository cannot swap the
 file behind an allowed name for another path. Only `login.json` grants it: no environment variable does.
 
 ### What this does not cover
@@ -115,6 +116,7 @@ The guard reads the helper's environment and nothing else. It cannot see:
   no token from this tool at all. Claude Code asks you to trust a folder before it applies a repository's `env`; that
   trust decision is yours and is not something this command can check;
 - a proxy or CA that the operating system applies outside the environment (a system proxy, a CA in the OS store);
+- a `.npmrc` `node-options` setting. npm, not Node, turns it into `NODE_OPTIONS`, and only for what npm launches (`npm run`, `npx`); Node run directly reads no such file. When Claude Code is launched through npm or npx the guard cannot see that setting (it does refuse `npm_config_node_options`, `NPM_CONFIG_USERCONFIG` and `NPM_CONFIG_GLOBALCONFIG` in the environment, in any case). Launch the installed `claude` binary directly;
 - an environment variable this list does not name.
 
 What the tests prove is that, for each variable above, the helper refuses with its name and prints nothing on stdout,

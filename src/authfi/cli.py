@@ -10,7 +10,8 @@
     authfi login --issuer URL [--no-browser] [--reregister]
         signs a person in once, in a browser, for the project's /llm door (needs authfi[login])
     authfi token --resource llm [--issuer URL]
-        a fresh person access token for /llm, one line (Claude Code's apiKeyHelper); bare ``token`` is the agent's
+        a fresh person access token for /llm, one line (Claude Code's apiKeyHelper, run as ``python -I -m authfi``;
+        refuses to start otherwise: ``authfi login`` prints the exact command); bare ``token`` is the agent's
     authfi logout [--issuer URL] [--forget-allow]
         revokes the person's refresh token and deletes what is stored
     authfi headers
@@ -124,6 +125,11 @@ def _person_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _isolated() -> bool:
+    """``True`` when Python was started with ``-I``: no ``PYTHON*`` variables, no user site, no working directory."""
+    return bool(sys.flags.isolated)
+
+
 def _http_client() -> httpx.Client | None:
     """The HTTP client the person commands use; the SDK's own by default."""
     return None
@@ -132,6 +138,15 @@ def _http_client() -> httpx.Client | None:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; returns the exit code."""
     args = _parser().parse_args(argv)
+    if args.command == "token" and args.resource and not _isolated():
+        # Python has already read PYTHONPATH and the user site by now: the environment guard cannot undo that.
+        print(
+            "authfi: this helper was not started in isolated mode, so Python may already have run code chosen by "
+            "the environment (PYTHONPATH, the user site or the working directory); set Claude Code's apiKeyHelper "
+            f"to: {_login.helper_command()}",
+            file=sys.stderr,
+        )
+        return 1
     if args.command in ("login", "logout") or (args.command == "token" and args.resource):
         return _person_command(args)
     if args.command == "redteam":

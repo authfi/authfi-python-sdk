@@ -127,7 +127,7 @@ never pickles.
 ## Claude Code as yourself
 
 `pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`, then `authfi login --issuer https://acme.authfi.io` signs you in once, and Claude Code
-takes its credential for the project's `/llm` door from `apiKeyHelper: "authfi token --resource llm"`. The refresh
+takes its credential for the project's `/llm` door from an `apiKeyHelper` that starts the helper isolated, `"<absolute python> -I -m authfi token --resource llm"` (`authfi login` prints the line). The refresh
 token stays in your operating system's credential store. See [docs/claude-code.md](docs/claude-code.md).
 
 ## Errors

@@ -6,23 +6,26 @@ spent one comes back (as identity does), so a missing lock or a lost rotation fa
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import hashlib
 import http.client
 import json
 import os
 import secrets
+import subprocess
+import sys
 import threading
 import time
 import types
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 import httpx
 import keyring
 import keyring.backend
-import keyring.backends.fail
 import keyring.errors
 import pytest
 
@@ -436,22 +439,39 @@ class _Memory(keyring.backend.KeyringBackend):
         del self.items[(service, username)]
 
 
+@pytest.fixture(autouse=True)
+def _started_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pytest is not run with ``-I``; the tests that exercise the check say otherwise."""
+    monkeypatch.setattr(cli_module, "_isolated", lambda: True)
+
+
 @pytest.fixture
-def os_keyring() -> Iterator[Any]:
-    before = keyring.get_keyring()
-    yield keyring
-    keyring.set_keyring(before)
+def use_store(monkeypatch: pytest.MonkeyPatch) -> Callable[[type], None]:
+    """Make ``open_vault`` build the given class, as it builds the operating system's own store."""
+
+    def use(kind: type) -> None:
+        name = f"{kind.__module__}.{kind.__qualname__}"
+
+        def classes(platform: str) -> list[tuple[str, str]]:
+            return [(kind.__module__, kind.__qualname__)]
+
+        monkeypatch.setattr(_login, "_backend_classes", classes)
+        monkeypatch.setattr(_login, "SECURE_BACKENDS", _login.SECURE_BACKENDS | {name})
+
+    return use
 
 
 def test_without_a_keyring_backend_login_refuses_and_writes_nothing(
-    os_keyring: Any,
     platform: Platform,
     server: FakeAS,
     config_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    keyring.set_keyring(keyring.backends.fail.Keyring())  # type: ignore[no-untyped-call]
+    def nothing(platform: str) -> list[tuple[str, str]]:
+        return []
+
+    monkeypatch.setattr(_login, "_backend_classes", nothing)
     monkeypatch.setenv("AUTHFI_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(cli_module, "_http_client", lambda: platform.client())
     for argv in (["login", "--issuer", ISSUER], ["token", "--resource", "llm", "--issuer", ISSUER]):
@@ -463,9 +483,8 @@ def test_without_a_keyring_backend_login_refuses_and_writes_nothing(
     assert not config_dir.exists()  # and before any file
 
 
-def test_the_keyring_vault_round_trips_through_a_real_backend(os_keyring: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_login, "SECURE_BACKENDS", _login.SECURE_BACKENDS | {f"{__name__}._Memory"})
-    keyring.set_keyring(_Memory())
+def test_the_keyring_vault_round_trips_through_the_named_backend(use_store: Callable[[type], None]) -> None:
+    use_store(_Memory)
     vault = _login.open_vault()
     assert isinstance(vault, KeyringVault)
     vault.set(ISSUER, "refresh", "rt-1")
@@ -473,6 +492,34 @@ def test_the_keyring_vault_round_trips_through_a_real_backend(os_keyring: Any, m
     vault.delete(ISSUER, "refresh")
     vault.delete(ISSUER, "refresh")  # deleting what is not there is not an error
     assert vault.get(ISSUER, "refresh") is None
+
+
+def test_keyring_is_never_asked_which_backend_to_use(
+    use_store: Callable[[type], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import keyring.backend
+    import keyring.core
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("keyring chose a backend")
+
+    for owner, name in (
+        (keyring, "get_keyring"),
+        (keyring.core, "get_keyring"),
+        (keyring.core, "init_backend"),
+        (keyring.core, "load_config"),
+        (keyring.core, "load_env"),
+        (keyring.backend, "get_all_keyring"),
+    ):
+        monkeypatch.setattr(owner, name, forbidden)
+    use_store(_Memory)
+    assert isinstance(_login.open_vault(), KeyringVault)
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "darwin", "linux"])
+def test_the_classes_named_for_a_platform_are_all_operating_system_stores(platform_name: str) -> None:
+    named = _login._backend_classes(platform_name)
+    assert named and all(f"{module}.{name}" in _login.SECURE_BACKENDS for module, name in named)
 
 
 # --- token -------------------------------------------------------------------------------------------------
@@ -631,70 +678,166 @@ def test_logout_deletes_locally_even_when_the_server_did_not_confirm(
 # --- review fixes: the credential store, the base URL, the lock, a refresh of unknown outcome ---------------
 
 
-def _backend(module: str, name: str, **attributes: Any) -> keyring.backend.KeyringBackend:
-    """A backend that reports the given module and class name, as the real one does to the allow-list."""
-    kind = type(name, (_Memory,), {"__module__": module, "__qualname__": name, **attributes})
-    return kind()  # type: ignore[no-any-return]
-
-
 class _PlainFile(_Memory):
     """Stands in for ``keyrings.alt``'s plaintext file store, which is not installed here."""
 
+    created: ClassVar[list[str]] = []
 
-@pytest.mark.parametrize(
-    "backend",
-    [
-        _backend("keyring.backends.macOS", "Keyring"),
-        _backend("keyring.backends.Windows", "WinVaultKeyring"),
-        _backend("keyring.backends.SecretService", "Keyring"),
-        _backend("keyring.backends.kwallet", "DBusKeyring"),
-        _backend(
-            "keyring.backends.chainer", "ChainerBackend", backends=[_backend("keyring.backends.macOS", "Keyring")]
-        ),
-    ],
-)
-def test_the_operating_system_stores_are_accepted(os_keyring: Any, backend: Any) -> None:
-    keyring.set_keyring(backend)
-    assert isinstance(_login.open_vault(), KeyringVault)
+    def __init__(self) -> None:
+        type(self).created.append("created")
+        super().__init__()
 
 
-@pytest.mark.parametrize(
-    "backend",
-    [
-        _backend("keyrings.alt.file", "PlaintextKeyring"),
-        _backend("keyrings.alt.file", "EncryptedKeyring"),
-        _backend("keyring.backends.null", "Keyring"),
-        _backend("keyring.backends.macOS", "KeyringLookalike"),
-        _backend("keyring.backends.chainer", "ChainerBackend", backends=[]),
-        _backend(
-            "keyring.backends.chainer",
-            "ChainerBackend",
-            backends=[_backend("keyring.backends.macOS", "Keyring"), _backend("keyrings.alt.file", "PlaintextKeyring")],
-        ),
-    ],
-)
-def test_a_store_that_is_not_the_operating_systems_is_refused_and_the_message_names_the_fix(
-    os_keyring: Any, backend: Any
+def test_a_class_that_is_not_an_operating_system_store_is_refused_without_being_built(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    keyring.set_keyring(backend)
+    def classes(platform: str) -> list[tuple[str, str]]:
+        return [(__name__, "_PlainFile")]
+
+    _PlainFile.created.clear()
+    monkeypatch.setattr(_login, "_backend_classes", classes)
     with pytest.raises(LoginError) as caught:
         _login.open_vault()
-    assert caught.value.code == "no_credential_store"
-    assert "uninstall keyrings.alt" in caught.value.message and "PYTHON_KEYRING_BACKEND" in caught.value.message
-    assert "will not write it to a file" in caught.value.message
+    assert caught.value.code == "no_credential_store" and "will not write it to a file" in caught.value.message
+    assert _PlainFile.created == []
 
 
-def test_a_keyring_backend_chosen_by_the_environment_is_checked_like_any_other(
-    os_keyring: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import keyring.core
-
+def test_a_keyring_backend_named_by_the_environment_is_never_built(monkeypatch: pytest.MonkeyPatch) -> None:
+    _PlainFile.created.clear()
     monkeypatch.setenv("PYTHON_KEYRING_BACKEND", f"{__name__}._PlainFile")
-    keyring.core.init_backend()
-    assert type(keyring.get_keyring()) is _PlainFile
-    with pytest.raises(LoginError) as caught:
+    with contextlib.suppress(LoginError):  # on a machine with no store the answer is the refusal
         _login.open_vault()
-    assert f"{__name__}._PlainFile" in caught.value.message
+    assert _PlainFile.created == []
+
+
+def _keyring_config_planted(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """An environment whose config folders hold a ``keyringrc.cfg`` naming a hostile backend that writes a marker."""
+    marker = tmp_path / "hostile-ran.txt"
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "hostile_backend.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('ran')\n"
+        "from keyring.backend import KeyringBackend\n"
+        "class Hostile(KeyringBackend):\n"
+        "    priority = 99\n"
+        "    def get_password(self, service, username): return 'x'\n"
+        "    def set_password(self, service, username, password): pass\n"
+        "    def delete_password(self, service, username): pass\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "XDG_CONFIG_HOME": str(home),
+        "LOCALAPPDATA": str(home),
+        "APPDATA": str(home),
+        "ProgramData": str(home),
+    }
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHON_KEYRING_BACKEND", None)
+    root = subprocess.run(
+        [sys.executable, "-c", "import keyring.util.platform_ as p; print(p.config_root())"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    Path(root).mkdir(parents=True, exist_ok=True)
+    (Path(root) / "keyringrc.cfg").write_text(
+        f"[backend]\ndefault-keyring=hostile_backend.Hostile\nkeyring-path={evil}\n", encoding="utf-8"
+    )
+    return env, marker
+
+
+def test_a_planted_keyringrc_with_a_keyring_path_is_never_read(tmp_path: Path) -> None:
+    env, marker = _keyring_config_planted(tmp_path)
+    subprocess.run(
+        [sys.executable, "-c", "import keyring; keyring.get_keyring()"], env=env, capture_output=True, check=False
+    )
+    assert marker.exists(), "the control failed: keyring itself did not read the planted file"
+    marker.unlink()
+    code = "from authfi import _login\ntry:\n    _login.open_vault()\nexcept Exception:\n    pass\n"
+    subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, check=True)  # noqa: S603
+    assert not marker.exists()
+
+
+def _helper(args: list[str], tmp_path: Path, extra: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "AUTHFI_CONFIG_DIR": str(tmp_path / "cfg"), **extra}
+    return subprocess.run(  # noqa: S603 - this interpreter, on code written above
+        [sys.executable, *args, "-m", "authfi", "token", "--resource", "llm", "--issuer", ISSUER],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        check=False,
+    )
+
+
+def _planted_pythonpath(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    marker = tmp_path / "sitecustomize-ran.txt"
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "sitecustomize.py").write_text(
+        f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n", encoding="utf-8"
+    )
+    return {"PYTHONPATH": str(planted)}, marker
+
+
+def test_the_helper_started_without_isolation_refuses_and_says_how_to_start_it(tmp_path: Path) -> None:
+    extra, _marker = _planted_pythonpath(tmp_path)
+    done = _helper([], tmp_path, extra)
+    assert done.returncode == 1 and done.stdout == ""
+    assert "isolated mode" in done.stderr and "-I -m authfi token --resource llm" in done.stderr
+    assert sys.executable in done.stderr
+
+
+def test_the_helper_started_isolated_runs_no_code_from_pythonpath(tmp_path: Path) -> None:
+    extra, marker = _planted_pythonpath(tmp_path)
+    done = _helper(["-I"], tmp_path, extra)
+    assert not marker.exists()  # -I ignored PYTHONPATH
+    assert "isolated mode" not in done.stderr  # it got past the startup check (and then found nobody signed in)
+    assert done.stdout == ""
+
+
+def test_the_startup_check_runs_before_the_credential_store_is_opened(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def opened() -> None:
+        raise AssertionError("the store was opened")
+
+    monkeypatch.setattr(cli_module, "_isolated", lambda: False)
+    monkeypatch.setattr(_login, "open_vault", opened)
+    assert cli_module.main(["token", "--resource", "llm", "--issuer", ISSUER]) == 1
+    assert "isolated mode" in capsys.readouterr().err
+
+
+def test_the_agents_own_token_command_does_not_need_isolation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli_module, "_isolated", lambda: False)
+    cli_module.main(["token"])
+    assert "isolated mode" not in capsys.readouterr().err
+
+
+def test_the_helper_command_is_this_interpreter_by_absolute_path_with_i() -> None:
+    command = _login.helper_command()
+    assert command.startswith(subprocess.list2cmdline([sys.executable]) if sys.platform == "win32" else sys.executable)
+    assert command.endswith("-I -m authfi token --resource llm")
+    assert Path(sys.executable).is_absolute()
+
+
+def test_login_prints_the_helper_line_to_put_in_claude_codes_settings(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    lines: list[str] = []
+    rt = dataclasses.replace(runtime(platform, vault, config_dir, opener=browser(server)), out=lines.append)
+    assert _login.login(rt, ISSUER, timeout=10) == 0
+    helper = next(line for line in lines if "apiKeyHelper" in line)
+    assert json.dumps(_login.helper_command()) in helper and "-I -m authfi token --resource llm" in helper
 
 
 class _SmallBlob(_Memory):
@@ -707,12 +850,11 @@ class _SmallBlob(_Memory):
 
 
 def test_a_refresh_token_longer_than_the_windows_blob_limit_is_kept_in_pieces(
-    os_keyring: Any, monkeypatch: pytest.MonkeyPatch
+    use_store: Callable[[type], None],
 ) -> None:
-    monkeypatch.setattr(_login, "SECURE_BACKENDS", _login.SECURE_BACKENDS | {f"{__name__}._SmallBlob"})
-    backend = _SmallBlob()
-    keyring.set_keyring(backend)
-    vault = _login.open_vault()
+    use_store(_SmallBlob)
+    vault = cast("KeyringVault", _login.open_vault())
+    backend = cast("_SmallBlob", vault._keyring)  # pyright: ignore[reportPrivateUsage]
     long = "rt-" + "x7" * 2500
     vault.set(ISSUER, "refresh", long)
     assert vault.get(ISSUER, "refresh") == long
@@ -1199,12 +1341,12 @@ def test_node_options_set_to_anything_stop_the_token(
     _refused(platform, vault, config_dir, {"NODE_OPTIONS": value}, "NODE_OPTIONS")
 
 
-def test_node_options_that_is_empty_or_blank_is_not_set(
+def test_node_options_that_is_empty_is_not_set_and_a_blank_one_is_a_value(
     platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
 ) -> None:
     signed_in(platform, server, vault, config_dir)
-    for value in ("", "  "):
-        assert _login.access_token(runtime(platform, vault, config_dir, env={"NODE_OPTIONS": value}), None)
+    assert _login.access_token(runtime(platform, vault, config_dir, env={"NODE_OPTIONS": ""}), None)
+    _refused(platform, vault, config_dir, {"NODE_OPTIONS": "  "}, "NODE_OPTIONS")  # exact means exact
 
 
 def test_an_allowed_node_options_value_passes_only_when_exact(
@@ -1464,3 +1606,70 @@ def test_a_clean_environment_and_the_allowed_ones_get_their_token_through_the_co
     assert cli_module.main(["token", "--resource", "llm", "--issuer", ISSUER]) == 1
     out = capsys.readouterr()
     assert out.out == "" and "HTTPS_PROXY" in out.err and "evil.example" in out.err
+
+
+UNICODE_SPACES = ["\xa0", "\u2003", "\u3000", "\x85", "\x1c", "\x0b", "\x0c", "\u2028"]
+
+
+@pytest.mark.parametrize("space", UNICODE_SPACES)
+@pytest.mark.parametrize("where", ["after", "before"])
+def test_an_allowed_value_with_a_space_added_is_not_that_exact_value(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, space: str, where: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(
+        ISSUER, allow_env=_login._allowed_env(["NODE_EXTRA_CA_CERTS=/opt/corp/ca.pem"])
+    )
+    exact = {"NODE_EXTRA_CA_CERTS": "/opt/corp/ca.pem"}
+    assert _login.access_token(runtime(platform, vault, config_dir, env=exact), None)
+    other = "/opt/corp/ca.pem" + space if where == "after" else space + "/opt/corp/ca.pem"
+    _refused(platform, vault, config_dir, {"NODE_EXTRA_CA_CERTS": other}, "NODE_EXTRA_CA_CERTS")
+
+
+def test_an_allowance_is_recorded_as_written(platform: Platform, vault: MemoryVault, config_dir: Path) -> None:
+    assert _login._allowed_env(["NODE_OPTIONS=--max-old-space-size=4096 "]) == {
+        "NODE_OPTIONS": "--max-old-space-size=4096 "
+    }
+    assert _login.allowance_problem("NODE_EXTRA_CA_CERTS", " ") is not None  # a lone space is a value, not a path
+    assert _login.allowance_problem("NODE_EXTRA_CA_CERTS", "") is not None
+
+
+def test_a_drive_letter_path_is_only_absolute_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert _login.allowance_problem("SSL_CERT_FILE", "C:\\ca.pem") is not None
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert _login.allowance_problem("SSL_CERT_FILE", "C:\\ca.pem") is None
+
+
+NPM_NAMES = [
+    "npm_config_node_options",
+    "NPM_CONFIG_NODE_OPTIONS",
+    "Npm_Config_Node_Options",
+    "npm_config_userconfig",
+    "NPM_CONFIG_GLOBALCONFIG",
+]
+
+
+@pytest.mark.parametrize("name", NPM_NAMES)
+def test_the_options_npm_hands_to_node_stop_the_token_unless_that_exact_value_is_allowed(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    value = "--max-old-space-size=4096" if name.upper().endswith("NODE_OPTIONS") else "/opt/npmrc"
+    _refused(platform, vault, config_dir, {name: value}, name)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env=_login._allowed_env([f"{name}={value}"]))
+    assert _login.access_token(runtime(platform, vault, config_dir, env={name: value}), None)
+    _refused(platform, vault, config_dir, {name: value + " "}, name)
+
+
+@pytest.mark.parametrize("name", ["npm_config_node_options", "NPM_CONFIG_NODE_OPTIONS"])
+@pytest.mark.parametrize("value", KEYLOG_SPELLINGS)
+def test_a_key_log_flag_through_npm_cannot_be_allowed_or_run(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str, value: str
+) -> None:
+    with pytest.raises(LoginError) as caught:
+        _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=[f"{name}={value}"])
+    assert caught.value.code == "bad_allow" and "cannot be allowed" in caught.value.message
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={name: value})  # hand-edited
+    assert "cannot be allowed" in _refused(platform, vault, config_dir, {name: value}, name).message
