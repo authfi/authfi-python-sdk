@@ -11,7 +11,7 @@
         signs a person in once, in a browser, for the project's /llm door (needs authfi[login])
     authfi token --resource llm [--issuer URL]
         a fresh person access token for /llm, one line (Claude Code's apiKeyHelper); bare ``token`` is the agent's
-    authfi logout [--issuer URL]
+    authfi logout [--issuer URL] [--forget-allow]
         revokes the person's refresh token and deletes what is stored
     authfi headers
         {"Authorization": "Bearer ..."} as JSON (an MCP server's headersHelper); with
@@ -82,6 +82,9 @@ def _parser() -> argparse.ArgumentParser:
     login.add_argument("--timeout", type=float, default=_login.CALLBACK_TIMEOUT, help="seconds to wait for the browser")
     logout = commands.add_parser("logout", help="revoke the person's refresh token and delete what is stored")
     logout.add_argument("--issuer", help="the project origin; default the one signed in to")
+    logout.add_argument(
+        "--forget-allow", action="store_true", help="also drop every proxy host and value allowed with `authfi login`"
+    )
     commands.add_parser("headers", help="print the agent's request headers as JSON")
     redteam.add_arguments(
         commands.add_parser("redteam", help="run the red-team corpus against your agent (a dry run unless --send)")
@@ -112,7 +115,7 @@ def _person_command(args: argparse.Namespace) -> int:
                 allow_env=args.allow_env,
             )
         if args.command == "logout":
-            return _login.logout(runtime, args.issuer)
+            return _login.logout(runtime, args.issuer, forget_allow=args.forget_allow)
         token = _login.access_token(runtime, args.issuer, min_validity=args.min_validity)
     except AuthFIError as error:
         print(f"authfi: {error.message}", file=sys.stderr)

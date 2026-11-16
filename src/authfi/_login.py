@@ -36,7 +36,7 @@ from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any, Protocol, cast
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
@@ -318,11 +318,21 @@ class Config:
         proxies = entry.get("proxies")
         env = _object(entry.get("env"))
         return Allowed(
-            proxies=frozenset(p.lower() for p in cast("list[Any]", proxies) if isinstance(p, str))
+            proxies=frozenset(p.lower() for p in proxies if isinstance(p, str))
             if isinstance(proxies, list)
             else frozenset(),
             env={k: v for k, v in env.items() if isinstance(v, str)},
         )
+
+    def forget_allow(self) -> None:
+        """Drop every proxy host and environment value the person allowed."""
+        data = self._read()
+        if data.pop("allow", None) is not None:
+            temporary = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            with contextlib.suppress(OSError):
+                temporary.chmod(0o600)
+            os.replace(temporary, self.path)
 
     def save(
         self,
@@ -595,6 +605,17 @@ def _sign_in(
         receiver.server_close()
 
 
+def _allowed_proxies(hosts: Sequence[str]) -> list[str]:
+    """The proxy hosts to allow; a value that names no host would allow every proxy value that does not parse."""
+    out: list[str] = []
+    for value in hosts:
+        host = _host_of(value)
+        if not host:
+            raise LoginError(f"--allow-proxy takes a proxy host, not {value!r}", code="bad_allow")
+        out.append(host)
+    return out
+
+
 def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
     """``NAME=VALUE`` pairs for the variables the guard can allow; anything else is a :class:`LoginError`."""
     out: dict[str, str] = {}
@@ -604,6 +625,8 @@ def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
             raise LoginError(
                 f"--allow-env takes NAME=VALUE for one of {', '.join(TLS_VARIABLES)}: {name!r}", code="bad_allow"
             )
+        if name in _PATH_VARIABLES and not (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()):
+            raise LoginError(f"--allow-env {name} takes an absolute path, not {value!r}", code="bad_allow")
         out[name] = value
     return out
 
@@ -625,6 +648,7 @@ def login(
     """
     config = rt.config()
     allowed_env = _allowed_env(allow_env)
+    allowed_proxies = _allowed_proxies(allow_proxies)
     typed = resolve_issuer(issuer_arg, rt.env, config)
     issuer = canonical_issuer(rt, typed)
     try:
@@ -653,7 +677,7 @@ def login(
                 code="store_failed",
             ) from exc
         _store_access(rt, key, tokens)
-        config.save(issuer, client_id=client_id, alias=typed, allow_proxies=allow_proxies, allow_env=allowed_env)
+        config.save(issuer, client_id=client_id, alias=typed, allow_proxies=allowed_proxies, allow_env=allowed_env)
     rt.out(f"signed in to {issuer} as {signed_in.user.sub}")
     return 0
 
@@ -748,7 +772,14 @@ TLS_VARIABLES = (
     "CURL_CA_BUNDLE",
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
+    # Variables that run code inside the helper or write the session keys to a file a network observer can read.
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "LD_PRELOAD",
+    "SSLKEYLOGFILE",
 )
+#: Variables whose value is a path: an allowance for one must be absolute, or a repository's own file would match it.
+_PATH_VARIABLES = frozenset(TLS_VARIABLES) - {"CLAUDE_CODE_CERT_STORE", "NODE_OPTIONS"}
 #: Verification turned off is never allowed.
 TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
 _FALSE = frozenset({"", "0", "false", "no", "off"})
@@ -829,7 +860,9 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
             continue
         if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:
             continue  # a subset of the built-in sources only narrows what is trusted
-        if name == "NODE_OPTIONS" and not _NODE_OPTION.search(value):
+        if name == "NODE_OPTIONS" and not _NODE_OPTION.search(
+            value.replace('"', "").replace("'", "")
+        ):  # Node strips quotes
             continue
         raise _refuse(
             name,
@@ -921,7 +954,7 @@ def access_token(rt: Runtime, issuer_arg: str | None, *, min_validity: float = D
         return tokens.access_token.reveal()
 
 
-def logout(rt: Runtime, issuer_arg: str | None) -> int:
+def logout(rt: Runtime, issuer_arg: str | None, *, forget_allow: bool = False) -> int:
     """Revoke the refresh token at the server (RFC 7009), then delete what is stored (also when it fails).
 
     Under the same lock as the renewal, so a helper in flight cannot store a rotated token after this deleted it.
@@ -943,6 +976,8 @@ def logout(rt: Runtime, issuer_arg: str | None) -> int:
                 failure = error.message
         rt.vault.delete(key, "refresh")
         rt.vault.delete(key, "access")
+        if forget_allow:
+            config.forget_allow()
     if failure is not None:
         raise LoginError(
             f"the stored tokens were deleted but the server did not confirm the revocation ({failure}); "

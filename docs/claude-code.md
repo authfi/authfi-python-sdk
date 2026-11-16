@@ -76,7 +76,8 @@ variable's name in the message and exit code 1, when any of these is present:
 | proxy | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and their lowercase forms | the proxy host is not one you allowed |
 | certificate trust | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` | set, unless you allowed that exact value |
 | | `CLAUDE_CODE_CERT_STORE` | anything but `bundled`, `system` or both |
-| | `NODE_OPTIONS` | it carries `-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--use-openssl-ca`, `--use-bundled-ca`, `--openssl-config` or `--tls-*`, unless you allowed that exact value |
+| | `NODE_OPTIONS` | it carries `-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--use-openssl-ca`, `--use-bundled-ca`, `--openssl-config` or `--tls-*` (quoted or not), unless you allowed that exact value |
+| code or key log in the helper | `PYTHONPATH`, `PYTHONSTARTUP`, `LD_PRELOAD`, `SSLKEYLOGFILE` | set, unless you allowed that exact absolute path |
 | | `NODE_TLS_REJECT_UNAUTHORIZED` | `0`; this cannot be allowed |
 
 The names come from Claude Code's own documentation (the [settings](https://code.claude.com/docs/en/settings),
@@ -94,6 +95,8 @@ A proxy or a certificate you need is allowed once, from your own terminal, and r
 authfi login --allow-proxy proxy.corp.example
 authfi login --allow-env NODE_EXTRA_CA_CERTS=/etc/ssl/corp-ca.pem
 ```
+
+An allowance needs a proxy host and, for a path variable, an absolute path. `authfi logout --forget-allow` drops all of them.
 
 The allowance is by proxy host, and by variable name together with its exact value, so a repository cannot swap the
 file behind an allowed name for another path. Only `login.json` grants it: no environment variable does.
