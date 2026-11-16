@@ -30,8 +30,8 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
-import subprocess
 import sys
 import threading
 import time
@@ -216,15 +216,30 @@ SECURE_BACKENDS = frozenset(
 )
 
 
-def helper_command() -> str:
+def helper_command(executable: str | None = None) -> str:
     """The ``apiKeyHelper`` value that starts the helper isolated: this interpreter, by absolute path, with ``-I``.
 
-    ``-I`` ignores ``PYTHON*`` variables and the user site and keeps the working directory off ``sys.path``, so
-    a repository's environment cannot make Python run its code before the guard looks at that environment. A console
-    script cannot carry the flag, which is why the helper is started as ``python -I -m authfi``.
+    ``-I`` ignores ``PYTHON*`` variables and the user site and keeps the working directory off ``sys.path``. It does
+    not touch the dynamic loader, OpenSSL's configuration or the shell that starts the helper (``LD_PRELOAD``,
+    ``OPENSSL_CONF``, ``BASH_ENV``). A console script cannot carry the flag, which is why the helper is started as
+    ``python -I -m authfi``. Claude Code runs the line through ``/bin/sh`` on macOS and Linux and through ``cmd`` on
+    Windows, so the interpreter is quoted for that shell.
     """
-    argv = [sys.executable, "-I", "-m", "authfi", "token", "--resource", "llm"]
-    return subprocess.list2cmdline(argv) if sys.platform == "win32" else shlex.join(argv)
+    exe = executable if executable is not None else sys.executable
+    if exe and not os.path.isabs(exe):
+        exe = shutil.which(exe) or ""
+    if not exe or not os.path.isabs(exe):
+        raise LoginError(
+            "this Python has no absolute path (sys.executable is empty or relative), so the apiKeyHelper line cannot "
+            "name it; run authfi login with the interpreter's full path",
+            code="no_interpreter",
+        )
+    tail = "-I -m authfi token --resource llm"
+    if sys.platform == "win32":
+        if '"' in exe or "%" in exe:
+            raise LoginError(f"the interpreter path {exe!r} has a character cmd cannot quote", code="no_interpreter")
+        return f'"{exe}" {tail}'
+    return f"{shlex.quote(exe)} {tail}"
 
 
 def _backend_classes(platform: str) -> list[tuple[str, str]]:
@@ -828,6 +843,13 @@ TLS_VARIABLES = (
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
 )
+#: The session bus keyring's Secret Service backend talks to. Not code, but the bus names who holds the secret.
+DBUS = "DBUS_SESSION_BUS_ADDRESS"
+#: Variables the dynamic loader, OpenSSL or the shell reads before any line of this tool runs: refusing them here is a
+#: second line of defence (the first is that the person only trusts repositories they would let run code).
+_READ_BEFORE_THE_GUARD = frozenset(
+    {"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "BASH_ENV", "ENV", "SHELLOPTS"}
+)
 #: Variables that load code or swap a trust store inside the helper or the tool: refused when set, unless the person
 #: allowed that exact value. ``LD_*`` and ``DYLD_*`` are covered by prefix.
 CODE_VARIABLES = (
@@ -848,6 +870,9 @@ CODE_VARIABLES = (
     "ENV",
     "OPENSSL_CONF",
     "OPENSSL_MODULES",
+    "OPENSSL_ENGINES",
+    "SHELLOPTS",
+    DBUS,
     "GIT_SSL_CAINFO",
     "GIT_PROXY_COMMAND",
     "PERL5OPT",
@@ -871,7 +896,7 @@ _NOT_PATHS = frozenset(
         "PYTHONINSPECT",
         "PYTHONSAFEPATH",
         "PYTHONWARNINGS",
-        "NPM_CONFIG_NODE_OPTIONS",
+        DBUS,
     }
 )
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/]")
@@ -880,19 +905,29 @@ TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
 _NEVER_NAMES = (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE", "GIT_SSL_NO_VERIFY")
 
 
-#: npm reads these in any case and hands the first to what it launches as ``NODE_OPTIONS``; the other two name the
-#: ``.npmrc`` files that can carry ``node-options=`` (the guard cannot see inside them).
-NPM_VARIABLES = frozenset({"NPM_CONFIG_NODE_OPTIONS", "NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG"})
-_NODE_OPTION_NAMES = frozenset({"NODE_OPTIONS", "NPM_CONFIG_NODE_OPTIONS"})
+#: The npm config keys that reach what npm launches: ``node-options`` becomes ``NODE_OPTIONS``, ``script-shell`` names
+#: the program that runs a script, and the two ``.npmrc`` files can carry either (the guard cannot see inside them).
+NPM_KEYS = frozenset({"node-options", "script-shell", "userconfig", "globalconfig"})
+
+
+def npm_key(name: str) -> str | None:
+    """The npm config key an environment variable sets, as npm reads it, or ``None`` when it is not ``npm_config_*``.
+
+    npm takes the prefix in any case and lower-cases the rest, and ``_`` and ``-`` in a key mean the same, so
+    ``npm_config_node-options`` and ``NPM_CONFIG_NODE_OPTIONS`` are one key.
+    """
+    prefix = "npm_config_"
+    return name[len(prefix) :].lower().replace("_", "-") if name[: len(prefix)].lower() == prefix else None
+
+
+def _is_node_options(name: str) -> bool:
+    return name == "NODE_OPTIONS" or npm_key(name) == "node-options"
 
 
 def is_guarded(name: str) -> bool:
     """``True`` for a variable the guard refuses when set, unless the person allowed that exact value."""
     return (
-        name in TLS_VARIABLES
-        or name in CODE_VARIABLES
-        or name.startswith(CODE_PREFIXES)
-        or name.upper() in NPM_VARIABLES
+        name in TLS_VARIABLES or name in CODE_VARIABLES or name.startswith(CODE_PREFIXES) or npm_key(name) in NPM_KEYS
     )
 
 
@@ -952,7 +987,7 @@ def never_allowed(name: str, value: str) -> str | None:
         return "turns certificate verification off"
     if name == "SSLKEYLOGFILE" and value:  # any non-empty value, blank or quoted too: Python opens it as written
         return "writes the TLS session keys to a file, so anyone who can read that file can read the token"
-    if name.upper() in _NODE_OPTION_NAMES and _carries_keylog(value):
+    if _is_node_options(name) and _carries_keylog(value):
         return "carries --tls-keylog, which writes the TLS session keys to a file anyone who can read it can use"
     return None
 
@@ -960,6 +995,25 @@ def never_allowed(name: str, value: str) -> str | None:
 def _never_allowed_name(name: str) -> str | None:
     """The reason an allowance for ``name`` is refused whatever its value, or ``None``."""
     return never_allowed(name, "0") if name in _NEVER_NAMES else None
+
+
+_FILE_NAME = re.compile(r"[\\/]|\.(js|mjs|cjs|so|dylib|dll|cnf|jar|rb|pl|pm|py)$")
+_FLAG_THEN_PATH = re.compile(r"^-[A-Za-z](?=[./~\\])")
+
+
+def _relative_file_in(value: str) -> str | None:
+    """The first token of an option string that names a file by a relative path, or ``None``.
+
+    ``--require=./hook.js``, ``--openssl-config=openssl.cnf``, ``-javaagent:agent.jar`` and ``-r./x`` all name a file
+    that the repository the tool runs in can supply. A module name (``-MHook``) is found through a search path the
+    guard covers separately (``PERL5LIB``, ``RUBYLIB``, ``NODE_PATH``).
+    """
+    for piece in re.split(r"[\s=,]+", value):
+        for token in [piece] if sys.platform == "win32" and _WINDOWS_PATH.match(piece) else piece.split(":"):
+            token = _FLAG_THEN_PATH.sub("", token)
+            if token and _FILE_NAME.search(token) and not _absolute(token):
+                return token
+    return None
 
 
 def allowance_problem(name: str, value: str) -> str | None:
@@ -973,7 +1027,7 @@ def allowance_problem(name: str, value: str) -> str | None:
         return "it needs a value"
     if why := never_allowed(name, value):
         return f"it {why}; this cannot be allowed"
-    if name.upper() not in _NOT_PATHS:
+    if name.upper() not in _NOT_PATHS and npm_key(name) != "node-options":
         members = [
             member
             for piece in re.split(r"[;\s]+", value)
@@ -981,6 +1035,8 @@ def allowance_problem(name: str, value: str) -> str | None:
         ]
         if not all(m and _absolute(m) for m in members):
             return f"every path in it must be absolute, not {value!r}"
+    elif bad := _relative_file_in(value):
+        return f"it names {bad!r} by a relative path, which the repository the tool runs in can supply"
     return None
 
 
@@ -1051,22 +1107,51 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
                 f"names the proxy {host or 'that is not an address'}, which could read the token",
                 f"unset it, or allow that host once with: authfi login --allow-proxy {host or 'HOST'}",
             )
-    for name in (*_NEVER_NAMES, *sorted(n for n in env if n.upper() in _NODE_OPTION_NAMES)):
+    for name in (*_NEVER_NAMES, *sorted(n for n in env if _is_node_options(n))):
         if why := never_allowed(
             name, env.get(name, "")
         ):  # before the allowances: a hand-edited login.json cannot lift it
             raise _refuse(name, why, "unset it; this cannot be allowed")
     for name in sorted(n for n in env if is_guarded(n)):
         value = env[name]  # as written: an allowance matches byte for byte
-        if not value or allow.env.get(name) == value:
+        if not value or allow.env.get(name) == value or (name == DBUS and value == default_session_bus()):
             continue
         if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:
             continue  # a subset of the built-in sources only narrows what is trusted
         raise _refuse(
             name,
-            "loads code or changes which certificates the tool trusts",
+            "is read by the dynamic loader, OpenSSL or the shell before this check runs, so code it names may already "
+            "have run (this refusal is a second line of defence)"
+            if name in _READ_BEFORE_THE_GUARD or name.startswith(CODE_PREFIXES)
+            else "loads code or changes which certificates the tool trusts",
             f"unset it, or allow exactly this value once with: authfi login --allow-env {name}=<value>",
         )
+
+
+def default_session_bus() -> str | None:
+    """The address of this user's own session bus (systemd's socket), or ``None`` where it cannot be known."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None or sys.platform in ("win32", "darwin"):
+        return None
+    return f"unix:path=/run/user/{getuid()}/bus"
+
+
+def check_session_bus(env: Mapping[str, str]) -> None:
+    """Refuse a session bus the environment names, before the credential store (which talks to it) is opened.
+
+    Only the default socket passes, or the exact address the person allowed: a hostile bus can answer as the Secret
+    Service and hand back a token that is not theirs. Windows and macOS have no such variable.
+    """
+    value = env.get(DBUS, "")
+    if not value or sys.platform in ("win32", "darwin") or value == default_session_bus():
+        return
+    if Config(config_dir(env)).allowed().env.get(DBUS) == value:
+        return
+    raise _refuse(
+        DBUS,
+        "names a session bus other than this user's own socket, and the credential store talks to that bus",
+        f"unset it, or allow exactly this value once with: authfi login --allow-env {DBUS}=<value>",
+    )
 
 
 def _forget(rt: Runtime, key: str) -> None:

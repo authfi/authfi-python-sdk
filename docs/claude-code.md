@@ -49,7 +49,7 @@ In `~/.claude/settings.json`:
 }
 ```
 
-- The helper must start isolated. Python reads `PYTHONPATH`, `PYTHONUSERBASE` and the user site, and puts the working directory on its path, before any line of this tool runs, so a check made afterwards cannot undo them. `-I` turns all of that off. A console script cannot carry the flag, so use the absolute path of the interpreter that has `authfi` installed, then `-I -m authfi`; `authfi login` prints the exact line for this machine. Started any other way, `authfi token --resource llm` prints the fix on stderr and exits 1 without opening the credential store. The credential store is opened by naming the operating system's store (Keychain, Credential Locker, Secret Service or KWallet) directly: `keyringrc.cfg`, its `keyring-path` and `PYTHON_KEYRING_BACKEND` are never read.
+- The helper must start isolated. Python reads `PYTHONPATH`, `PYTHONUSERBASE` and the user site, and puts the working directory on its path, before any line of this tool runs, so a check made afterwards cannot undo them. `-I` turns those off. It does not stop the dynamic loader, OpenSSL or the shell that starts the helper: `LD_PRELOAD`, `OPENSSL_CONF` and `BASH_ENV` load code before any Python runs (see [The boundary](#the-boundary)). A console script cannot carry the flag, so use the absolute path of the interpreter that has `authfi` installed, then `-I -m authfi`; `authfi login` prints the exact line for this machine. Claude Code runs the line through `/bin/sh` on macOS and Linux and through `cmd` on Windows ([settings reference](https://code.claude.com/docs/en/settings-reference#apikeyhelper)), so on Windows the interpreter is double-quoted for `cmd`: `"C:\\Python\\python.exe" -I -m authfi token --resource llm` (written with doubled backslashes inside the JSON). Run `authfi login` with the interpreter you want Claude Code to use: from a project's virtualenv the line names that virtualenv's Python and its packages, and a Python with no absolute path gets no line. Started any other way, `authfi token --resource llm` prints the fix on stderr and exits 1 without opening the credential store. The credential store is opened by naming the operating system's store (Keychain, Credential Locker, Secret Service or KWallet) directly: `keyringrc.cfg`, its `keyring-path` and `PYTHON_KEYRING_BACKEND` are never read.
 - `apiKeyHelper` runs the command and uses what it prints. Claude Code sends that value in both `Authorization: Bearer`
   and `x-api-key`. `authfi token --resource llm` prints the access token and a newline and nothing else; on any
   failure it prints the reason on stderr, prints nothing on stdout and exits 1.
@@ -78,7 +78,8 @@ variable's name in the message and exit code 1, when any of these is present:
 | certificate trust | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` | set, unless you allowed that exact value |
 | | `CLAUDE_CODE_CERT_STORE` | anything but `bundled`, `system` or both |
 | | `NODE_OPTIONS` | set to anything, unless you allowed that exact value. Node's own parser (quotes, escapes, `_` for `-`) reads options in more spellings than a deny-list can match, so the helper does not try |
-| code or trust store in the helper or the tool | `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONBREAKPOINT`, `PYTHONINSPECT`, `PYTHONSAFEPATH`, `PYTHONPYCACHEPREFIX`, `PYTHONWARNINGS`, `NODE_PATH`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `BASH_ENV`, `ENV`, `OPENSSL_CONF`, `OPENSSL_MODULES`, `GIT_SSL_CAINFO`, `GIT_PROXY_COMMAND`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, and every `LD_*` and `DYLD_*` variable | set, unless you allowed that exact value |
+| code or trust store in the helper or the tool | `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONBREAKPOINT`, `PYTHONINSPECT`, `PYTHONSAFEPATH`, `PYTHONPYCACHEPREFIX`, `PYTHONWARNINGS`, `NODE_PATH`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `BASH_ENV`, `ENV`, `OPENSSL_CONF`, `OPENSSL_MODULES`, `OPENSSL_ENGINES`, `SHELLOPTS`, `GIT_SSL_CAINFO`, `GIT_PROXY_COMMAND`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, and every `LD_*` and `DYLD_*` variable | set, unless you allowed that exact value |
+| session bus (Linux) | `DBUS_SESSION_BUS_ADDRESS` | anything but this user's own `unix:path=/run/user/<uid>/bus`, unless you allowed that exact value; checked before the credential store is opened, because the store talks to that bus and a hostile one can answer as the Secret Service |
 | | `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY` | `0`; this cannot be allowed |
 | | `GIT_SSL_NO_VERIFY` | set to anything; this cannot be allowed |
 | TLS session keys | `SSLKEYLOGFILE` (any non-empty value, a blank or quoted one too), and `--tls-keylog` in `NODE_OPTIONS` in any spelling (`--tls_keylog`, `"--tls-key\log"`) | set; this cannot be allowed, because whoever can read the key log can read the token |
@@ -104,6 +105,18 @@ An allowance needs a proxy host and, for a path variable, an absolute path in ev
 The allowance is by proxy host, and by variable name together with its exact value, compared as written: no trimming, so a trailing space or a Unicode space is a different value, so a repository cannot swap the
 file behind an allowed name for another path. Only `login.json` grants it: no environment variable does.
 
+### The boundary
+
+This guard catches misconfiguration. It does not defend against a repository you have trusted. The dynamic loader,
+OpenSSL and the shell read `LD_PRELOAD`, `OPENSSL_CONF`, `BASH_ENV` and similar variables before any line of this tool
+runs, so the helper refuses them, and names the variable, only as a second line of defence: code they name may already
+have run. That code runs as you, and code running as you can read your credential store directly. A repository that can
+set the helper's environment can already run commands as you (through a hook in the same `.claude/settings.json`, or
+`BASH_ENV` in the shell that starts the helper), so no check inside the helper can stop it.
+
+The control is Claude Code's workspace trust: it asks before it applies a repository's settings. Trust only repositories
+you would let run code on your machine. This tool makes no stronger claim than that.
+
 ### What this does not cover
 
 The guard reads the helper's environment and nothing else. It cannot see:
@@ -116,7 +129,7 @@ The guard reads the helper's environment and nothing else. It cannot see:
   no token from this tool at all. Claude Code asks you to trust a folder before it applies a repository's `env`; that
   trust decision is yours and is not something this command can check;
 - a proxy or CA that the operating system applies outside the environment (a system proxy, a CA in the OS store);
-- a `.npmrc` `node-options` setting. npm, not Node, turns it into `NODE_OPTIONS`, and only for what npm launches (`npm run`, `npx`); Node run directly reads no such file. When Claude Code is launched through npm or npx the guard cannot see that setting (it does refuse `npm_config_node_options`, `NPM_CONFIG_USERCONFIG` and `NPM_CONFIG_GLOBALCONFIG` in the environment, in any case). Launch the installed `claude` binary directly;
+- a `.npmrc` `node-options` setting. npm, not Node, turns it into `NODE_OPTIONS`, and only for what npm launches (`npm run`, `npx`); Node run directly reads no such file. When Claude Code is launched through npm or npx the guard cannot see that setting (it does refuse the environment variables npm reads for `node-options`, `script-shell`, `userconfig` and `globalconfig`, in any case and with `_` or `-` in the key, such as `npm_config_node-options`). Launch the installed `claude` binary directly;
 - an environment variable this list does not name.
 
 What the tests prove is that, for each variable above, the helper refuses with its name and prints nothing on stdout,

@@ -13,6 +13,7 @@ import http.client
 import json
 import os
 import secrets
+import shlex
 import subprocess
 import sys
 import threading
@@ -825,8 +826,8 @@ def test_the_agents_own_token_command_does_not_need_isolation(
 
 def test_the_helper_command_is_this_interpreter_by_absolute_path_with_i() -> None:
     command = _login.helper_command()
-    assert command.startswith(subprocess.list2cmdline([sys.executable]) if sys.platform == "win32" else sys.executable)
-    assert command.endswith("-I -m authfi token --resource llm")
+    quoted = f'"{sys.executable}"' if sys.platform == "win32" else shlex.quote(sys.executable)
+    assert command == f"{quoted} -I -m authfi token --resource llm"
     assert Path(sys.executable).is_absolute()
 
 
@@ -1647,6 +1648,11 @@ NPM_NAMES = [
     "Npm_Config_Node_Options",
     "npm_config_userconfig",
     "NPM_CONFIG_GLOBALCONFIG",
+    "npm_config_node-options",
+    "NPM_CONFIG_NODE-OPTIONS",
+    "npm_config_script_shell",
+    "npm_config_script-shell",
+    "NPM_CONFIG_SCRIPT-SHELL",
 ]
 
 
@@ -1655,7 +1661,7 @@ def test_the_options_npm_hands_to_node_stop_the_token_unless_that_exact_value_is
     platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
 ) -> None:
     signed_in(platform, server, vault, config_dir)
-    value = "--max-old-space-size=4096" if name.upper().endswith("NODE_OPTIONS") else "/opt/npmrc"
+    value = "--max-old-space-size=4096" if _login.npm_key(name) == "node-options" else "/opt/npmrc"
     _refused(platform, vault, config_dir, {name: value}, name)
     runtime(platform, vault, config_dir).config().save(ISSUER, allow_env=_login._allowed_env([f"{name}={value}"]))
     assert _login.access_token(runtime(platform, vault, config_dir, env={name: value}), None)
@@ -1673,3 +1679,192 @@ def test_a_key_log_flag_through_npm_cannot_be_allowed_or_run(
     signed_in(platform, server, vault, config_dir)
     runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={name: value})  # hand-edited
     assert "cannot be allowed" in _refused(platform, vault, config_dir, {name: value}, name).message
+
+
+BEFORE_THE_GUARD = [
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "OPENSSL_CONF",
+    "OPENSSL_ENGINES",
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+]
+
+
+@pytest.mark.parametrize("name", BEFORE_THE_GUARD)
+def test_a_variable_the_loader_or_shell_reads_first_is_still_refused_and_named(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    error = _refused(platform, vault, config_dir, {name: "/repo/x"}, name)
+    assert "before this check runs" in error.message and "second line of defence" in error.message
+
+
+@pytest.fixture
+def linux_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
+
+
+BUS = "DBUS_SESSION_BUS_ADDRESS"
+
+
+@pytest.mark.usefixtures("linux_user")
+def test_only_this_users_own_session_bus_passes(config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTHFI_CONFIG_DIR", str(config_dir))
+    own = "unix:path=/run/user/1000/bus"
+    assert _login.default_session_bus() == own
+    _login.check_session_bus({})
+    _login.check_session_bus({BUS: own})
+    for other in ("unix:path=/tmp/hostile", "unix:path=/run/user/1001/bus", own + ",guid=x", "tcp:host=evil,port=1"):
+        with pytest.raises(LoginError) as caught:
+            _login.check_session_bus({BUS: other, "AUTHFI_CONFIG_DIR": str(config_dir)})
+        assert caught.value.code == "environment_refused" and BUS in caught.value.message
+
+
+def test_the_guard_lets_the_default_session_bus_through_and_names_any_other(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own = "unix:path=/run/user/1000/bus"
+    monkeypatch.setattr(_login, "default_session_bus", lambda: own)
+    signed_in(platform, server, vault, config_dir)
+    assert _login.access_token(runtime(platform, vault, config_dir, env={BUS: own}), None)
+    _refused(platform, vault, config_dir, {BUS: "unix:path=/tmp/hostile"}, BUS)
+
+
+@pytest.mark.usefixtures("linux_user")
+def test_an_allowed_session_bus_address_passes_only_when_exact(config_dir: Path) -> None:
+    other = "unix:path=/tmp/dbus-session-abc"
+    _login.Config(config_dir).save(ISSUER, allow_env=_login._allowed_env([f"{BUS}={other}"]))
+    env = {"AUTHFI_CONFIG_DIR": str(config_dir)}
+    _login.check_session_bus({**env, BUS: other})
+    with pytest.raises(LoginError):
+        _login.check_session_bus({**env, BUS: other + "x"})
+
+
+def test_the_bus_is_checked_before_the_credential_store_is_opened(
+    linux_user: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def opened() -> None:
+        raise AssertionError("the store was opened")
+
+    monkeypatch.setattr(_login, "open_vault", opened)
+    monkeypatch.setenv(BUS, "unix:path=/tmp/hostile")
+    for argv in (["token", "--resource", "llm"], ["login"], ["logout"]):
+        assert cli_module.main(argv) == 1
+        assert BUS in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "darwin"])
+def test_windows_and_macos_have_no_session_bus_to_check(monkeypatch: pytest.MonkeyPatch, platform_name: str) -> None:
+    monkeypatch.setattr(sys, "platform", platform_name)
+    assert _login.default_session_bus() is None
+    _login.check_session_bus({BUS: "unix:path=/tmp/anything"})
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("npm_config_node_options", "node-options"),
+        ("npm_config_node-options", "node-options"),
+        ("NPM_CONFIG_NODE-OPTIONS", "node-options"),
+        ("Npm_Config_Node_Options", "node-options"),
+        ("npm_config_script_shell", "script-shell"),
+        ("npm_config_script-shell", "script-shell"),
+        ("NPM_CONFIG_USERCONFIG", "userconfig"),
+        ("NODE_OPTIONS", None),
+        ("npm_config", None),
+        ("xnpm_config_node_options", None),
+    ],
+)
+def test_npm_keys_are_read_as_npm_reads_them(name: str, key: str | None) -> None:
+    assert _login.npm_key(name) == key
+    assert _login.is_guarded(name) is (key is not None or name == "NODE_OPTIONS")
+
+
+@pytest.mark.parametrize("name", ["npm_config_node-options", "NPM_CONFIG_NODE-OPTIONS"])
+@pytest.mark.parametrize("value", KEYLOG_SPELLINGS)
+def test_a_key_log_flag_through_npms_dash_spelling_cannot_be_allowed_or_run(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str, value: str
+) -> None:
+    with pytest.raises(LoginError) as caught:
+        _login._allowed_env([f"{name}={value}"])
+    assert caught.value.code == "bad_allow" and "cannot be allowed" in caught.value.message
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={name: value})  # hand-edited
+    assert "cannot be allowed" in _refused(platform, vault, config_dir, {name: value}, name).message
+
+
+def test_an_allowance_cannot_name_a_file_by_a_relative_path() -> None:
+    for pair in (
+        "NODE_OPTIONS=--require=./hook.js",
+        "NODE_OPTIONS=--openssl-config=openssl.cnf",
+        "NODE_OPTIONS=-r ./hook.js",
+        "JAVA_TOOL_OPTIONS=-javaagent:agent.jar",
+        "RUBYOPT=-r./x",
+        "NPM_CONFIG_NODE_OPTIONS=--require=../hook.js",
+    ):
+        name = pair.partition("=")[0]
+        with pytest.raises(LoginError) as caught:
+            _login._allowed_env([pair])
+        assert caught.value.code == "bad_allow" and name in caught.value.message and "relative" in caught.value.message
+    assert _login._allowed_env(["NODE_OPTIONS=--require=/opt/hook.js --max-old-space-size=4096"])
+    assert _login._allowed_env(["JAVA_TOOL_OPTIONS=-javaagent:/opt/agent.jar"])
+    assert _login._allowed_env(["NODE_OPTIONS=--max-old-space-size=4096"])
+
+
+def test_a_relative_file_in_an_allowance_written_by_hand_is_ignored(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={"NODE_OPTIONS": "--require=./hook.js"})
+    _refused(platform, vault, config_dir, {"NODE_OPTIONS": "--require=./hook.js"}, "NODE_OPTIONS")
+
+
+@pytest.mark.parametrize("executable", ["", "python", "./venv/bin/python", "venv\\Scripts\\python.exe"])
+def test_the_helper_line_needs_an_absolute_interpreter(
+    executable: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path))  # nothing named python is on it
+    with pytest.raises(LoginError) as caught:
+        _login.helper_command(executable)
+    assert caught.value.code == "no_interpreter"
+
+
+def test_the_helper_line_runs_in_the_shell_claude_code_uses(tmp_path: Path) -> None:
+    """``/bin/sh`` on macOS and Linux, ``cmd`` on Windows: a space and an ampersand in the path keep the args."""
+    folder = tmp_path / "dir with space & amp"
+    folder.mkdir()
+    if sys.platform == "win32":
+        program = folder / "echo args.cmd"
+        program.write_text("@echo off\r\necho ARGS: %*\r\n", encoding="utf-8")
+    else:
+        program = folder / "echo args.sh"
+        program.write_text('#!/bin/sh\necho "ARGS: $@"\n', encoding="utf-8")
+        program.chmod(0o755)
+    command = _login.helper_command(str(program))
+    done = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)  # noqa: S602
+    assert done.returncode == 0 and "ARGS: -I -m authfi token --resource llm" in done.stdout, done.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe quoting")
+def test_the_windows_helper_line_quotes_the_interpreter_for_cmd() -> None:
+    assert _login.helper_command("C:\\Program Files\\Python\\python.exe") == (
+        '"C:\\Program Files\\Python\\python.exe" -I -m authfi token --resource llm'
+    )
+    for bad in ("C:\\a%PATH%b\\python.exe", 'C:\\a"b\\python.exe'):
+        with pytest.raises(LoginError):
+            _login.helper_command(bad)
+
+
+def test_the_posix_helper_line_quotes_the_interpreter_for_sh(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    program = tmp_path / "a dir; touch x" / "python"
+    monkeypatch.setattr(sys, "platform", "linux")
+    command = _login.helper_command(str(program))
+    assert command == f"{shlex.quote(str(program))} -I -m authfi token --resource llm"
+    assert shlex.split(command)[0] == str(program)  # one word for sh, whatever the path holds
