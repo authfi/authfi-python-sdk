@@ -84,6 +84,7 @@ class FakeAS:
         self.login_refresh: str | None = None
         self.dead_clients: set[str] = set()
         self.all_clients_dead = False
+        self.exchange_error: dict[str, Any] | None = None
         self.revoked: list[dict[str, str]] = []
         self.revoke_status = 200
         self.issued = 0
@@ -144,6 +145,8 @@ class FakeAS:
         form = dict(parse_qsl(request.content.decode()))
         self.token_forms.append(form)
         if form["grant_type"] == "authorization_code":
+            if self.exchange_error is not None:
+                return json_response(self.exchange_error, 400)
             if self.all_clients_dead or form["client_id"] in self.dead_clients:
                 return json_response({"error": "invalid_client", "error_description": "unknown client"}, 401)
             asked = self.codes.pop(form["code"], None)
@@ -964,6 +967,16 @@ def test_login_gives_up_after_one_new_registration(
         _login.login(runtime(platform, vault, config_dir, opener=browser(server)), ISSUER, timeout=10)
     assert caught.value.code == "invalid_client" and len(server.registrations) == 2
     assert vault.values == {}
+
+
+def test_login_registers_again_only_for_a_refused_client_not_for_any_other_refusal(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    server.exchange_error = {"error": "invalid_grant", "error_description": "the code was used"}
+    with pytest.raises(OAuthError) as caught:
+        _login.login(runtime(platform, vault, config_dir, opener=browser(server)), ISSUER, timeout=10)
+    assert caught.value.code == "invalid_grant" and len(server.registrations) == 1
+    assert len(server.token_forms) == 1  # one exchange, not a second sign-in
 
 
 def test_logout_with_no_client_to_revoke_with_says_so_and_still_deletes(
