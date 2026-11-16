@@ -9,12 +9,14 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import secrets
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit
 
 import httpx
@@ -1162,45 +1164,207 @@ def test_the_cert_store_variable_may_only_narrow_the_built_in_sources(
         assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
 
 
-@pytest.mark.parametrize(
-    ("value", "refused"),
-    [
-        ("--max-old-space-size=4096", False),
-        ("--require /repo/hook.js", True),
-        ("-r /repo/hook.js", True),
-        ("--import=/repo/hook.mjs", True),
-        ("--experimental-loader /repo/l.mjs", True),
-        ("--use-openssl-ca", True),
-        ("--tls-min-v1.0", True),
-        ('"--require=./probe.js"', True),
-        ('"--require" ./probe.js', True),
-        ("'--require=./probe.js'", True),
-        ('"--tls-keylog=/tmp/k"', True),
-        ('"--max-old-space-size=4096"', False),
-    ],
-)
-def test_node_options_that_load_code_or_change_tls_stop_the_token(
-    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str, refused: bool
+#: Every spelling here loads code or changes TLS in node; the three that the round-5 review found come first.
+NODE_BYPASSES = [
+    '"--requ\\ire=./p.js"',
+    "--tls_keylog=/tmp/k",
+    "--experimental_loader /repo/l.mjs",
+    "--use_openssl_ca",
+    "--openssl_config=/repo/o.cnf",
+    '"--req\\uire" ./p.js',
+    '"--tls-key\\log=/tmp/k"',
+    '"--tls_key\\log=/tmp/k"',
+    "--require /repo/hook.js",
+    "-r /repo/hook.js",
+    "--import=/repo/hook.mjs",
+    "--experimental-loader /repo/l.mjs",
+    "--use-openssl-ca",
+    "--tls-min-v1.0",
+    '"--require=./probe.js"',
+    '"--require" ./probe.js',
+    "'--require=./probe.js'",
+    '"--tls-keylog=/tmp/k"',
+    "--max-old-space-size=4096",
+    '"--max-old-space-size=4096"',
+    "--inspect",
+    "--use-system-ca",
+]
+
+
+@pytest.mark.parametrize("value", NODE_BYPASSES)
+def test_node_options_set_to_anything_stop_the_token(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str
 ) -> None:
     signed_in(platform, server, vault, config_dir)
-    env = {"NODE_OPTIONS": value}
-    if refused:
-        _refused(platform, vault, config_dir, env, "NODE_OPTIONS")
-    else:
-        assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
+    _refused(platform, vault, config_dir, {"NODE_OPTIONS": value}, "NODE_OPTIONS")
 
 
-@pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONSTARTUP", "LD_PRELOAD"])
-def test_variables_that_run_code_or_write_session_keys_stop_the_token(
+def test_node_options_that_is_empty_or_blank_is_not_set(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    for value in ("", "  "):
+        assert _login.access_token(runtime(platform, vault, config_dir, env={"NODE_OPTIONS": value}), None)
+
+
+def test_an_allowed_node_options_value_passes_only_when_exact(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(
+        ISSUER, allow_env=_login._allowed_env(["NODE_OPTIONS=--max-old-space-size=4096"])
+    )
+    ok = {"NODE_OPTIONS": "--max-old-space-size=4096"}
+    assert _login.access_token(runtime(platform, vault, config_dir, env=ok), None)
+    for other in ("--max-old-space-size=8192", "--max-old-space-size=4096 --require=./p.js", '"--requ\\ire=./p.js"'):
+        _refused(platform, vault, config_dir, {"NODE_OPTIONS": other}, "NODE_OPTIONS")
+
+
+KEYLOG_SPELLINGS = [
+    "--tls-keylog=/x",
+    "--tls_keylog=/x",
+    '"--tls-keylog=/x"',
+    '"--tls-key\\log=/x"',
+    '"--tls_key\\log=/x"',
+    "--max-old-space-size=4096 --tls_keylog /x",
+    "'--tls-keylog=/x'",
+]
+
+
+@pytest.mark.parametrize("value", KEYLOG_SPELLINGS)
+def test_a_key_log_flag_in_any_spelling_cannot_be_allowed_or_run(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str
+) -> None:
+    with pytest.raises(LoginError) as caught:
+        _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=[f"NODE_OPTIONS={value}"])
+    assert caught.value.code == "bad_allow" and "cannot be allowed" in caught.value.message
+    assert platform.requests == [] and vault.values == {}
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env={"NODE_OPTIONS": value})  # hand-edited
+    error = _refused(platform, vault, config_dir, {"NODE_OPTIONS": value}, "NODE_OPTIONS")
+    assert "cannot be allowed" in error.message
+
+
+@pytest.mark.parametrize(
+    ("value", "tokens"),
+    [
+        ("--a_b=c_d  --e", ["--a-b=c_d", "--e"]),
+        ('"--requ\\ire=./p.js"', ["--require=./p.js"]),
+        ('--x="a b"', ["--x=a b"]),
+        ("", []),
+    ],
+)
+def test_node_options_are_read_as_node_reads_them(value: str, tokens: list[str]) -> None:
+    assert _login.node_options(value) == tokens
+
+
+GUARDED_CODE_VARIABLES = [*_login.CODE_VARIABLES, "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES"]
+
+
+@pytest.mark.parametrize("name", GUARDED_CODE_VARIABLES)
+def test_a_variable_that_loads_code_stops_the_token_unless_that_exact_value_is_allowed(
     platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, name: str
 ) -> None:
     signed_in(platform, server, vault, config_dir)
-    _refused(platform, vault, config_dir, {name: "/repo/x"}, name)
+    value = "ok" if name in _login._NOT_PATHS else "/opt/ok"
+    _refused(platform, vault, config_dir, {name: value}, name)
+    runtime(platform, vault, config_dir).config().save(ISSUER, allow_env=_login._allowed_env([f"{name}={value}"]))
+    assert _login.access_token(runtime(platform, vault, config_dir, env={name: value}), None)
+    _refused(platform, vault, config_dir, {name: value + "x"}, name)
+
+
+def test_a_path_allowance_needs_every_member_absolute(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    for bad in ("/opt/lib:", "/opt/lib:.", "/opt/lib:repo/src", "rel.so", "/opt/a.so rel.so"):
+        with pytest.raises(LoginError) as caught:
+            _login.login(runtime(platform, vault, config_dir), ISSUER, allow_env=[f"PYTHONPATH={bad}"])
+        assert caught.value.code == "bad_allow"
+    assert platform.requests == []
+    assert _login._allowed_env(["PYTHONPATH=/opt/a:/opt/b"]) == {"PYTHONPATH": "/opt/a:/opt/b"}
+
+
+@pytest.mark.parametrize("value", ["/x", " ", '""', "''", "\t"])
+def test_a_blank_or_quoted_key_log_name_counts_as_set(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, value: str
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    _refused(platform, vault, config_dir, {"SSLKEYLOGFILE": value}, "SSLKEYLOGFILE")
+
+
+def test_an_allowance_written_by_hand_is_checked_when_it_is_read(
+    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    runtime(platform, vault, config_dir).config().save(
+        ISSUER,
+        allow_proxies=[""],
+        allow_env={"SSL_CERT_FILE": "ca.pem", "PYTHONPATH": ".:/x"},
+    )
+    allowed = runtime(platform, vault, config_dir).config().allowed()
+    assert not allowed.proxies and not allowed.env
+    _refused(platform, vault, config_dir, {"SSL_CERT_FILE": "ca.pem"}, "SSL_CERT_FILE")
+    _refused(platform, vault, config_dir, {"HTTPS_PROXY": "not an address"}, "HTTPS_PROXY")
+
+
+def test_a_file_another_user_owns_or_can_write_is_not_private() -> None:
+    mine = types.SimpleNamespace(st_uid=1000, st_mode=0o100600)
+    assert _login.private_to(cast("os.stat_result", mine), 1000)
+    assert not _login.private_to(cast("os.stat_result", mine), 1001)
+    for mode in (0o100620, 0o100602, 0o100666):
+        shared = types.SimpleNamespace(st_uid=1000, st_mode=mode)
+        assert not _login.private_to(cast("os.stat_result", shared), 1000)
+
+
+def _always(answer: bool) -> Callable[[os.stat_result, int], bool]:
+    def private_to(info: os.stat_result, uid: int) -> bool:
+        return answer
+
+    return private_to
+
+
+def test_allowances_in_a_file_that_is_not_private_are_ignored(
+    platform: Platform,
+    server: FakeAS,
+    vault: MemoryVault,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    config = runtime(platform, vault, config_dir).config()
+    config.save(ISSUER, allow_proxies=["proxy.corp.example"])
+    monkeypatch.setattr(_login, "private_to", _always(True))
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    assert config.allowed().proxies == {"proxy.corp.example"}
+    monkeypatch.setattr(_login, "private_to", _always(False))
+    assert not config.allowed().proxies
+
+
+def test_a_failed_forget_is_a_clear_error_and_leaves_no_temporary_file(
+    platform: Platform,
+    server: FakeAS,
+    vault: MemoryVault,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signed_in(platform, server, vault, config_dir)
+    config = runtime(platform, vault, config_dir).config()
+    config.save(ISSUER, allow_proxies=["proxy.corp.example"])
+
+    def refuse(*_: object) -> None:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(LoginError) as caught:
+        config.forget_allow()
+    assert caught.value.code == "forget_failed" and "still in force" in caught.value.message
+    assert not list(config_dir.glob("*.tmp"))
 
 
 NEVER_ALLOWED = [
     ("NODE_TLS_REJECT_UNAUTHORIZED", "0", "certificate verification off"),
     ("PYTHONHTTPSVERIFY", "0", "certificate verification off"),
+    ("GIT_SSL_NO_VERIFY", "1", "certificate verification off"),
     ("SSLKEYLOGFILE", "/home/me/keys.log", "TLS session keys"),
     ("NODE_OPTIONS", "--tls-keylog=/home/me/keys.log", "TLS session keys"),
     ("NODE_OPTIONS", '"--tls-keylog=/home/me/keys.log"', "TLS session keys"),
@@ -1232,7 +1396,7 @@ def test_the_never_allowed_variables_are_fine_when_harmless(
     platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path
 ) -> None:
     signed_in(platform, server, vault, config_dir)
-    for env in ({"PYTHONHTTPSVERIFY": "1"}, {"SSLKEYLOGFILE": ""}, {"NODE_OPTIONS": "--max-old-space-size=4096"}):
+    for env in ({"PYTHONHTTPSVERIFY": "1"}, {"SSLKEYLOGFILE": ""}, {"GIT_SSL_NO_VERIFY": ""}):
         assert _login.access_token(runtime(platform, vault, config_dir, env=env), None)
 
 
@@ -1286,7 +1450,13 @@ def test_a_clean_environment_and_the_allowed_ones_get_their_token_through_the_co
     monkeypatch.setattr(_login, "open_vault", lambda: vault)
     monkeypatch.setattr(cli_module, "_http_client", lambda: platform.client())
     monkeypatch.setenv("AUTHFI_CONFIG_DIR", str(config_dir))
-    for name in (*_login.PROXY_VARIABLES, *_login.TLS_VARIABLES, _login.TLS_OFF, *_login.PROVIDER_SWITCHES):
+    for name in (
+        *_login.PROXY_VARIABLES,
+        *_login.TLS_VARIABLES,
+        *_login.CODE_VARIABLES,
+        _login.TLS_OFF,
+        *_login.PROVIDER_SWITCHES,
+    ):
         monkeypatch.delenv(name, raising=False)
     assert cli_module.main(["token", "--resource", "llm", "--issuer", ISSUER]) == 0
     assert capsys.readouterr().out.strip().count(".") == 2

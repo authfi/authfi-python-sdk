@@ -76,10 +76,11 @@ variable's name in the message and exit code 1, when any of these is present:
 | proxy | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and their lowercase forms | the proxy host is not one you allowed |
 | certificate trust | `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` | set, unless you allowed that exact value |
 | | `CLAUDE_CODE_CERT_STORE` | anything but `bundled`, `system` or both |
-| | `NODE_OPTIONS` | it carries `-r`, `--require`, `--import`, `--loader`, `--experimental-loader`, `--use-openssl-ca`, `--use-bundled-ca`, `--openssl-config` or `--tls-*` (quoted or not), unless you allowed that exact value |
-| code in the helper | `PYTHONPATH`, `PYTHONSTARTUP`, `LD_PRELOAD` | set, unless you allowed that exact absolute path |
+| | `NODE_OPTIONS` | set to anything, unless you allowed that exact value. Node's own parser (quotes, escapes, `_` for `-`) reads options in more spellings than a deny-list can match, so the helper does not try |
+| code or trust store in the helper or the tool | `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONUSERBASE`, `PYTHONHOME`, `PYTHONBREAKPOINT`, `PYTHONINSPECT`, `PYTHONSAFEPATH`, `PYTHONPYCACHEPREFIX`, `PYTHONWARNINGS`, `NODE_PATH`, `JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `BASH_ENV`, `ENV`, `OPENSSL_CONF`, `OPENSSL_MODULES`, `GIT_SSL_CAINFO`, `GIT_PROXY_COMMAND`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, and every `LD_*` and `DYLD_*` variable | set, unless you allowed that exact value |
 | | `NODE_TLS_REJECT_UNAUTHORIZED`, `PYTHONHTTPSVERIFY` | `0`; this cannot be allowed |
-| TLS session keys | `SSLKEYLOGFILE`, and `--tls-keylog` in `NODE_OPTIONS` | set; this cannot be allowed, because whoever can read the key log can read the token |
+| | `GIT_SSL_NO_VERIFY` | set to anything; this cannot be allowed |
+| TLS session keys | `SSLKEYLOGFILE` (any non-empty value, a blank or quoted one too), and `--tls-keylog` in `NODE_OPTIONS` in any spelling (`--tls_keylog`, `"--tls-key\log"`) | set; this cannot be allowed, because whoever can read the key log can read the token |
 
 The names come from Claude Code's own documentation (the [settings](https://code.claude.com/docs/en/settings),
 [environment variables](https://code.claude.com/docs/en/env-vars),
@@ -97,7 +98,7 @@ authfi login --allow-proxy proxy.corp.example
 authfi login --allow-env NODE_EXTRA_CA_CERTS=/etc/ssl/corp-ca.pem
 ```
 
-An allowance needs a proxy host and, for a path variable, an absolute path. `authfi logout --forget-allow` drops all of them.
+An allowance needs a proxy host and, for a path variable, an absolute path in every member of the list (`/opt/lib:.` and a trailing `:` are refused). The same checks run again when the file is read, so a hand-edited entry that would not have been recorded is ignored. On Linux and macOS the allowances in a `login.json` that another user owns, or that its group or others can write, are ignored. `authfi logout --forget-allow` drops all of them; if the file cannot be rewritten it says so and the allowances stay in force.
 
 The allowance is by proxy host, and by variable name together with its exact value, so a repository cannot swap the
 file behind an allowed name for another path. Only `login.json` grants it: no environment variable does.

@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -276,6 +277,11 @@ class Allowed:
     env: Mapping[str, str]
 
 
+def private_to(info: os.stat_result, uid: int) -> bool:
+    """``True`` when the file belongs to ``uid`` and neither its group nor others can write it."""
+    return info.st_uid == uid and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
 class Config:
     """``login.json``: the issuer last signed in to and, per issuer, the client id registered for it. No secrets."""
 
@@ -314,24 +320,48 @@ class Config:
 
     def allowed(self) -> Allowed:
         """What the person allowed with ``authfi login --allow-proxy`` and ``--allow-env``; nothing by default."""
+        if not self._trusted():
+            return Allowed(proxies=frozenset(), env={})
         entry = _object(self._read().get("allow"))
         proxies = entry.get("proxies")
         listed: list[object] = cast("list[object]", proxies) if isinstance(proxies, list) else []
         env = _object(entry.get("env"))
         return Allowed(
-            proxies=frozenset(p.lower() for p in listed if isinstance(p, str)),
-            env={k: v for k, v in env.items() if isinstance(v, str)},
+            proxies=frozenset(
+                p.lower() for p in listed if isinstance(p, str) and p.strip() and _host_of(p) == p.lower()
+            ),
+            env={k: v for k, v in env.items() if isinstance(v, str) and allowance_problem(k, v) is None},
         )
+
+    def _trusted(self) -> bool:
+        """``False`` when another user owns ``login.json`` or can write it: its allowances are then ignored."""
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            return True
+        try:
+            info = self.path.stat()
+        except OSError:
+            return True
+        return private_to(info, geteuid())
 
     def forget_allow(self) -> None:
         """Drop every proxy host and environment value the person allowed."""
         data = self._read()
         if data.pop("allow", None) is not None:
             temporary = self.path.with_name(self.path.name + f".{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            with contextlib.suppress(OSError):
-                temporary.chmod(0o600)
-            os.replace(temporary, self.path)
+            try:
+                temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                with contextlib.suppress(OSError):
+                    temporary.chmod(0o600)
+                os.replace(temporary, self.path)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    temporary.unlink()
+                raise LoginError(
+                    f"the stored tokens were deleted but the allowances in {self.path} could not be removed: "
+                    f"{exc.strerror or exc}; they are still in force",
+                    code="forget_failed",
+                ) from exc
 
     def save(
         self,
@@ -620,17 +650,9 @@ def _allowed_env(pairs: Sequence[str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for pair in pairs:
         name, _, value = pair.partition("=")
-        if why := _never_allowed_name(name):
-            raise LoginError(f"--allow-env {name} is refused: it {why}; this cannot be allowed", code="bad_allow")
-        if name == "NODE_OPTIONS" and (why := never_allowed(name, value)):
-            raise LoginError(f"--allow-env NODE_OPTIONS is refused: it {why}; this cannot be allowed", code="bad_allow")
-        if name not in TLS_VARIABLES or not value:
-            raise LoginError(
-                f"--allow-env takes NAME=VALUE for one of {', '.join(TLS_VARIABLES)}: {name!r}", code="bad_allow"
-            )
-        if name in _PATH_VARIABLES and not (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()):
-            raise LoginError(f"--allow-env {name} takes an absolute path, not {value!r}", code="bad_allow")
-        out[name] = value
+        if why := allowance_problem(name, value):
+            raise LoginError(f"--allow-env {name} is refused: {why}", code="bad_allow")
+        out[name] = value.strip()
     return out
 
 
@@ -766,7 +788,8 @@ PROXY_VARIABLES = (
     "http_proxy",
     "all_proxy",
 )
-#: Trust-store and TLS variables: a CA the person did not name lets a proxy read the token in transit.
+#: Trust-store and TLS variables: a CA the person did not name lets a proxy read the token in transit. ``NODE_OPTIONS``
+#: is here because it can load code and change TLS and the guard cannot parse it as node does: any value is refused.
 TLS_VARIABLES = (
     "NODE_EXTRA_CA_CERTS",
     "SSL_CERT_FILE",
@@ -775,16 +798,99 @@ TLS_VARIABLES = (
     "CURL_CA_BUNDLE",
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
-    # Variables that run code inside the helper.
+)
+#: Variables that load code or swap a trust store inside the helper or the tool: refused when set, unless the person
+#: allowed that exact value. ``LD_*`` and ``DYLD_*`` are covered by prefix.
+CODE_VARIABLES = (
     "PYTHONPATH",
     "PYTHONSTARTUP",
-    "LD_PRELOAD",
+    "PYTHONUSERBASE",
+    "PYTHONHOME",
+    "PYTHONBREAKPOINT",
+    "PYTHONINSPECT",
+    "PYTHONSAFEPATH",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONWARNINGS",
+    "NODE_PATH",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "OPENSSL_CONF",
+    "OPENSSL_MODULES",
+    "GIT_SSL_CAINFO",
+    "GIT_PROXY_COMMAND",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
 )
-#: Variables whose value is a path: an allowance for one must be absolute, or a repository's own file would match it.
-_PATH_VARIABLES = frozenset(TLS_VARIABLES) - {"CLAUDE_CODE_CERT_STORE", "NODE_OPTIONS"}
-#: Verification turned off is never allowed.
+CODE_PREFIXES = ("LD_", "DYLD_")
+#: Guarded variables whose value is not a path: an allowance for one needs no absolute-path check.
+_NOT_PATHS = frozenset(
+    {
+        "CLAUDE_CODE_CERT_STORE",
+        "NODE_OPTIONS",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "PERL5OPT",
+        "RUBYOPT",
+        "GIT_PROXY_COMMAND",
+        "PYTHONBREAKPOINT",
+        "PYTHONINSPECT",
+        "PYTHONSAFEPATH",
+        "PYTHONWARNINGS",
+    }
+)
+_WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/]")
+#: Verification turned off and exported session keys are never allowed.
 TLS_OFF = "NODE_TLS_REJECT_UNAUTHORIZED"
-_KEYLOG_OPTION = re.compile(r"(^|\s)--tls-keylog(?![a-z0-9-])")
+_NEVER_NAMES = (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE", "GIT_SSL_NO_VERIFY")
+
+
+def is_guarded(name: str) -> bool:
+    """``True`` for a variable the guard refuses when set, unless the person allowed that exact value."""
+    return name in TLS_VARIABLES or name in CODE_VARIABLES or name.startswith(CODE_PREFIXES)
+
+
+def node_options(value: str) -> list[str]:
+    """``NODE_OPTIONS`` as node reads it: split on spaces, ``"`` quotes, escapes inside quotes, ``_`` as ``-``."""
+    tokens: list[str] = []
+    current: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and in_string:
+            index += 1
+            if index >= len(value):
+                break
+            current.append(value[index])
+        elif char == " " and not in_string:
+            if current:
+                tokens.append("".join(current))
+                current = []
+        elif char == '"':
+            in_string = not in_string
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    out: list[str] = []
+    for token in tokens:
+        head, equals, tail = token.partition("=")
+        out.append(head.replace("_", "-") + equals + tail)
+    return out
+
+
+def _carries_keylog(value: str) -> bool:
+    """``True`` when node would read ``--tls-keylog`` out of this value, or when any spelling of it could hide in it."""
+    if any(token.partition("=")[0] == "--tls-keylog" for token in node_options(value)):
+        return True
+    return "tls-keylog" in re.sub(r"[\\\"'\s]", "", value)  # a spelling node's own parser would miss
 
 
 def never_allowed(name: str, value: str) -> str | None:
@@ -796,23 +902,44 @@ def never_allowed(name: str, value: str) -> str | None:
     plain = value.strip().replace('"', "").replace("'", "")
     if name in (TLS_OFF, "PYTHONHTTPSVERIFY") and plain == "0":
         return "turns certificate verification off"
-    if name == "SSLKEYLOGFILE" and plain:
+    if name == "GIT_SSL_NO_VERIFY" and value:
+        return "turns certificate verification off"
+    if name == "SSLKEYLOGFILE" and value:  # any non-empty value, blank or quoted too: Python opens it as written
         return "writes the TLS session keys to a file, so anyone who can read that file can read the token"
-    if name == "NODE_OPTIONS" and _KEYLOG_OPTION.search(plain):
+    if name == "NODE_OPTIONS" and _carries_keylog(value):
         return "carries --tls-keylog, which writes the TLS session keys to a file anyone who can read it can use"
     return None
 
 
 def _never_allowed_name(name: str) -> str | None:
     """The reason an allowance for ``name`` is refused whatever its value, or ``None``."""
-    return never_allowed(name, "0") if name in (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE") else None
+    return never_allowed(name, "0") if name in _NEVER_NAMES else None
+
+
+def allowance_problem(name: str, value: str) -> str | None:
+    """Why ``NAME=VALUE`` cannot be recorded as an allowance, or ``None``; also applied when the file is read."""
+    if why := _never_allowed_name(name):
+        return f"it {why}; this cannot be allowed"
+    if not is_guarded(name):
+        names = ", ".join((*TLS_VARIABLES, *CODE_VARIABLES))
+        return f"it is not one of the variables the guard can allow ({names}, LD_*, DYLD_*)"
+    if not value.strip():
+        return "it needs a value"
+    if why := never_allowed(name, value):
+        return f"it {why}; this cannot be allowed"
+    if name not in _NOT_PATHS:
+        members = [
+            member
+            for piece in re.split(r"[;\s]+", value.strip())
+            for member in ([piece] if _WINDOWS_PATH.match(piece) else piece.split(":"))
+        ]
+        if not all(m and (PurePosixPath(m).is_absolute() or PureWindowsPath(m).is_absolute()) for m in members):
+            return f"every path in it must be absolute, not {value!r}"
+    return None
 
 
 _FALSE = frozenset({"", "0", "false", "no", "off"})
 _CERT_STORE_SOURCES = frozenset({"bundled", "system"})
-_NODE_OPTION = re.compile(
-    r"(^|\s)(-r|--require|--import|--loader|--experimental-loader|--use-openssl-ca|--use-bundled-ca|--openssl-config|--tls-[a-z0-9-]+)\b"
-)
 
 
 def _is_llm_url(value: str, origins: frozenset[str]) -> bool:
@@ -878,24 +1005,20 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
                 f"names the proxy {host or 'that is not an address'}, which could read the token",
                 f"unset it, or allow that host once with: authfi login --allow-proxy {host or 'HOST'}",
             )
-    for name in (TLS_OFF, "PYTHONHTTPSVERIFY", "SSLKEYLOGFILE", "NODE_OPTIONS"):
+    for name in (*_NEVER_NAMES, "NODE_OPTIONS"):
         if why := never_allowed(
             name, env.get(name, "")
         ):  # before the allowances: a hand-edited login.json cannot lift it
             raise _refuse(name, why, "unset it; this cannot be allowed")
-    for name in TLS_VARIABLES:
-        value = env.get(name, "").strip()
+    for name in sorted(n for n in env if is_guarded(n)):
+        value = env[name].strip()
         if not value or allow.env.get(name) == value:
             continue
         if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:
             continue  # a subset of the built-in sources only narrows what is trusted
-        if name == "NODE_OPTIONS" and not _NODE_OPTION.search(
-            value.replace('"', "").replace("'", "")
-        ):  # Node strips quotes
-            continue
         raise _refuse(
             name,
-            "changes which certificates or code the tool trusts",
+            "loads code or changes which certificates the tool trusts",
             f"unset it, or allow exactly this value once with: authfi login --allow-env {name}=<value>",
         )
 
