@@ -30,7 +30,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import stat
 import sys
 import threading
@@ -226,8 +225,6 @@ def helper_command(executable: str | None = None) -> str:
     Windows, so the interpreter is quoted for that shell.
     """
     exe = executable if executable is not None else sys.executable
-    if exe and not os.path.isabs(exe):
-        exe = shutil.which(exe) or ""
     if not exe or not os.path.isabs(exe):
         raise LoginError(
             "this Python has no absolute path (sys.executable is empty or relative), so the apiKeyHelper line cannot "
@@ -843,7 +840,7 @@ TLS_VARIABLES = (
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
 )
-#: The session bus keyring's Secret Service backend talks to. Not code, but the bus names who holds the secret.
+#: The session bus the Secret Service and KWallet backends talk to (Linux). See :func:`check_session_bus`.
 DBUS = "DBUS_SESSION_BUS_ADDRESS"
 #: Variables the dynamic loader, OpenSSL or the shell reads before any line of this tool runs: refusing them here is a
 #: second line of defence (the first is that the person only trusts repositories they would let run code).
@@ -872,7 +869,6 @@ CODE_VARIABLES = (
     "OPENSSL_MODULES",
     "OPENSSL_ENGINES",
     "SHELLOPTS",
-    DBUS,
     "GIT_SSL_CAINFO",
     "GIT_PROXY_COMMAND",
     "PERL5OPT",
@@ -896,7 +892,6 @@ _NOT_PATHS = frozenset(
         "PYTHONINSPECT",
         "PYTHONSAFEPATH",
         "PYTHONWARNINGS",
-        DBUS,
     }
 )
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/]")
@@ -1114,7 +1109,7 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
             raise _refuse(name, why, "unset it; this cannot be allowed")
     for name in sorted(n for n in env if is_guarded(n)):
         value = env[name]  # as written: an allowance matches byte for byte
-        if not value or allow.env.get(name) == value or (name == DBUS and value == default_session_bus()):
+        if not value or allow.env.get(name) == value:
             continue
         if name == "CLAUDE_CODE_CERT_STORE" and {part.strip() for part in value.split(",")} <= _CERT_STORE_SOURCES:
             continue  # a subset of the built-in sources only narrows what is trusted
@@ -1128,30 +1123,68 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
         )
 
 
-def default_session_bus() -> str | None:
-    """The address of this user's own session bus (systemd's socket), or ``None`` where it cannot be known."""
-    getuid = getattr(os, "getuid", None)
-    if getuid is None or sys.platform in ("win32", "darwin"):
+#: The keyring modules whose backends talk to the session bus.
+_BUS_BACKENDS = frozenset({"keyring.backends.SecretService", "keyring.backends.kwallet"})
+
+
+def _socket_owner(path: str) -> int | None:
+    """The uid that owns the Unix socket at ``path``, or ``None`` when there is no such socket."""
+    try:
+        info = os.stat(path)
+    except OSError:
         return None
-    return f"unix:path=/run/user/{getuid()}/bus"
+    return info.st_uid if stat.S_ISSOCK(info.st_mode) else None
+
+
+def _bus_problem(address: str, env: Mapping[str, str], uid: int) -> str | None:
+    """Why a D-Bus address points somewhere ``uid`` does not own, or ``None``.
+
+    An address is ``;``-separated entries of ``transport:key=value,...``. Every entry must be a Unix socket: a
+    ``path`` (or ``runtime=yes``, which is ``$XDG_RUNTIME_DIR/bus``) that is a socket owned by ``uid``, or an
+    ``abstract`` name (what ``dbus-launch`` sets on a desktop without systemd). ``guid`` is ignored. TCP and anything
+    else is refused.
+    """
+    entries = [entry.strip() for entry in address.split(";") if entry.strip()]
+    if not entries:
+        return "names no address"
+    for entry in entries:
+        transport, _, rest = entry.partition(":")
+        keys = {k: unquote(v) for k, _, v in (part.partition("=") for part in rest.split(","))}
+        if transport != "unix":
+            return f"names a {transport or 'nameless'} address, not a Unix socket"
+        if keys.get("abstract"):
+            continue
+        runtime = env.get("XDG_RUNTIME_DIR", "")
+        path = keys.get("path") or (f"{runtime.rstrip('/')}/bus" if keys.get("runtime") == "yes" and runtime else "")
+        if not path or not PurePosixPath(path).is_absolute():
+            return "names no absolute socket path"
+        owner = _socket_owner(path)
+        if owner != uid:
+            return f"names {path}, which is not a socket you own"
+    return None
 
 
 def check_session_bus(env: Mapping[str, str]) -> None:
-    """Refuse a session bus the environment names, before the credential store (which talks to it) is opened.
+    """Refuse a session bus the environment points at somewhere the person does not own.
 
-    Only the default socket passes, or the exact address the person allowed: a hostile bus can answer as the Secret
-    Service and hand back a token that is not theirs. Windows and macOS have no such variable.
+    Only where the credential store talks to a bus (the Secret Service and KWallet backends, so Linux); macOS and
+    Windows ignore the variable. The address is judged by what it names, not by one spelling: systemd's
+    ``/run/user/<uid>/bus``, ``$XDG_RUNTIME_DIR/bus`` and ``dbus-launch``'s abstract or ``/tmp/dbus-*`` socket all pass
+    when the person owns the socket. A hostile bus could answer as the Secret Service and hand back a token that is
+    not theirs.
     """
+    getuid = getattr(os, "getuid", None)
     value = env.get(DBUS, "")
-    if not value or sys.platform in ("win32", "darwin") or value == default_session_bus():
+    if not value or getuid is None or sys.platform in ("win32", "darwin"):
         return
-    if Config(config_dir(env)).allowed().env.get(DBUS) == value:
+    if not any(module in _BUS_BACKENDS for module, _ in _backend_classes(sys.platform)):
         return
-    raise _refuse(
-        DBUS,
-        "names a session bus other than this user's own socket, and the credential store talks to that bus",
-        f"unset it, or allow exactly this value once with: authfi login --allow-env {DBUS}=<value>",
-    )
+    if why := _bus_problem(value, env, getuid()):
+        raise _refuse(
+            DBUS,
+            f"{why}, and the credential store talks to that bus (one you do not own can answer as the Secret Service)",
+            "unset it, or point it at your own session bus",
+        )
 
 
 def _forget(rt: Runtime, key: str) -> None:

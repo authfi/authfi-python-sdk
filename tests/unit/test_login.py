@@ -1704,66 +1704,154 @@ def test_a_variable_the_loader_or_shell_reads_first_is_still_refused_and_named(
     assert "before this check runs" in error.message and "second line of defence" in error.message
 
 
-@pytest.fixture
-def linux_user(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
-
-
 BUS = "DBUS_SESSION_BUS_ADDRESS"
+ME = 1000
+TMP = "/tmp"  # noqa: S108 - a path on the desktop being described, never touched
 
 
-@pytest.mark.usefixtures("linux_user")
-def test_only_this_users_own_session_bus_passes(config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTHFI_CONFIG_DIR", str(config_dir))
-    own = "unix:path=/run/user/1000/bus"
-    assert _login.default_session_bus() == own
-    _login.check_session_bus({})
-    _login.check_session_bus({BUS: own})
-    for other in ("unix:path=/tmp/hostile", "unix:path=/run/user/1001/bus", own + ",guid=x", "tcp:host=evil,port=1"):
-        with pytest.raises(LoginError) as caught:
-            _login.check_session_bus({BUS: other, "AUTHFI_CONFIG_DIR": str(config_dir)})
-        assert caught.value.code == "environment_refused" and BUS in caught.value.message
+@pytest.fixture
+def sockets(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """A Linux desktop whose user is uid 1000, and the Unix sockets on it (path to owner)."""
+    owners: dict[str, int] = {}
+
+    def owner(path: str) -> int | None:
+        return owners.get(path)
+
+    monkeypatch.setattr(_login, "_socket_owner", owner)
+    return owners
 
 
-def test_the_guard_lets_the_default_session_bus_through_and_names_any_other(
-    platform: Platform, server: FakeAS, vault: MemoryVault, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+# Each shape is a desktop the person really has: (name, address, XDG_RUNTIME_DIR, sockets it owns).
+DESKTOPS: list[tuple[str, str, str, dict[str, int]]] = [
+    ("systemd", "unix:path=/run/user/1000/bus", "/run/user/1000", {"/run/user/1000/bus": ME}),
+    ("systemd with a guid", "unix:path=/run/user/1000/bus,guid=0123abcd", "", {"/run/user/1000/bus": ME}),
+    ("the runtime dir spelled out", "unix:path=/run/user/1000/bus", "/run/user/1000", {"/run/user/1000/bus": ME}),
+    (
+        "the runtime dir under /var",
+        "unix:path=/var/run/user/1000/bus",
+        "/var/run/user/1000",
+        {"/var/run/user/1000/bus": ME},
+    ),
+    ("runtime=yes", "unix:runtime=yes", "/run/user/1000", {"/run/user/1000/bus": ME}),
+    ("dbus-launch abstract", "unix:abstract=/tmp/dbus-AbCdEfGh,guid=0123", "", {}),
+    ("dbus-launch path", f"unix:path={TMP}/dbus-XyZ123,guid=0123", "", {f"{TMP}/dbus-XyZ123": ME}),
+    ("percent escapes", "unix:path=/run/user/1000/b%75s", "", {"/run/user/1000/bus": ME}),
+    (
+        "a list of two of the person's own",
+        "unix:abstract=/tmp/dbus-a;unix:path=/run/user/1000/bus",
+        "",
+        {"/run/user/1000/bus": ME},
+    ),
+]
+
+
+@pytest.mark.parametrize(("shape", "address", "runtime", "owned"), DESKTOPS, ids=[d[0] for d in DESKTOPS])
+def test_the_session_bus_of_an_ordinary_linux_desktop_passes(
+    sockets: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+    address: str,
+    runtime: str,
+    owned: dict[str, int],
 ) -> None:
-    own = "unix:path=/run/user/1000/bus"
-    monkeypatch.setattr(_login, "default_session_bus", lambda: own)
-    signed_in(platform, server, vault, config_dir)
-    assert _login.access_token(runtime(platform, vault, config_dir, env={BUS: own}), None)
-    _refused(platform, vault, config_dir, {BUS: "unix:path=/tmp/hostile"}, BUS)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
+    sockets.update(owned)
+    _login.check_session_bus({BUS: address, **({"XDG_RUNTIME_DIR": runtime} if runtime else {})})
 
 
-@pytest.mark.usefixtures("linux_user")
-def test_an_allowed_session_bus_address_passes_only_when_exact(config_dir: Path) -> None:
-    other = "unix:path=/tmp/dbus-session-abc"
-    _login.Config(config_dir).save(ISSUER, allow_env=_login._allowed_env([f"{BUS}={other}"]))
-    env = {"AUTHFI_CONFIG_DIR": str(config_dir)}
-    _login.check_session_bus({**env, BUS: other})
+HOSTILE: list[tuple[str, str, dict[str, int]]] = [
+    ("a tcp address", "tcp:host=evil.example,port=1234", {}),
+    ("a nonce-tcp address", "nonce-tcp:host=evil.example,port=1234,noncefile=/tmp/n", {}),
+    ("a socket owned by someone else", f"unix:path={TMP}/hostile", {f"{TMP}/hostile": 0}),
+    ("the right place, the wrong owner", "unix:path=/run/user/1000/bus", {"/run/user/1000/bus": 1001}),
+    ("a path that is no socket", "unix:path=/tmp/missing", {}),
+    ("a relative path", "unix:path=bus", {"bus": ME}),
+    ("a tcp address behind a good one", "unix:abstract=/tmp/dbus-a;tcp:host=evil.example,port=1", {}),
+    (
+        "a bad one behind a good one",
+        "unix:path=/run/user/1000/bus;unix:path=/tmp/hostile",
+        {"/run/user/1000/bus": ME, f"{TMP}/hostile": 0},
+    ),
+    ("runtime=yes with no runtime dir", "unix:runtime=yes", {}),
+    ("a directory form", "unix:tmpdir=/tmp", {}),
+    ("a launchd address", "launchd:env=DBUS_LAUNCHD_SESSION_BUS_SOCKET", {}),
+    ("only a separator", ";", {}),
+]
+
+
+@pytest.mark.parametrize(("shape", "address", "owned"), HOSTILE, ids=[h[0] for h in HOSTILE])
+def test_a_session_bus_the_person_does_not_own_is_refused_and_named(
+    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, shape: str, address: str, owned: dict[str, int]
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
+    sockets.update(owned)
+    with pytest.raises(LoginError) as caught:
+        _login.check_session_bus({BUS: address})
+    assert caught.value.code == "environment_refused" and BUS in caught.value.message
+    assert "certificates" not in caught.value.message  # it says what is wrong with the bus
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "darwin"])
+@pytest.mark.parametrize("address", ["tcp:host=evil.example,port=1", f"unix:path={TMP}/hostile", "garbage", ";"])
+def test_windows_and_macos_ignore_the_session_bus_variable(
+    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, platform_name: str, address: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform_name)
+    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
+    _login.check_session_bus({BUS: address})
+
+
+def test_the_bus_is_only_checked_for_a_backend_that_talks_to_one(
+    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
+
+    def classes(platform: str) -> list[tuple[str, str]]:
+        return [("keyring.backends.libsecret_free", "Keyring")]
+
+    monkeypatch.setattr(_login, "_backend_classes", classes)
+    _login.check_session_bus({BUS: "tcp:host=evil.example,port=1"})  # a store with no bus does not read it
+
+
+def test_the_variable_is_not_one_the_guard_can_allow() -> None:
+    assert not _login.is_guarded(BUS)
     with pytest.raises(LoginError):
-        _login.check_session_bus({**env, BUS: other + "x"})
+        _login._allowed_env([f"{BUS}=unix:path=/tmp/x"])
 
 
 def test_the_bus_is_checked_before_the_credential_store_is_opened(
-    linux_user: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     def opened() -> None:
         raise AssertionError("the store was opened")
 
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
     monkeypatch.setattr(_login, "open_vault", opened)
-    monkeypatch.setenv(BUS, "unix:path=/tmp/hostile")
+    monkeypatch.setenv(BUS, "tcp:host=evil.example,port=1")
     for argv in (["token", "--resource", "llm"], ["login"], ["logout"]):
         assert cli_module.main(argv) == 1
         assert BUS in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("platform_name", ["win32", "darwin"])
-def test_windows_and_macos_have_no_session_bus_to_check(monkeypatch: pytest.MonkeyPatch, platform_name: str) -> None:
-    monkeypatch.setattr(sys, "platform", platform_name)
-    assert _login.default_session_bus() is None
-    _login.check_session_bus({BUS: "unix:path=/tmp/anything"})
+@pytest.mark.skipif(sys.platform != "linux", reason="a real Unix socket on a Linux desktop")
+def test_a_real_socket_the_person_owns_passes_and_a_regular_file_does_not(tmp_path: Path) -> None:
+    import socket
+
+    path = tmp_path / "bus"
+    listener = socket.socket(socket.AF_UNIX)
+    try:
+        listener.bind(str(path))
+        _login.check_session_bus({BUS: f"unix:path={path}"})
+        plain = tmp_path / "plain"
+        plain.write_text("x", encoding="utf-8")
+        with pytest.raises(LoginError):
+            _login.check_session_bus({BUS: f"unix:path={plain}"})
+    finally:
+        listener.close()
 
 
 @pytest.mark.parametrize(
@@ -1868,3 +1956,18 @@ def test_the_posix_helper_line_quotes_the_interpreter_for_sh(monkeypatch: pytest
     command = _login.helper_command(str(program))
     assert command == f"{shlex.quote(str(program))} -I -m authfi token --resource llm"
     assert shlex.split(command)[0] == str(program)  # one word for sh, whatever the path holds
+
+
+def test_a_bare_interpreter_name_is_not_resolved_through_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A Python named ``python`` on ``PATH`` may be another interpreter than the one running: no line is printed."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("python", "python.cmd", "python.exe"):
+        (bin_dir / name).write_text("", encoding="utf-8")
+        (bin_dir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.chdir(bin_dir)
+    for name in ("python", "./python", "python.exe"):
+        with pytest.raises(LoginError) as caught:
+            _login.helper_command(name)
+        assert caught.value.code == "no_interpreter"
