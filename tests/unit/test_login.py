@@ -30,7 +30,7 @@ import keyring.backend
 import keyring.errors
 import pytest
 
-from authfi import _login
+from authfi import _bus, _login
 from authfi import cli as cli_module
 from authfi._login import KeyringVault, LoginError, Runtime
 from authfi._protocol.http import HttpResponse
@@ -1706,152 +1706,141 @@ def test_a_variable_the_loader_or_shell_reads_first_is_still_refused_and_named(
 
 BUS = "DBUS_SESSION_BUS_ADDRESS"
 ME = 1000
-TMP = "/tmp"  # noqa: S108 - a path on the desktop being described, never touched
 
 
-@pytest.fixture
-def sockets(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
-    """A Linux desktop whose user is uid 1000, and the Unix sockets on it (path to owner)."""
-    owners: dict[str, int] = {}
-
-    def owner(path: str) -> int | None:
-        return owners.get(path)
-
-    monkeypatch.setattr(_login, "_socket_owner", owner)
-    return owners
-
-
-# Each shape is a desktop the person really has: (name, address, XDG_RUNTIME_DIR, sockets it owns).
-DESKTOPS: list[tuple[str, str, str, dict[str, int]]] = [
-    ("systemd", "unix:path=/run/user/1000/bus", "/run/user/1000", {"/run/user/1000/bus": ME}),
-    ("systemd with a guid", "unix:path=/run/user/1000/bus,guid=0123abcd", "", {"/run/user/1000/bus": ME}),
-    ("the runtime dir spelled out", "unix:path=/run/user/1000/bus", "/run/user/1000", {"/run/user/1000/bus": ME}),
-    (
-        "the runtime dir under /var",
-        "unix:path=/var/run/user/1000/bus",
-        "/var/run/user/1000",
-        {"/var/run/user/1000/bus": ME},
-    ),
-    ("runtime=yes", "unix:runtime=yes", "/run/user/1000", {"/run/user/1000/bus": ME}),
-    ("dbus-launch abstract", "unix:abstract=/tmp/dbus-AbCdEfGh,guid=0123", "", {}),
-    ("dbus-launch path", f"unix:path={TMP}/dbus-XyZ123,guid=0123", "", {f"{TMP}/dbus-XyZ123": ME}),
-    ("percent escapes", "unix:path=/run/user/1000/b%75s", "", {"/run/user/1000/bus": ME}),
-    (
-        "a list of two of the person's own",
-        "unix:abstract=/tmp/dbus-a;unix:path=/run/user/1000/bus",
-        "",
-        {"/run/user/1000/bus": ME},
-    ),
-]
+@pytest.mark.parametrize(
+    ("platform_name", "classes"),
+    [
+        ("linux", [("authfi._login", "VerifiedSecretService")]),
+        ("darwin", [("keyring.backends.macOS", "Keyring")]),
+        ("win32", [("keyring.backends.Windows", "WinVaultKeyring")]),
+        ("freebsd14", []),
+    ],
+)
+def test_the_store_named_for_each_platform(platform_name: str, classes: list[tuple[str, str]]) -> None:
+    assert _login._backend_classes(platform_name) == classes
+    assert all(f"{module}.{name}" in _login.SECURE_BACKENDS for module, name in classes)
 
 
-@pytest.mark.parametrize(("shape", "address", "runtime", "owned"), DESKTOPS, ids=[d[0] for d in DESKTOPS])
-def test_the_session_bus_of_an_ordinary_linux_desktop_passes(
-    sockets: dict[str, int],
-    monkeypatch: pytest.MonkeyPatch,
-    shape: str,
-    address: str,
-    runtime: str,
-    owned: dict[str, int],
-) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
-    sockets.update(owned)
-    _login.check_session_bus({BUS: address, **({"XDG_RUNTIME_DIR": runtime} if runtime else {})})
-
-
-HOSTILE: list[tuple[str, str, dict[str, int]]] = [
-    ("a tcp address", "tcp:host=evil.example,port=1234", {}),
-    ("a nonce-tcp address", "nonce-tcp:host=evil.example,port=1234,noncefile=/tmp/n", {}),
-    ("a socket owned by someone else", f"unix:path={TMP}/hostile", {f"{TMP}/hostile": 0}),
-    ("the right place, the wrong owner", "unix:path=/run/user/1000/bus", {"/run/user/1000/bus": 1001}),
-    ("a path that is no socket", "unix:path=/tmp/missing", {}),
-    ("a relative path", "unix:path=bus", {"bus": ME}),
-    ("a tcp address behind a good one", "unix:abstract=/tmp/dbus-a;tcp:host=evil.example,port=1", {}),
-    (
-        "a bad one behind a good one",
-        "unix:path=/run/user/1000/bus;unix:path=/tmp/hostile",
-        {"/run/user/1000/bus": ME, f"{TMP}/hostile": 0},
-    ),
-    ("runtime=yes with no runtime dir", "unix:runtime=yes", {}),
-    ("a directory form", "unix:tmpdir=/tmp", {}),
-    ("a launchd address", "launchd:env=DBUS_LAUNCHD_SESSION_BUS_SOCKET", {}),
-    ("only a separator", ";", {}),
-]
-
-
-@pytest.mark.parametrize(("shape", "address", "owned"), HOSTILE, ids=[h[0] for h in HOSTILE])
-def test_a_session_bus_the_person_does_not_own_is_refused_and_named(
-    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, shape: str, address: str, owned: dict[str, int]
-) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
-    sockets.update(owned)
-    with pytest.raises(LoginError) as caught:
-        _login.check_session_bus({BUS: address})
-    assert caught.value.code == "environment_refused" and BUS in caught.value.message
-    assert "certificates" not in caught.value.message  # it says what is wrong with the bus
-
-
-@pytest.mark.parametrize("platform_name", ["win32", "darwin"])
-@pytest.mark.parametrize("address", ["tcp:host=evil.example,port=1", f"unix:path={TMP}/hostile", "garbage", ";"])
-def test_windows_and_macos_ignore_the_session_bus_variable(
-    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, platform_name: str, address: str
-) -> None:
-    monkeypatch.setattr(sys, "platform", platform_name)
-    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
-    _login.check_session_bus({BUS: address})
-
-
-def test_the_bus_is_only_checked_for_a_backend_that_talks_to_one(
-    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
-    monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
-
-    def classes(platform: str) -> list[tuple[str, str]]:
-        return [("keyring.backends.libsecret_free", "Keyring")]
-
-    monkeypatch.setattr(_login, "_backend_classes", classes)
-    _login.check_session_bus({BUS: "tcp:host=evil.example,port=1"})  # a store with no bus does not read it
-
-
-def test_the_variable_is_not_one_the_guard_can_allow() -> None:
+def test_the_session_bus_variable_is_not_one_the_guard_allows() -> None:
     assert not _login.is_guarded(BUS)
     with pytest.raises(LoginError):
         _login._allowed_env([f"{BUS}=unix:path=/tmp/x"])
 
 
-def test_the_bus_is_checked_before_the_credential_store_is_opened(
-    sockets: dict[str, int], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def opened() -> None:
-        raise AssertionError("the store was opened")
+class _Recorder:
+    """What the Secret Service backend did with the bus: the connection it was given, and the calls it made."""
 
-    monkeypatch.setattr(sys, "platform", "linux")
+    def __init__(self) -> None:
+        self.connection = types.SimpleNamespace(closed=False, close=lambda: None, name="the checked connection")
+        self.opened: list[tuple[str, int]] = []
+        self.matched: list[object] = []
+        self.collection_for: list[object] = []
+        self.dbus_init_calls = 0
+
+
+@pytest.fixture
+def secret_service(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, _Recorder]:
+    """keyring's Secret Service backend, rebuilt on this package's checked connection, with the bus faked."""
+    secretstorage = pytest.importorskip("secretstorage")
+    util = pytest.importorskip("secretstorage.util")
+    pytest.importorskip("keyring.backends.SecretService")
+    record = _Recorder()
+    monkeypatch.setenv(BUS, "unix:path=/run/user/1000/bus")
     monkeypatch.setattr(os, "getuid", lambda: ME, raising=False)
-    monkeypatch.setattr(_login, "open_vault", opened)
-    monkeypatch.setenv(BUS, "tcp:host=evil.example,port=1")
-    for argv in (["token", "--resource", "llm"], ["login"], ["logout"]):
-        assert cli_module.main(argv) == 1
-        assert BUS in capsys.readouterr().err
+
+    def open_verified_bus(address: str, uid: int, **_: object) -> object:
+        record.opened.append((address, uid))
+        return record.connection
+
+    def dbus_init() -> None:
+        record.dbus_init_calls += 1
+        raise AssertionError("secretstorage connected to the bus by itself")
+
+    class Collection:
+        def __init__(self, connection: object) -> None:
+            record.collection_for.append(connection)
+            self.connection = connection
+
+        def is_locked(self) -> bool:
+            return False
+
+    monkeypatch.setattr(_bus, "open_verified_bus", open_verified_bus)
+    monkeypatch.setattr(secretstorage, "dbus_init", dbus_init)
+
+    def get_default_collection(connection: object) -> Collection:
+        return Collection(connection)
+
+    def check_service_availability(connection: object) -> bool:
+        return True
+
+    def add_match_rules(connection: object) -> None:
+        record.matched.append(connection)
+
+    monkeypatch.setattr(secretstorage, "get_default_collection", get_default_collection)
+    monkeypatch.setattr(secretstorage, "check_service_availability", check_service_availability)
+    monkeypatch.setattr(util, "add_match_rules", add_match_rules)
+    monkeypatch.delitem(vars(_login), "VerifiedSecretService", raising=False)
+    return _login.VerifiedSecretService(), record
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="a real Unix socket on a Linux desktop")
-def test_a_real_socket_the_person_owns_passes_and_a_regular_file_does_not(tmp_path: Path) -> None:
-    import socket
+def test_the_secret_service_is_handed_the_connection_that_was_checked(secret_service: tuple[Any, _Recorder]) -> None:
+    backend, record = secret_service
+    collection = backend.get_preferred_collection()
+    assert record.opened == [("unix:path=/run/user/1000/bus", ME)]  # checked as this user
+    assert collection.connection is record.connection and record.collection_for == [record.connection]
+    assert record.matched == [record.connection]
+    assert record.dbus_init_calls == 0
 
-    path = tmp_path / "bus"
-    listener = socket.socket(socket.AF_UNIX)
-    try:
-        listener.bind(str(path))
-        _login.check_session_bus({BUS: f"unix:path={path}"})
-        plain = tmp_path / "plain"
-        plain.write_text("x", encoding="utf-8")
-        with pytest.raises(LoginError):
-            _login.check_session_bus({BUS: f"unix:path={plain}"})
-    finally:
-        listener.close()
+
+def test_the_availability_probe_uses_the_checked_connection_too(secret_service: tuple[Any, _Recorder]) -> None:
+    backend, record = secret_service
+    assert backend.priority > 0
+    assert record.opened and record.dbus_init_calls == 0
+
+
+def test_a_bus_run_by_another_user_stops_the_store_and_says_so(
+    secret_service: tuple[Any, _Recorder], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, record = secret_service
+
+    def refused(address: str, uid: int, **_: object) -> object:
+        raise _bus.BusPeerError("the bus socket is served by uid 0, not by you (uid 1000)")
+
+    monkeypatch.setattr(_bus, "open_verified_bus", refused)
+    for call in (backend.get_preferred_collection, lambda: backend.priority):
+        with pytest.raises(LoginError) as caught:
+            call()
+        assert caught.value.code == "environment_refused" and BUS in caught.value.message
+        assert "uid 0" in caught.value.message
+    assert record.dbus_init_calls == 0 and record.collection_for == []
+
+
+def test_opening_the_vault_reports_a_foreign_bus_not_a_missing_store(
+    secret_service: tuple[Any, _Recorder], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def classes(platform: str) -> list[tuple[str, str]]:
+        return [("authfi._login", "VerifiedSecretService")]
+
+    def refused(address: str, uid: int, **_: object) -> object:
+        raise _bus.BusPeerError("the bus socket is served by uid 0, not by you (uid 1000)")
+
+    monkeypatch.setattr(_login, "_backend_classes", classes)
+    monkeypatch.setattr(_bus, "open_verified_bus", refused)
+    with pytest.raises(LoginError) as caught:
+        _login.open_vault()
+    assert caught.value.code == "environment_refused"
+
+
+def test_with_no_session_bus_address_the_store_is_missing_not_guessed(
+    secret_service: tuple[Any, _Recorder], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, record = secret_service
+    monkeypatch.delenv(BUS)
+    secretstorage = pytest.importorskip("secretstorage")
+    with pytest.raises(secretstorage.SecretServiceNotAvailableException):
+        backend.get_preferred_collection()
+    assert record.opened == [] and record.dbus_init_calls == 0
 
 
 @pytest.mark.parametrize(

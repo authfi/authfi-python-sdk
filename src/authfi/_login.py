@@ -45,6 +45,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 import httpx
 
+from authfi import _bus
 from authfi._protocol.register import parse_registration, registration_request
 from authfi._protocol.verify import unverified_claims
 from authfi.client import AuthFI
@@ -207,10 +208,7 @@ SECURE_BACKENDS = frozenset(
     {
         "keyring.backends.macOS.Keyring",
         "keyring.backends.Windows.WinVaultKeyring",
-        "keyring.backends.SecretService.Keyring",
-        "keyring.backends.libsecret.Keyring",
-        "keyring.backends.kwallet.DBusKeyring",
-        "keyring.backends.kwallet.DBusKeyringKWallet4",
+        "authfi._login.VerifiedSecretService",
     }
 )
 
@@ -250,7 +248,76 @@ def _backend_classes(platform: str) -> list[tuple[str, str]]:
         return [("keyring.backends.Windows", "WinVaultKeyring")]
     if platform == "darwin":
         return [("keyring.backends.macOS", "Keyring")]
-    return [("keyring.backends.SecretService", "Keyring"), ("keyring.backends.kwallet", "DBusKeyring")]
+    if platform.startswith("linux"):  # KWallet answers the Secret Service API too (KDE 5.97 and later)
+        return [("authfi._login", "VerifiedSecretService")]
+    return []
+
+
+def _verified_dbus_init(secretstorage: Any, util: Any) -> Any:
+    """A jeepney connection to the session bus whose listener runs as this user: ``dbus_init``, but checked."""
+    address = os.environ.get(_bus.DBUS, "")
+    if not address:
+        raise secretstorage.SecretServiceNotAvailableException(f"Environment variable {_bus.DBUS} is unset")
+    try:
+        connection = _bus.open_verified_bus(address, os.getuid())
+    except _bus.BusPeerError as exc:
+        raise _refuse(
+            _bus.DBUS, f"names a session bus that is not yours ({exc})", "unset it, or point it at your own session bus"
+        ) from exc
+    except (_bus.BusError, ValueError) as exc:
+        raise secretstorage.SecretServiceNotAvailableException(str(exc)) from exc
+    util.add_match_rules(connection)
+    return connection
+
+
+def _build_verified_secret_service() -> type:
+    """Keyring's Secret Service backend, with every bus connection opened and checked by :mod:`authfi._bus`.
+
+    keyring's own backend calls ``secretstorage.dbus_init()``, which connects to whatever
+    ``DBUS_SESSION_BUS_ADDRESS`` names and trusts it. Here the connection is made first, the listener's uid is read
+    from the socket, and that checked connection is what ``secretstorage`` is given.
+    """
+    secretstorage = importlib.import_module("secretstorage")
+    util = importlib.import_module("secretstorage.util")
+    exceptions = importlib.import_module("secretstorage.exceptions")
+    errors = importlib.import_module("keyring.errors")
+    base = importlib.import_module("keyring.backends.SecretService").Keyring
+
+    class VerifiedSecretService(base):  # type: ignore[misc, valid-type]
+        @property
+        def priority(self) -> float:
+            with contextlib.closing(_verified_dbus_init(secretstorage, util)) as connection:
+                if not secretstorage.check_service_availability(connection):
+                    raise RuntimeError("The Secret Service daemon is neither running nor activatable through D-Bus")
+            return 5
+
+        def get_preferred_collection(self) -> Any:
+            bus = _verified_dbus_init(secretstorage, util)
+            try:
+                if hasattr(self, "preferred_collection"):
+                    collection = secretstorage.Collection(bus, self.preferred_collection)
+                else:
+                    collection = secretstorage.get_default_collection(bus)
+            except exceptions.SecretStorageException as exc:
+                bus.close()
+                raise errors.InitError(f"Failed to create the collection: {exc}.") from exc
+            if collection.is_locked():
+                collection.unlock()
+                if collection.is_locked():  # the person dismissed the prompt
+                    bus.close()
+                    raise errors.KeyringLocked("Failed to unlock the collection!")
+            return collection
+
+    VerifiedSecretService.__module__ = __name__
+    return VerifiedSecretService
+
+
+def __getattr__(name: str) -> Any:
+    if name == "VerifiedSecretService":
+        built = _build_verified_secret_service()
+        globals()[name] = built
+        return built
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _started(module: str, name: str) -> Any:
@@ -258,6 +325,8 @@ def _started(module: str, name: str) -> Any:
     try:
         backend = getattr(importlib.import_module(module), name)()
         return backend if backend.priority > 0 else None  # priority raises when the store is not there
+    except LoginError:  # a refusal says why; "no store" would hide it
+        raise
     except Exception:  # a store that fails to start is no store
         return None
 
@@ -285,7 +354,7 @@ def open_vault() -> Vault:
     if backend is None:
         raise LoginError(
             _NO_STORE.format(
-                why="no operating-system store (Keychain, Credential Locker, Secret Service or KWallet) is available "
+                why="no operating-system store (Keychain, Credential Locker or Secret Service) is available "
                 "here; the helper names that store itself and does not read keyringrc.cfg or PYTHON_KEYRING_BACKEND"
             ),
             code="no_credential_store",
@@ -840,8 +909,6 @@ TLS_VARIABLES = (
     "CLAUDE_CODE_CERT_STORE",
     "NODE_OPTIONS",
 )
-#: The session bus the Secret Service and KWallet backends talk to (Linux). See :func:`check_session_bus`.
-DBUS = "DBUS_SESSION_BUS_ADDRESS"
 #: Variables the dynamic loader, OpenSSL or the shell reads before any line of this tool runs: refusing them here is a
 #: second line of defence (the first is that the person only trusts repositories they would let run code).
 _READ_BEFORE_THE_GUARD = frozenset(
@@ -1120,70 +1187,6 @@ def check_environment(env: Mapping[str, str], issuer: str, config: Config) -> No
             if name in _READ_BEFORE_THE_GUARD or name.startswith(CODE_PREFIXES)
             else "loads code or changes which certificates the tool trusts",
             f"unset it, or allow exactly this value once with: authfi login --allow-env {name}=<value>",
-        )
-
-
-#: The keyring modules whose backends talk to the session bus.
-_BUS_BACKENDS = frozenset({"keyring.backends.SecretService", "keyring.backends.kwallet"})
-
-
-def _socket_owner(path: str) -> int | None:
-    """The uid that owns the Unix socket at ``path``, or ``None`` when there is no such socket."""
-    try:
-        info = os.stat(path)
-    except OSError:
-        return None
-    return info.st_uid if stat.S_ISSOCK(info.st_mode) else None
-
-
-def _bus_problem(address: str, env: Mapping[str, str], uid: int) -> str | None:
-    """Why a D-Bus address points somewhere ``uid`` does not own, or ``None``.
-
-    An address is ``;``-separated entries of ``transport:key=value,...``. Every entry must be a Unix socket: a
-    ``path`` (or ``runtime=yes``, which is ``$XDG_RUNTIME_DIR/bus``) that is a socket owned by ``uid``, or an
-    ``abstract`` name (what ``dbus-launch`` sets on a desktop without systemd). ``guid`` is ignored. TCP and anything
-    else is refused.
-    """
-    entries = [entry.strip() for entry in address.split(";") if entry.strip()]
-    if not entries:
-        return "names no address"
-    for entry in entries:
-        transport, _, rest = entry.partition(":")
-        keys = {k: unquote(v) for k, _, v in (part.partition("=") for part in rest.split(","))}
-        if transport != "unix":
-            return f"names a {transport or 'nameless'} address, not a Unix socket"
-        if keys.get("abstract"):
-            continue
-        runtime = env.get("XDG_RUNTIME_DIR", "")
-        path = keys.get("path") or (f"{runtime.rstrip('/')}/bus" if keys.get("runtime") == "yes" and runtime else "")
-        if not path or not PurePosixPath(path).is_absolute():
-            return "names no absolute socket path"
-        owner = _socket_owner(path)
-        if owner != uid:
-            return f"names {path}, which is not a socket you own"
-    return None
-
-
-def check_session_bus(env: Mapping[str, str]) -> None:
-    """Refuse a session bus the environment points at somewhere the person does not own.
-
-    Only where the credential store talks to a bus (the Secret Service and KWallet backends, so Linux); macOS and
-    Windows ignore the variable. The address is judged by what it names, not by one spelling: systemd's
-    ``/run/user/<uid>/bus``, ``$XDG_RUNTIME_DIR/bus`` and ``dbus-launch``'s abstract or ``/tmp/dbus-*`` socket all pass
-    when the person owns the socket. A hostile bus could answer as the Secret Service and hand back a token that is
-    not theirs.
-    """
-    getuid = getattr(os, "getuid", None)
-    value = env.get(DBUS, "")
-    if not value or getuid is None or sys.platform in ("win32", "darwin"):
-        return
-    if not any(module in _BUS_BACKENDS for module, _ in _backend_classes(sys.platform)):
-        return
-    if why := _bus_problem(value, env, getuid()):
-        raise _refuse(
-            DBUS,
-            f"{why}, and the credential store talks to that bus (one you do not own can answer as the Secret Service)",
-            "unset it, or point it at your own session bus",
         )
 
 

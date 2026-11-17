@@ -104,7 +104,6 @@ def _keygen(out: str, alg: str, kid: str | None) -> int:
 def _person_command(args: argparse.Namespace) -> int:
     """``login``, ``logout`` and ``token --resource``: a person's own credential, kept in the credential store."""
     try:
-        _login.check_session_bus(os.environ)  # the store talks to this bus: look before opening it
         runtime = _login.Runtime(env=os.environ, vault=_login.open_vault(), http_client=_http_client())
         if args.command == "login":
             return _login.login(
