@@ -76,6 +76,7 @@ class ServerMetadata:
     introspection_endpoint: str | None = None
     end_session_endpoint: str | None = None
     backchannel_authentication_endpoint: str | None = None
+    registration_endpoint: str | None = None
     grant_types_supported: tuple[str, ...] = ()
     token_endpoint_auth_methods_supported: tuple[str, ...] = ()
     token_endpoint_auth_signing_alg_values_supported: tuple[str, ...] = ()
@@ -115,6 +116,7 @@ def parse_metadata(issuer: str, doc: object) -> ServerMetadata:
         introspection_endpoint=_optional_endpoint(issuer, body, "introspection_endpoint"),
         end_session_endpoint=_optional_endpoint(issuer, body, "end_session_endpoint"),
         backchannel_authentication_endpoint=_optional_endpoint(issuer, body, "backchannel_authentication_endpoint"),
+        registration_endpoint=_optional_endpoint(issuer, body, "registration_endpoint"),
         grant_types_supported=_strings(body, "grant_types_supported"),
         token_endpoint_auth_methods_supported=_strings(body, "token_endpoint_auth_methods_supported"),
         token_endpoint_auth_signing_alg_values_supported=_strings(
