@@ -16,6 +16,7 @@ model: :data:`HOLD_MESSAGE` is, and the approval id travels outside the model.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -29,19 +30,24 @@ from authfi.secret import Secret
 
 __all__ = [
     "APPROVAL_ARGUMENT",
-    "CLOUD_PATH",
+    "CLOUD_REDEEM_PATH",
+    "CLOUD_TOOL",
     "HOLD_MESSAGE",
     "MAX_CLOUD_SECONDS",
     "REFUSAL_META",
     "SCOPE_META",
     "TASK_GUIDANCE",
     "CloudCredential",
+    "CloudHandle",
     "ToolAllowed",
     "ToolApprovalRequired",
     "ToolOutcome",
     "ToolRefused",
-    "cloud_request",
-    "parse_cloud",
+    "cloud_issue_request",
+    "cloud_redeem_request",
+    "cloud_redeem_url",
+    "parse_cloud_handle",
+    "parse_cloud_secret",
     "read_result",
     "scope_of",
     "strip_approval_argument",
@@ -59,8 +65,10 @@ SCOPE_META = "io.authfi/scope"
 GOVERNANCE_ANNOTATION = "io.authfi/governance"
 #: What a model is told about a held call: the wait, never an instruction or an id.
 HOLD_MESSAGE = "This action is waiting for a person's approval in AuthFI."
-#: The gateway's cloud-credential door, under the model routes.
-CLOUD_PATH = "/mcp/v1/cloud/credentials"
+#: The gateway's own tool that issues a cloud credential: a handle, never the secret.
+CLOUD_TOOL = "cloud.credentials"
+#: Where the instance that was issued a handle redeems its secret, once, under the tool door's resource.
+CLOUD_REDEEM_PATH = "/cloud/credentials/{credential_id}/secret"
 
 # The shape of the gateway's hold message, which tests/fixtures/mcp/hold-result.json holds verbatim:
 # "Waiting for approval <id> (<code>). A person must approve this action in the AuthFI console. ..."
@@ -326,8 +334,22 @@ class CloudCredential:
         )
 
 
-def cloud_request(
-    api_origin: str,
+@dataclass(frozen=True, slots=True)
+class CloudHandle:
+    """What ``cloud.credentials`` answers: names the credential, carries no secret."""
+
+    credential_id: str
+    account: str
+    role: str
+    expires_at: datetime | None
+    scope: str
+
+
+_CREDENTIAL_ID = re.compile(r"[A-Za-z0-9_.-]{1,128}")
+
+
+def cloud_issue_request(
+    mcp_url: str,
     authorization: Mapping[str, str],
     *,
     account: str,
@@ -337,23 +359,51 @@ def cloud_request(
     approval_id: str | None,
     dpop: Callable[[str, str, str | None], str] | None = None,
 ) -> HttpRequest:
-    """``POST <api origin>/mcp/v1/cloud/credentials``. Never retried after send: it may open an approval."""
+    """``tools/call`` of ``cloud.credentials`` on ``mcp_url``. Never retried after send: it may open an approval."""
     for name, value in (("account", account), ("role", role)):
         if not isinstance(cast(object, value), str) or not value.strip():
             raise ConfigurationError(f"cloud_credentials needs the {name}")
     if not 0 < expires_in <= MAX_CLOUD_SECONDS:
         raise ConfigurationError(f"expires_in must be 1 to {MAX_CLOUD_SECONDS} seconds")
-    body: dict[str, Any] = {"account": account, "role": role, "duration_seconds": int(expires_in)}
+    arguments: dict[str, Any] = {"account": account, "role": role, "duration_seconds": int(expires_in)}
     if session_policy:
-        body["session_policy"] = dict(session_policy)
+        arguments["session_policy"] = dict(session_policy)
     if approval_id:
-        body["approval_id"] = approval_id
+        arguments = with_approval(arguments, approval_id)
     return HttpRequest(
         "POST",
-        api_origin + CLOUD_PATH,
-        what="the cloud credential door",
+        mcp_url,
+        what="the cloud credential tool",
         headers={"Accept": "application/json", **authorization},
-        json_body=body,
+        json_body={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": CLOUD_TOOL, "arguments": arguments},
+        },
+        retry=Retry.NEVER_AFTER_SEND,
+        dpop=dpop,
+    )
+
+
+def cloud_redeem_url(mcp_url: str, credential_id: str) -> str:
+    """``<mcp_url>/cloud/credentials/<credential_id>/secret``; refuses an id that is not a plain handle."""
+    if not _CREDENTIAL_ID.fullmatch(credential_id):
+        raise APIError("invalid_response", "the cloud credential tool answered a credential id that is not an id", 200)
+    return mcp_url + CLOUD_REDEEM_PATH.format(credential_id=credential_id)
+
+
+def cloud_redeem_request(
+    url: str,
+    authorization: Mapping[str, str],
+    dpop: Callable[[str, str, str | None], str] | None = None,
+) -> HttpRequest:
+    """``POST <mcp_url>/cloud/credentials/{id}/secret``: the secret is given once, so it is never sent again."""
+    return HttpRequest(
+        "POST",
+        url,
+        what="the cloud credential secret door",
+        headers={"Accept": "application/json", **authorization},
         retry=Retry.NEVER_AFTER_SEND,
         dpop=dpop,
     )
@@ -377,30 +427,77 @@ def _expiry(data: Mapping[str, Any], now: float) -> datetime | None:
     return None
 
 
-def parse_cloud(response: HttpResponse, now: float) -> tuple[CloudCredential | None, str | None]:
-    """``(credential, None)`` when issued, ``(None, approval_id)`` when a person must approve."""
-    if response.status not in (201, 202):
-        raise api_error(response, "the cloud credential door")
+def _instant(value: object) -> datetime | None:
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def parse_cloud_handle(response: HttpResponse) -> tuple[CloudHandle | None, str | None]:
+    """``(handle, None)`` when issued, ``(None, approval_id)`` when a person must approve.
+
+    The answer is a JSON-RPC ``tools/call`` result, read as any tool result is. A refusal is an
+    :class:`~authfi.APIError` with the gateway's code (``ECLOUDCRED...``).
+    """
+    if response.status != 200:
+        raise api_error(response, "the cloud credential tool")
+    body = response.json_object() or {}
+    failure = body.get("error")
+    if isinstance(failure, dict):
+        detail = cast(dict[str, Any], failure)
+        raise APIError("rpc_error", str(detail.get("message") or "the gateway failed the call"), 200)
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise APIError("invalid_response", "the cloud credential tool answered no result", 200)
+    answer = cast(dict[str, Any], result)
+    outcome = read_result(answer)
+    if isinstance(outcome, ToolApprovalRequired):
+        return None, outcome.approval_id
+    if isinstance(outcome, ToolRefused):
+        raise APIError(outcome.code or outcome.error or "refused", outcome.reason, 403)
+    if _is_error(answer):
+        raise APIError("invalid_response", "the cloud credential tool failed: " + outcome.model_text[:200], 200)
+    structured: object = _field(answer, "structuredContent")
+    if not isinstance(structured, Mapping):
+        try:
+            structured = cast(object, json.loads(_text_of(answer)))
+        except ValueError:
+            structured = None
+    handle: Mapping[str, Any] = cast(Mapping[str, Any], structured) if isinstance(structured, Mapping) else {}
+    credential_id = handle.get("credential_id")
+    if not isinstance(credential_id, str) or not credential_id:
+        raise APIError("invalid_response", "the cloud credential tool answered no credential handle", 200)
+    return (
+        CloudHandle(
+            credential_id=credential_id,
+            account=str(handle.get("account") or ""),
+            role=str(handle.get("role") or ""),
+            expires_at=_instant(handle.get("expires_at")),
+            scope=str(handle.get("scope") or ""),
+        ),
+        None,
+    )
+
+
+def parse_cloud_secret(response: HttpResponse, handle: CloudHandle, now: float) -> CloudCredential:
+    """The credential a redeem answered (``ECLOUDCRED013`` to ``015``: unknown, spent, expired are refusals)."""
+    if response.status != 200:
+        raise api_error(response, "the cloud credential secret door")
     body = response.json_object() or {}
     data_obj = body.get("data")
     if not isinstance(data_obj, dict):
-        raise APIError("invalid_response", "the cloud credential door answered no data", response.status)
+        raise APIError("invalid_response", "the cloud credential secret door answered no data", response.status)
     data = cast(dict[str, Any], data_obj)
-    if response.status == 202:
-        approval_id = data.get("approval_id")
-        if not isinstance(approval_id, str) or not approval_id:
-            raise APIError("invalid_response", "the cloud credential door held the call without an approval id", 202)
-        return None, approval_id
     access_key = data.get("access_key_id")
-    return (
-        CloudCredential(
-            provider=str(data.get("provider") or ""),
-            credential_id=str(data.get("credential_id") or ""),
-            expires_at=_expiry(data, now),
-            access_key_id=access_key if isinstance(access_key, str) and access_key else None,
-            secret_access_key=_secret(data, "secret_access_key"),
-            session_token=_secret(data, "session_token"),
-            access_token=_secret(data, "access_token"),
-        ),
-        None,
+    return CloudCredential(
+        provider=str(data.get("provider") or ""),
+        credential_id=str(data.get("credential_id") or handle.credential_id),
+        expires_at=_expiry(data, now) or handle.expires_at,
+        access_key_id=access_key if isinstance(access_key, str) and access_key else None,
+        secret_access_key=_secret(data, "secret_access_key"),
+        session_token=_secret(data, "session_token"),
+        access_token=_secret(data, "access_token"),
     )

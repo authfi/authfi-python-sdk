@@ -79,7 +79,7 @@ LIMITS: tuple[str, ...] = (
     "The verdicts are your call tape's rows. A request with no row proves nothing either way.",
 )
 
-_PATHS = {"chat": "/mcp/v1/chat/completions", "responses": "/mcp/v1/responses", "messages": "/mcp/v1/messages"}
+_PATHS = {"chat": "/llm/v1/chat/completions", "responses": "/llm/v1/responses", "messages": "/llm/v1/messages"}
 _CONFIG_HEADER = "Authfi-Agent-Config"
 _BASELINE_CONTROL = "control-baseline"
 _CODE = re.compile(r"\bE[A-Z]{2,}\d{3}\b")

@@ -24,7 +24,7 @@ from tests.fake_gateway import FakeGateway
 
 CORPUS = json.loads((Path(redteam.__file__).parent / "_redteam" / "corpus.json").read_text(encoding="utf-8"))
 CASES: dict[str, dict[str, Any]] = {c["id"]: c for c in CORPUS["cases"]}
-MODEL_PATHS = ("/mcp/v1/chat/completions", "/mcp/v1/responses", "/mcp/v1/messages")
+MODEL_PATHS = ("/llm/v1/chat/completions", "/llm/v1/responses", "/llm/v1/messages")
 CONFIG = "signed-config-token"
 ROLES = ("system", "user", "assistant", "tool")
 
@@ -367,7 +367,7 @@ def test_it_only_runs_with_the_credential_of_the_project_it_is_pointed_at(key: A
 
 def test_a_redirect_is_not_followed(key: AgentKey) -> None:
     with Stand(redteam.corpus_baseline()) as stand, Stand(redteam.corpus_baseline()) as elsewhere:
-        stand.redirect_to = elsewhere.issuer + "/mcp/v1/chat/completions"
+        stand.redirect_to = elsewhere.issuer + "/llm/v1/chat/completions"
         report = _run(stand, key, redteam.corpus_baseline())
         assert elsewhere.requests == []
         assert _by_id(report)["control-baseline"].status == redteam.NO_TAPE_ROW

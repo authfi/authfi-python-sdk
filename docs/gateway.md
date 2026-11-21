@@ -1,8 +1,15 @@
 # The AuthFI gateways
 
-`<issuer>/mcp` is the MCP gateway, which governs an agent's tool calls, and the AI gateway, which
-governs its model calls. A `Gateway` connects any credential (an agent's own token, or a token it
+`<issuer>/mcp` is the MCP gateway, which governs an agent's tool calls, and `<issuer>/llm` is the AI gateway,
+which governs its model calls. A `Gateway` connects any credential (an agent's own token, or a token it
 holds for a person) to them.
+
+Each door takes only a token requested for it: a token for `<issuer>/mcp` is refused at `/llm`, and the reverse.
+So an agent that calls models holds two tokens, the second requested with `resource=<issuer>/llm`, both signed
+with the same key (one run). `Gateway` asks for the second by itself and caches it apart from the first; it puts the
+model token on `/llm` requests and the tool token on every other gateway request, and never the other way round.
+`gateway.llm_url` is the model door and `gateway.llm_source` its credential. A credential that cannot make a model
+token (a token the agent holds for a person) is refused when it is used at `/llm`, instead of being sent there.
 
 ```python
 gateway = agent.gateway()                   # or Gateway(af, delegated_token)
@@ -34,6 +41,9 @@ anthropic.Anthropic(base_url=gateway.model_base_url("anthropic"), api_key="unuse
 openai.OpenAI(base_url=gateway.model_base_url("openai"), api_key="unused",
               http_client=gateway.http_client(httpx2))
 ```
+
+`gateway.model_base_url("anthropic")` is `<issuer>/llm` and `("openai")` is `<issuer>/llm/v1`, so the SDKs call
+`/llm/v1/messages` and `/llm/v1/chat/completions`.
 
 The token is never the SDK's `api_key` or a default header, which tracers record.
 
@@ -88,6 +98,12 @@ if outcome.kind == "approval_required":
     outcome = gateway.cloud_credentials("prod", "deployer", approval_id=outcome.approval_id)
 credential = outcome.credential       # access_key_id, secret_access_key (a Secret), expires_at
 ```
+
+The call is the `cloud.credentials` tool, a `tools/call` on `<issuer>/mcp`, which answers a handle
+(`credential_id`, `account`, `role`, `expires_at`, `scope`) and never the secret. The SDK then redeems the secret
+once, with `POST <issuer>/mcp/cloud/credentials/{credential_id}/secret`, with the same token and proof, so the
+secret reaches your process and no tool result a model reads. The issue call is never sent again after it went:
+it may have opened an approval.
 
 A refusal raises `APIError` with the gateway's code. `expires_in` is 1 to 900 seconds, the most the platform issues.
 `agent.cloud.credentials(account, role, duration)` is the same call.

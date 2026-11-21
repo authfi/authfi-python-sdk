@@ -8,7 +8,9 @@ through the AuthFI AI gateway.
 - **The token stays out of traces.** The provider SDK gets the gateway's HTTP client, which puts
   the agent's current token on each request. The token is never the SDK's `api_key`, a default
   header, or any other setting a tracer records.
-- **One base URL per API.** `gateway.model_base_url("anthropic")` and `("openai")`.
+- **One base URL per API.** `gateway.model_base_url("anthropic")` (`<issuer>/llm`) and `("openai")`
+  (`<issuer>/llm/v1`). The gateway puts a token requested for `<issuer>/llm` on these calls, apart from the one
+  for the tools.
 - **The gateway governs the call.** The model must be granted to the agent; an ungranted one is
   refused with a 403 the provider SDK reports.
 

@@ -40,7 +40,7 @@ def gw() -> Iterator[AgentGateway]:
 
 
 def model_calls(gw: AgentGateway) -> list[dict[str, Any]]:
-    return [r for r in gw.requests if r["path"].startswith("/mcp/v1/")]
+    return [r for r in gw.requests if r["path"].startswith("/llm/v1/")]
 
 
 def assert_every_model_call_proved_the_key(gw: AgentGateway, expected: int) -> None:
@@ -49,7 +49,7 @@ def assert_every_model_call_proved_the_key(gw: AgentGateway, expected: int) -> N
     assert all(c["headers"]["authorization"].startswith("DPoP ") and "dpop" in c["headers"] for c in calls)
     assert gw.refused_proofs == [] and gw.unproven_model_calls == []
     assert gw.nonce_challenges >= 1  # the nonce was asked for and answered, not skipped
-    assert len([p for p in gw.proofs if p["path"].startswith("/mcp/v1/")]) == expected
+    assert len([p for p in gw.proofs if p["path"].startswith("/llm/v1/")]) == expected
 
 
 def test_the_anthropic_sdk_proves_the_key_on_the_models_route(gw: AgentGateway, key: AgentKey) -> None:
@@ -114,7 +114,7 @@ def test_a_bearer_credential_is_refused_by_the_gateway_and_the_sdk_says_so_once(
             with pytest.raises(anthropic.PermissionDeniedError):
                 client.messages.create(model="claude-haiku-5-5", max_tokens=16, messages=MESSAGES)
 
-    assert gw.unproven_model_calls == ["/mcp/v1/messages"] * 2
+    assert gw.unproven_model_calls == ["/llm/v1/messages"] * 2
     warned = [r for r in caplog.records if "MCP_MODEL_PROOF_CHECK" in r.getMessage()]
     assert len(warned) == 1 and "Bearer" in warned[0].getMessage()
 

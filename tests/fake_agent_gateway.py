@@ -12,8 +12,11 @@ it receives, so it is not the SDK grading itself:
 - Proofs are checked as the kernel does: ``typ``, the embedded key and its algorithm, ``htm``, ``htu``, ``iat``
   within 60 seconds, a ``jti`` seen once, ``ath`` for a token, and a server nonce when ``nonce`` is set
   (``use_dpop_nonce`` with ``DPoP-Nonce``: 400 at the token endpoint, 401 at a resource).
-- ``/mcp`` and ``/mcp/v1/cloud/credentials``: a bound token is refused as Bearer (``token_dpop_proof_required``);
-  a task's root is a bound token whose tools, budget and life decide each call (EMDT005, EMDT006, EMDT004).
+- ``/mcp`` and ``/llm``: a bound token is refused as Bearer (``token_dpop_proof_required``); each door takes only the
+  token requested with its resource (``<issuer>/mcp`` by default, ``<issuer>/llm``), except a task's root, which
+  both take; a task's root is a bound token whose tools, budget and life decide each call (EMDT005, EMDT006, EMDT004).
+- ``cloud.credentials`` (also ``cloud__credentials``): a ``tools/call`` on ``/mcp`` that answers a handle, a hold or
+  a refusal; ``POST /mcp/cloud/credentials/{id}/secret`` gives the secret once (ECLOUDCRED013, 014).
 """
 
 from __future__ import annotations
@@ -34,7 +37,9 @@ from tests.fake_gateway import ALLOWED, STEP_UP, FakeGateway
 
 CIBA = "urn:openid:params:grant-type:ciba"
 EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
-CLOUD_PATH = "/mcp/v1/cloud/credentials"
+#: Where the secret of an issued handle is redeemed: this prefix, the credential id, then ``/secret``.
+REDEEM_PREFIX = "/mcp/cloud/credentials/"
+CLOUD_TOOLS = ("cloud.credentials", "cloud__credentials")
 #: The gateway's own tool, as ``tools/list`` advertises it.
 CLOUD_TOOL: dict[str, Any] = {
     "name": "cloud__credentials",
@@ -108,7 +113,9 @@ class AgentGateway(FakeGateway):
         #: (account, role) -> "allow", "approval", or "forbidden"
         self.cloud_roles: dict[tuple[str, str], str] = {("prod", "deployer"): "allow", ("prod", "admin"): "approval"}
         self.cloud_calls: list[dict[str, Any]] = []
-        self.cloud_approvals: dict[str, str] = {}
+        #: credential id -> its secret and whether it was redeemed: what ``cloud.credentials`` issued.
+        self.cloud_handles: dict[str, dict[str, Any]] = {}
+        self.redeems: list[str] = []
         self.ended: set[str] = set()
         self._cloud_tool = False
         #: The scope a person's CIBA approval grants the agent.
@@ -150,18 +157,25 @@ class AgentGateway(FakeGateway):
         self.ended.add(mandate_id)
 
     def decide_cloud(self, approval_id: str, status: str) -> None:
-        self.cloud_approvals[approval_id] = status
+        self.approvals[approval_id]["status"] = status
 
     # --- tokens ----------------------------------------------------------------------------------
 
     def _mint(
-        self, kind: str, client: str, jkt: str | None, subject: str | None = None, **extra: Any
+        self,
+        kind: str,
+        client: str,
+        jkt: str | None,
+        subject: str | None = None,
+        *,
+        aud: str | None = None,
+        **extra: Any,
     ) -> tuple[str, dict[str, Any]]:
         now = int(time.time())
         claims: dict[str, Any] = {
             "iss": self.issuer,
             "sub": subject or client,
-            "aud": self.issuer + "/mcp",
+            "aud": aud or self.issuer + "/mcp",
             "iat": now,
             "exp": now + self.token_lifetime,
             "jti": uuid.uuid4().hex,
@@ -286,7 +300,22 @@ class AgentGateway(FakeGateway):
                 return None, unauth
         if info["claims"]["exp"] < time.time():
             return None, unauth
+        if self._door_refused(path, info):
+            self.wrong_door.append((path, info["claims"]["aud"]))
+            return None, unauth
         return info, None
+
+    def _wrong_door(self, path: str, resource: str | None) -> bool:
+        return False  # decided from the token's own ``aud`` in :meth:`_credential`, not from the token endpoint's log
+
+    def _door_refused(self, path: str, info: dict[str, Any]) -> bool:
+        """A token minted for one door is refused at the other; a task's root (a mandate) is the one both take."""
+        if info["kind"] == "task":
+            return False
+        llm = self.issuer + "/llm"
+        on_llm = path == "/llm" or path.startswith("/llm/")
+        on_mcp = path == "/mcp" or path.startswith(("/mcp/", "/otlp/"))
+        return (on_llm and info["claims"]["aud"] != llm) or (on_mcp and info["claims"]["aud"] == llm)
 
     # --- POST ------------------------------------------------------------------------------------
 
@@ -299,10 +328,10 @@ class AgentGateway(FakeGateway):
             if not form.get("client_assertion"):
                 return 401, {}, b'{"error":"invalid_client"}'
             return 200, {}, json.dumps({"auth_req_id": "ciba-1", "expires_in": 300, "interval": 1}).encode()
-        if path == CLOUD_PATH:
-            return self._cloud(headers, body)
+        if path.startswith(REDEEM_PREFIX) and path.endswith("/secret"):
+            return self._redeem(path, headers)
         run: str | None = None
-        if path == "/mcp" or path.startswith("/mcp/"):
+        if path == "/mcp" or path.startswith(("/mcp/", "/llm/")):
             info, refusal = self._credential("POST", path, headers)
             if refusal is not None:
                 return refusal
@@ -310,7 +339,7 @@ class AgentGateway(FakeGateway):
             run = self._run_of(info)
             with self._lock:
                 self.run_calls.append((path, run, headers["authorization"].partition(" ")[0].lower()))
-            if self.model_proof and path.startswith("/mcp/v1/") and not info.get("jkt"):
+            if self.model_proof and path.startswith("/llm/v1/") and not info.get("jkt"):
                 self.unproven_model_calls.append(path)
                 refusal_body = {"error": {"type": "permission_error", "code": "EMODEL020", "message": "unproven"}}
                 return 403, {}, json.dumps(refusal_body).encode()
@@ -324,6 +353,9 @@ class AgentGateway(FakeGateway):
             if path == "/mcp" and body:
                 parsed: Any = json.loads(body)
                 message = cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {}
+            params: dict[str, Any] = message.get("params") or {}
+            if message.get("method") == "tools/call" and params.get("name") in CLOUD_TOOLS:
+                return self._cloud_tool_call(info, message)
             if info["kind"] == "task" and message.get("method") == "tools/call":
                 refused = self._task_call(info, message)
                 if refused is not None:
@@ -333,10 +365,6 @@ class AgentGateway(FakeGateway):
                 listing: dict[str, Any] = json.loads(out)
                 listing["result"]["tools"].append(CLOUD_TOOL)
                 return status, out_headers, json.dumps(listing).encode()
-            if self._cloud_tool and message.get("method") == "tools/call":
-                params: dict[str, Any] = message.get("params") or {}
-                if params.get("name") == "cloud__credentials":
-                    return self._cloud_tool_call(message)
         status, out_headers, out = super()._post(path, headers, body)
         return status, ({**out_headers, "AuthFI-Run-Id": run} if run else out_headers), out
 
@@ -351,12 +379,19 @@ class AgentGateway(FakeGateway):
         """List the gateway's own ``cloud__credentials`` tool, which holds a privileged role like any held tool."""
         self._cloud_tool = True
 
-    def _cloud_tool_call(self, message: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
+    def _cloud_tool_call(self, info: dict[str, Any], message: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
+        """``cloud.credentials``: a handle, a hold for a privileged role, or a refusal; never the secret."""
         rid: Any = message.get("id")
         call: dict[str, Any] = message.get("params") or {}
         args: dict[str, Any] = dict(call.get("arguments") or {})
         approval: str | None = args.pop("_authfi_approval_id", None)
+        self.cloud_calls.append({"kind": info["kind"], "request": args, "mandate_id": info.get("mandate_id")})
+        if info["kind"] == "person" and "mcp:cloud.credentials" not in info["claims"].get("scope", "").split():
+            # A delegated token's scope is what the person approved: lending an identity is not approving the cloud.
+            return self._refuse(rid, "cloud__credentials", code="ECLOUDCRED011")
         decision = self.cloud_roles.get((str(args.get("account")), str(args.get("role"))), "forbidden")
+        if decision == "forbidden":
+            return self._refuse(rid, "cloud__credentials", code="ECLOUDCRED003")
         if decision == "approval":
             if approval is None:
                 approval = str(uuid.uuid4())
@@ -366,18 +401,51 @@ class AgentGateway(FakeGateway):
             if record is None or record["status"] == "pending":
                 return self._hold(rid, approval, "approval_pending")
             if record["status"] != "approved":
-                return self._refuse(
-                    rid, "cloud__credentials", code="approval_" + record["status"], approval_id=approval
-                )
-        elif decision == "forbidden":
-            return self._refuse(rid, "cloud__credentials", code="ECLOUDCRED003")
-        credential = {"provider": "aws", "credential_id": "cred-1", "access_key_id": "ASIAFAKE"}
+                return self._refuse(rid, "cloud__credentials", code="ECLOUDCRED007", approval_id=approval)
+            record["status"] = "used"
+        credential_id = "cred-" + uuid.uuid4().hex[:8]
+        secret = {
+            "credential_id": credential_id,
+            "provider": "aws",
+            "access_key_id": "ASIAFAKE",
+            "secret_access_key": "fake-secret",
+            "session_token": "fake-session",
+            "expiration": "2099-01-01T00:00:00Z",
+            "expires_in": 900,
+        }
+        self.cloud_handles[credential_id] = {"secret": secret, "spent": False, "run": self._run_of(info)}
+        handle = {
+            "credential_id": credential_id,
+            "account": args.get("account"),
+            "role": args.get("role"),
+            "expires_at": "2099-01-01T00:00:00Z",
+            "scope": "cloud_role:" + str(args.get("role")),
+        }
         result = {
-            "content": [{"type": "text", "text": json.dumps(credential)}],
-            "structuredContent": credential,
+            "content": [{"type": "text", "text": json.dumps(handle)}],
+            "structuredContent": handle,
             "isError": False,
         }
         return 200, {}, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}).encode()
+
+    def _redeem(self, path: str, headers: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
+        """The secret of a handle, once, to the instance (the run) that was issued it."""
+        info, refusal = self._credential("POST", path, headers)
+        if refusal is not None:
+            return refusal
+        assert info is not None
+        credential_id = path[len(REDEEM_PREFIX) : -len("/secret")]
+        self.redeems.append(credential_id)
+        envelope = {"Content-Type": "application/json"}
+        handle = self.cloud_handles.get(credential_id)
+        if handle is None or handle["run"] != self._run_of(info):
+            denied = {"error": "ECLOUDCRED013", "error_description": "no such credential for this instance"}
+            return 404, envelope, json.dumps(denied).encode()
+        if handle["spent"]:
+            gone = {"error": "ECLOUDCRED014", "error_description": "this credential's secret was already fetched"}
+            return 410, envelope, json.dumps(gone).encode()
+        handle["spent"] = True
+        return 200, envelope, json.dumps({"data": handle["secret"]}).encode()
 
     def _task_call(self, info: dict[str, Any], message: dict[str, Any]) -> tuple[int, dict[str, str], bytes] | None:
         """The answer to a call the task refuses, or ``None`` for a call it allows."""
@@ -404,70 +472,6 @@ class AgentGateway(FakeGateway):
             info["budget_left"] = left - amount
         return None
 
-    def _cloud(self, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, str], bytes]:
-        info, refusal = self._credential("POST", CLOUD_PATH, headers)
-        if refusal is not None:
-            return refusal
-        assert info is not None
-        request: dict[str, Any] = json.loads(body) if body else {}
-        self.cloud_calls.append({"kind": info["kind"], "request": request, "mandate_id": info.get("mandate_id")})
-        if info["kind"] == "task" and info["mandate_id"] in self.ended:
-            return 401, {}, b'{"error":"EMDT004"}'
-        decision = self.cloud_roles.get((str(request.get("account")), str(request.get("role"))), "forbidden")
-        envelope = {"Content-Type": "application/json"}
-        if info["kind"] == "person" and "mcp:cloud.credentials" not in info["claims"].get("scope", "").split():
-            # A delegated token's scope is what the person approved: lending an identity is not approving the cloud.
-            envelope["WWW-Authenticate"] = 'Bearer error="insufficient_scope", scope="mcp:cloud.credentials"'
-            denied = {
-                "error": "ECLOUDCRED011",
-                "error_description": "the person this agent acts for did not approve cloud.credentials",
-            }
-            return 403, envelope, json.dumps(denied).encode()
-        approval = request.get("approval_id")
-        if decision == "forbidden":
-            return (
-                403,
-                envelope,
-                json.dumps(
-                    {"error": "ECLOUDCRED003", "error_description": "no grant lets this agent assume that role"}
-                ).encode(),
-            )
-        if decision == "approval":
-            if approval is None:
-                approval_id = str(uuid.uuid4())
-                self.cloud_approvals[approval_id] = "pending"
-                data = {
-                    "status": "approval_required",
-                    "approval_id": approval_id,
-                    "message": "a person must approve this role",
-                }
-                return 202, envelope, json.dumps({"data": data}).encode()
-            state = self.cloud_approvals.get(approval)
-            if state == "pending":
-                return (
-                    202,
-                    envelope,
-                    json.dumps({"data": {"status": "approval_required", "approval_id": approval}}).encode(),
-                )
-            if state != "approved":
-                return (
-                    403,
-                    envelope,
-                    json.dumps(
-                        {"error": "ECLOUDCRED007", "error_description": "the approval was not granted"}
-                    ).encode(),
-                )
-            self.cloud_approvals[approval] = "used"
-        data = {
-            "provider": "aws",
-            "credential_id": "cred-" + uuid.uuid4().hex[:8],
-            "access_key_id": "ASIAFAKE",
-            "secret_access_key": "fake-secret",
-            "session_token": "fake-session",
-            "expiration": "2099-01-01T00:00:00Z",
-        }
-        return 201, envelope, json.dumps({"data": data}).encode()
-
     # --- the token endpoint -----------------------------------------------------------------------
 
     def _token(self, headers: dict[str, str], form: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
@@ -482,7 +486,9 @@ class AgentGateway(FakeGateway):
             return 400, {}, b'{"error":"invalid_request"}'
         agent = form.get("client_id", "")
         if grant == "client_credentials":
-            token, _ = self._mint("agent", agent, jkt)
+            resource = form.get("resource")
+            self.mint_resources.append(resource)
+            token, _ = self._mint("agent", agent, jkt, aud=resource.rstrip("/") if resource else None)
             kind = "DPoP" if jkt and self.bind else "Bearer"
             return 200, {}, self._token_body(token, kind, capabilities=["mcp:deepwiki"])
         if grant == CIBA:

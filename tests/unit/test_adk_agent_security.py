@@ -78,7 +78,7 @@ async def test_the_model_and_the_tools_prove_the_key_and_answer_a_nonce(
     model = gw.model_requests()
     assert model and all(r["headers"]["authorization"].startswith("DPoP ") and "dpop" in r["headers"] for r in model)
     assert gw.nonce_challenges >= 2 and gw.refused_proofs == []
-    assert {"/mcp", "/mcp/v1/messages"} <= {p["path"] for p in gw.proofs}
+    assert {"/mcp", "/llm/v1/messages"} <= {p["path"] for p in gw.proofs}
 
 
 async def test_a_model_call_that_is_the_first_to_meet_a_new_nonce_answers_it_once(
@@ -87,6 +87,7 @@ async def test_a_model_call_that_is_the_first_to_meet_a_new_nonce_answers_it_onc
     """LiteLLM is given the proof in a header, so the adapter answers the nonce itself."""
     agent = project.agent(AGENT, key)
     await agent.token()
+    await agent.gateway().llm_source.token()  # the model token is minted before the nonce changes
     challenges = gw.nonce_challenges
     gw._nonce = "nonce-rotated"
     request = LlmRequest(model="claude-haiku-5-5", contents=[types.Content(role="user", parts=[types.Part(text="hi")])])
@@ -110,6 +111,6 @@ async def test_inside_a_task_a_call_outside_it_reaches_the_model_with_what_it_ca
     read = json.dumps([r["json"] for r in gw.model_requests()])
     assert "EMDT005" in read and "Use a tool the task allows" in read and "new task" not in read.lower()
     carried = {
-        r["headers"]["authorization"].split(" ", 1)[1] for r in gw.requests if r["path"] in {"/mcp", "/mcp/v1/messages"}
+        r["headers"]["authorization"].split(" ", 1)[1] for r in gw.requests if r["path"] in {"/mcp", "/llm/v1/messages"}
     }
     assert {gw.issued[t]["kind"] for t in carried} == {"task"}

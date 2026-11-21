@@ -74,8 +74,8 @@ async def test_the_model_and_the_tools_prove_the_key_on_every_call(
     assert all("dpop" in r["headers"] for r in gateway_calls)
     assert gw.nonce_challenges >= 2  # the mint, and the rotation
     assert gw.refused_proofs == []  # every proof the SDK sent after the challenges was good
-    proofs = [p for p in gw.proofs if p["path"] in {"/mcp", "/mcp/v1/messages"}]
-    assert {p["path"] for p in proofs} == {"/mcp", "/mcp/v1/messages"}  # the tools and the model are both proved
+    proofs = [p for p in gw.proofs if p["path"] in {"/mcp", "/llm/v1/messages"}]
+    assert {p["path"] for p in proofs} == {"/mcp", "/llm/v1/messages"}  # the tools and the model are both proved
     assert len({p["claims"]["jti"] for p in proofs}) == len(proofs)  # no proof is used twice
 
 
@@ -100,7 +100,7 @@ async def test_given_a_task_a_call_outside_it_reaches_the_model_with_what_it_can
     model_read = json.dumps([r["json"] for r in gw.model_requests()])
     assert "Use a tool the task allows" in model_read and "new task" not in model_read.lower()
     # The tool calls and the model's calls all carried the task's credential, never the agent's own.
-    after = [r for r in gw.requests if r["path"] in {"/mcp", "/mcp/v1/messages"}]
+    after = [r for r in gw.requests if r["path"] in {"/mcp", "/llm/v1/messages"}]
     carried = {r["headers"]["authorization"].split(" ", 1)[1] for r in after}
     assert {gw.issued[t]["kind"] for t in carried} == {"task"}
     assert task.mandate_id in {gw.issued[t].get("mandate_id") for t in carried}
@@ -134,4 +134,4 @@ async def test_a_held_cloud_request_surfaces_as_any_held_tool_call_does(
 
     assert state["messages"][-1].content == "Deployed."
     (issued,) = [m for m in state["messages"] if isinstance(m, ToolMessage) and m.status == "success"]
-    assert "ASIAFAKE" in str(issued.content)  # the gateway's tool result is the tool's answer: the model reads it
+    assert "cred-" in str(issued.content) and "ASIAFAKE" not in str(issued.content)  # a handle, never the secret

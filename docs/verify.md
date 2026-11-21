@@ -27,7 +27,7 @@ name in `aud`:
   app. If the app calls your API with it, accept the app's client id here.
 
 AuthFI's own audiences are refused when the verifier is built: the issuer, any URL under it (such
-as `<issuer>/mcp`, the audience of tokens meant for the AuthFI gateway), and AuthFI's own
+as `<issuer>/mcp` or `<issuer>/llm`, the audiences of tokens meant for the AuthFI gateways), and AuthFI's own
 applications. Accepting one would let a token meant for AuthFI be replayed at your API.
 
 `expected_tenant_id` pins the tenant tokens must name. Set it. An empty value is a `ConfigurationError`, never "no pin": leave the argument out for that.

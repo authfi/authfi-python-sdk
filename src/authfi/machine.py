@@ -135,6 +135,8 @@ class ClientCredentials(FrameworkCredential, TokenSource):
         self.project = project
         self._cache: SyncCache[Secret] = SyncCache(project.clock, max_entries=1)
         self._gateway: Gateway | None = None
+        self._again = (client_id, client_secret, scope, auth_method)
+        self._llm: ClientCredentials | None = None
 
     @property
     def client_id(self) -> str:
@@ -166,6 +168,21 @@ class ClientCredentials(FrameworkCredential, TokenSource):
             return response.access_token, lifetime_for(response)
 
         return self._cache.get(self._config.key, mint, refresh=force).reveal()
+
+    def for_llm(self, llm_url: str) -> ClientCredentials:
+        """This client's token for the model door ``llm_url``: the same client, asking with that resource."""
+        if self._llm is None:
+            client_id, secret, scope, method = self._again
+            self._llm = ClientCredentials(
+                self.project,
+                client_id,
+                secret,
+                resource=llm_url,
+                scope=scope,
+                auth_method=method,
+                warn_without_resource=False,
+            )
+        return self._llm
 
     def gateway(self) -> Gateway:
         """The AuthFI gateways (MCP tools, models) with this client's token, one per credential.
@@ -210,6 +227,8 @@ class AsyncClientCredentials(FrameworkCredential, AsyncTokenSource):
         self.project = project
         self._cache: AsyncCache[Secret] = AsyncCache(project.clock, max_entries=1)
         self._gateway: AsyncGateway | None = None
+        self._again = (client_id, client_secret, scope, auth_method)
+        self._llm: AsyncClientCredentials | None = None
 
     @property
     def client_id(self) -> str:
@@ -241,6 +260,21 @@ class AsyncClientCredentials(FrameworkCredential, AsyncTokenSource):
             return response.access_token, lifetime_for(response)
 
         return (await self._cache.get(self._config.key, mint, refresh=force)).reveal()
+
+    def for_llm(self, llm_url: str) -> AsyncClientCredentials:
+        """See :meth:`ClientCredentials.for_llm`."""
+        if self._llm is None:
+            client_id, secret, scope, method = self._again
+            self._llm = AsyncClientCredentials(
+                self.project,
+                client_id,
+                secret,
+                resource=llm_url,
+                scope=scope,
+                auth_method=method,
+                warn_without_resource=False,
+            )
+        return self._llm
 
     def gateway(self) -> AsyncGateway:
         """See :meth:`ClientCredentials.gateway`."""
