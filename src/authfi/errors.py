@@ -288,6 +288,33 @@ class WaitTimeout(AuthFIError):
         self.pending_id = pending_id
 
 
+class ApprovalUnavailable(AuthFIError):
+    """The agent could not read an approval it raised, and waiting on it is pointless.
+
+    Not "the project offers no approval status": the answer came from the platform, naming the agent.
+
+    Attributes:
+        reason: ``agent_refused`` (401: the agent's token is refused, it was revoked or its key retired),
+            ``agent_not_allowed`` (403: the agent is suspended or may not read approvals) or
+            ``approval_not_found`` (404: no such approval for this agent).
+        approval_id: the approval that could not be read.
+
+    """
+
+    reason: str
+    approval_id: str
+
+    def __init__(self, reason: str, approval_id: str, status: int, *, request_id: str | None = None) -> None:
+        super().__init__(
+            f"approval {approval_id} cannot be read by this agent ({reason})",
+            status,
+            code="approval_unavailable",
+            request_id=request_id,
+        )
+        self.reason = reason
+        self.approval_id = approval_id
+
+
 class TemporarilyUnavailable(OAuthError):
     """The platform could not decide now and failed closed (HTTP 503). Calling again later may work."""
 

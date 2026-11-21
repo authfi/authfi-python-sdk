@@ -44,6 +44,7 @@ from authfi.agents import (
 from authfi.client import AsyncAuthFI, AuthFI, AuthFIOptions, Timeout
 from authfi.errors import (
     APIError,
+    ApprovalUnavailable,
     AuthFIDeprecationWarning,
     AuthFIError,
     AuthFISecurityWarning,
@@ -152,6 +153,7 @@ __all__ = [
     "AgentAuth",
     "AgentKey",
     "Approval",
+    "ApprovalUnavailable",
     "AsyncAgentAuth",
     "AsyncAuthFI",
     "AsyncClientCredentials",

@@ -1379,7 +1379,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             )
         url = approval_url(template, approval_id)
         response = self._send_own("GET", url, lambda credential: read_approval_request(url, credential))
-        return Approval.of(parse_approval(response, reading=True))
+        return Approval.of(parse_approval(response, reading=True, approval_id=approval_id))
 
     def wait_for_approval(
         self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = _APPROVAL_POLL
@@ -1842,7 +1842,7 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
             )
         url = approval_url(template, approval_id)
         response = await self._send_own("GET", url, lambda credential: read_approval_request(url, credential))
-        return Approval.of(parse_approval(response, reading=True))
+        return Approval.of(parse_approval(response, reading=True, approval_id=approval_id))
 
     async def wait_for_approval(
         self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = _APPROVAL_POLL

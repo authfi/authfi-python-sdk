@@ -37,11 +37,11 @@ from authfi._protocol.urls import require_endpoint
 from authfi._protocol.verify import unverified_claims
 from authfi.errors import (
     APIError,
+    ApprovalUnavailable,
     ConfigurationError,
     ConsentExpired,
     DiscoveryError,
     InvalidToken,
-    NotSupportedError,
     OAuthError,
     WaitTimeout,
 )
@@ -649,13 +649,14 @@ def read_approval_request(url: str, credential: Mapping[str, str]) -> HttpReques
     return _json_request("GET", url, "the approval endpoint", credential, None)
 
 
-def parse_approval(response: HttpResponse, *, reading: bool) -> ApprovalRecord:
-    """An approval record; a 403 on a read is :class:`NotSupportedError` (``agent_approval_status``)."""
-    if reading and response.status == 403:
-        raise NotSupportedError(
-            "agent_approval_status",
-            "This AuthFI project does not offer approval status to agents.",
-            403,
+_APPROVAL_UNREADABLE = {401: "agent_refused", 403: "agent_not_allowed", 404: "approval_not_found"}
+
+
+def parse_approval(response: HttpResponse, *, reading: bool, approval_id: str = "") -> ApprovalRecord:
+    """An approval record; a 401, 403 or 404 on a read is :class:`ApprovalUnavailable`, saying which."""
+    if reading and response.status in _APPROVAL_UNREADABLE:
+        raise ApprovalUnavailable(
+            _APPROVAL_UNREADABLE[response.status], approval_id, response.status, request_id=response.answer_request_id
         )
     data = _data(response, "the approval endpoint", ok=(200, 201, 202))
     approval_id = data.get("approval_id")
