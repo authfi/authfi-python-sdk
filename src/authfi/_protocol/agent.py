@@ -652,11 +652,11 @@ def read_approval_request(url: str, credential: Mapping[str, str]) -> HttpReques
 _APPROVAL_UNREADABLE = {401: "agent_refused", 403: "agent_not_allowed", 404: "approval_not_found"}
 
 
-def parse_approval(response: HttpResponse, *, reading: bool, approval_id: str = "") -> ApprovalRecord:
+def parse_approval(response: HttpResponse, *, reading: bool, asked: str = "") -> ApprovalRecord:
     """An approval record; a 401, 403 or 404 on a read is :class:`ApprovalUnavailable`, saying which."""
     if reading and response.status in _APPROVAL_UNREADABLE:
         raise ApprovalUnavailable(
-            _APPROVAL_UNREADABLE[response.status], approval_id, response.status, request_id=response.answer_request_id
+            _APPROVAL_UNREADABLE[response.status], asked, response.status, request_id=response.answer_request_id
         )
     data = _data(response, "the approval endpoint", ok=(200, 201, 202))
     approval_id = data.get("approval_id")

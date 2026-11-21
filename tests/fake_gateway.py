@@ -234,6 +234,13 @@ class FakeGateway:
                 {},
                 json.dumps({"access_token": token, "token_type": "Bearer", "expires_in": self.token_lifetime}).encode(),
             )
+        if path == "/apis/regional/v1/ai/auth/request-approval":
+            asked = json.loads(body)
+            approval_id = str(uuid.uuid4())
+            with self._lock:
+                self.approvals[approval_id] = {"status": "pending", "asked": asked}
+            record = {"approval_id": approval_id, "status": "pending", "requesting_action": asked["requesting_action"]}
+            return 201, {}, json.dumps({"data": record}).encode()
         if not self._authorized(headers) or (self.tools_revoked and path == "/mcp"):
             return (
                 401,
