@@ -70,6 +70,14 @@ _HOLD = re.compile(r"^Waiting for approval ([A-Za-z0-9_-]+) \(([a-z_]+)\)\. A pe
 #: The most seconds a cloud credential can be asked for: the platform's cap.
 MAX_CLOUD_SECONDS = 900
 
+#: The gateway's refusal of an approval a different run of the agent raised (a project whose approvals are bound to
+#: the run); the call must be raised again so a person is asked afresh.
+OTHER_RUN_REFUSAL = "approval was raised by another run of this agent"
+_OTHER_RUN = (
+    "approval_other_run",
+    "That approval belongs to an earlier run. Raise the call again: a person will be asked afresh.",
+)
+
 #: What a call a task (a mandate) refused means, and what the agent can still do. A task is one level
 #: deep and nothing raises trust, so no advice here starts a new task or asks for a wider one: the way
 #: out of a refusal is a different step inside the task, or stopping and telling the person.
@@ -129,16 +137,21 @@ class ToolRefused:
     approval_id: str | None = None
     kind: Literal["refused"] = field(default="refused", init=False)
 
+    def _guidance(self) -> tuple[str, str] | None:
+        if OTHER_RUN_REFUSAL in (self.reason or "") or OTHER_RUN_REFUSAL in (self.error or ""):
+            return _OTHER_RUN
+        return TASK_GUIDANCE.get(self.code or "")
+
     @property
     def why(self) -> str:
-        """Why it was refused in one word: ``outside_task``, ``over_budget``, ``task_ended``, ... or ``refused``."""
-        found = TASK_GUIDANCE.get(self.code or "")
+        """Why it was refused in one word: ``outside_task``, ``over_budget``, ``approval_other_run``, or ``refused``."""
+        found = self._guidance()
         return found[0] if found else "refused"
 
     @property
     def next_step(self) -> str | None:
-        """What the agent can still do, for a call a task refused; ``None`` for any other refusal."""
-        found = TASK_GUIDANCE.get(self.code or "")
+        """What the agent can still do, for a call a task or another run's approval refused; else ``None``."""
+        found = self._guidance()
         return found[1] if found else None
 
     def as_dict(self) -> dict[str, Any]:
