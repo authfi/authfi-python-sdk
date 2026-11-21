@@ -664,7 +664,7 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
         return out
 
     def adopt(self, held: Sequence[Mapping[str, Any]]) -> None:
-        """Remember calls saved by :meth:`held` in another process, so :meth:`resolve` sends them with their approval."""
+        """Remember calls saved by :meth:`held` elsewhere, so :meth:`resolve` sends them with their approval."""
         for call in held:
             approval_id, tool, args = call.get("approval_id"), call.get("tool"), call.get("args")
             if isinstance(approval_id, str) and isinstance(tool, str) and isinstance(args, Mapping):

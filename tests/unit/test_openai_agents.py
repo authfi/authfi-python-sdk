@@ -735,7 +735,7 @@ async def test_resolve_returns_a_call_nobody_decided_in_time(readable: FakeGatew
         integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
         integration.configure_tracing()
         async with integration.mcp_server(approval_poll=True, poll_interval=0.01, approval_timeout=0.05) as tools:
-            _agent_, result = await _paused(readable, integration, tools)
+            _, result = await _paused(readable, integration, tools)
             (waiting,) = await tools.resolve(result.to_state(), result.interruptions)
     assert readable.pending() == [waiting.approval_id]
 
@@ -745,7 +745,7 @@ async def test_an_agent_revoked_while_resolve_waits_raises(readable: FakeGateway
         integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
         integration.configure_tracing()
         async with integration.mcp_server(approval_poll=True, poll_interval=0.01) as tools:
-            _agent_, result = await _paused(readable, integration, tools)
+            _, result = await _paused(readable, integration, tools)
             resolving = asyncio.ensure_future(tools.resolve(result.to_state(), result.interruptions))
             for _ in range(500):
                 if readable.pending():
@@ -761,7 +761,7 @@ async def test_a_restarted_process_resumes_a_saved_run_with_the_approval(readabl
         integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
         integration.configure_tracing()
         async with integration.mcp_server() as tools:
-            _agent_, result = await _paused(readable, integration, tools)
+            _, result = await _paused(readable, integration, tools)
             (waiting,) = await tools.resolve(result.to_state(), result.interruptions)
             saved = json.dumps({"state": result.to_state().to_json(), "held": tools.held()})
     assert waiting.approval_id in saved
