@@ -22,23 +22,31 @@ Python 3.11 or later. The extra brings the framework adapter and nothing else; `
 
 ## 2. Register the agent once in the console (3 minutes)
 
-An agent here has no password, API key or key file. It proves where it runs, and AuthFI trusts that.
+An agent here has no password, API key or key file. It proves where it runs, and AuthFI trusts that. You need a
+group in **Identity > Groups** whose members answer for the agent, and a Kubernetes cluster
+connected to your project (or a device, below).
 
-1. Open the console (`console.authfi.io`), **Agents**, **Register agent**. Name it, pick the person who owns it and the
-   group that approves its risky actions.
-2. Choose **Where it runs** and bind it to that workload. For Kubernetes: the cluster, namespace and service account.
-   For a laptop: **This device**.
-3. Open the agent's **Identifiers** and copy these three values. They are the only things your code needs:
+1. Open the console (`console.authfi.io`), **Identity > AI Agents**, **Register agent**. Registration has the steps
+   **Name it**, **Where it runs**, **What it may do**, **Review** and **Done**.
+2. **Name it**: a name, **Works on its own**, and the group that answers for the agent.
+3. **Where it runs**: **In a connected Kubernetes cluster (recommended)**, then the **Cluster**, **Namespace** and
+   **Service account** the agent's pod runs as. Only pods running as that service account can sign in as this agent.
+4. **What it may do**: under **Through the MCP gateway**, open **May call** and choose the tools the agent may use.
+   Everything you do not choose is denied. Grant the model under **Integrations > MCP Gateway**, **Tools**,
+   **Say who may call a tool**: caller type **An AI agent**, your agent, and a model such as
+   `anthropic/claude-haiku-5-5` (connect the provider first under **Integrations > Connections**).
+5. **Review**, then **Register**. The **Done** step shows the **Agent id** and the two values your code needs:
 
 | Value | Looks like | Goes in |
 |---|---|---|
 | Project issuer | `https://acme.authfi.io` | `AUTHFI_ISSUER` |
-| Agent ID | `agt_...` | `AUTHFI_AGENT_ID` |
-| Approved configuration (version and digest), once a person has approved the agent's first run | `7`, `sha256:...` | `AUTHFI_CONFIG_VERSION`, `AUTHFI_CONFIG_DIGEST` |
+| Agent id | `agt_...` | `AUTHFI_AGENT_ID` |
+| Approved configuration (version and digest), after a person approves the agent's first run | `1`, `sha256:...` | `AUTHFI_CONFIG_VERSION`, `AUTHFI_CONFIG_DIGEST` |
 
-A new agent has no approved configuration yet. Ask a person to open an observation window for it in the console, run
-it once with `AUTHFI_CONFIG_OBSERVE=1`, then approve what it was seen doing and copy the version and digest
-the console shows. From then on the agent names that version.
+A new agent has no approved configuration yet. On the **Done** step select **Observe its first run**, choose how long
+(`1 hour`) and **Start observing**; nothing is denied while you watch. Run the agent once with
+`AUTHFI_CONFIG_OBSERVE=1`. Then open the agent's **Approved configuration**, tick what it was seen doing, **Approve**,
+and copy the version and digest. From then on the agent names that version.
 
 On Kubernetes, project the service-account token for the project's origin (`audience: https://acme.authfi.io`,
 `expirationSeconds: 600`). On a laptop, set `AUTHFI_DEVICE_KEY_FILE` to the device key the console gave the device.
@@ -107,9 +115,9 @@ app or the model says can approve the call: only the person's decision in AuthFI
 
 ## 6. See the run in the console
 
-- **Agents**, then your agent: its identifiers, its recent runs and what each one called. Find yours by the run id you printed.
+- **Identity > AI Agents**, then your agent: its Agent id, its approved configuration and what it has done.
 - **Approvals**: the held call, who it is waiting on and the decision, linked to the run.
-- **Audit**: the tape of every sign-in, tool call, model call, refusal and approval, in order.
+- **Security > Audit**: the tape of every sign-in, tool call, model call, refusal and approval, in order. Enter `agent:agt_...` in **Who**.
 
 To see each framework step (which model call, which tool, how long) as well, send the steps to AuthFI:
 
