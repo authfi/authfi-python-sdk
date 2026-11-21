@@ -248,3 +248,32 @@ async def test_an_async_agent_has_one_gateway(key: AgentKey, platform: AgentPlat
     async with AsyncAuthFI(platform.issuer, http_client=platform.async_client(), clock=clock) as aaf:
         agent = aaf.agent(AGENT, key)
         assert agent.gateway() is agent.gateway()
+
+
+# --- an approval another run raised ---------------------------------------------------------------------------
+
+
+def _refused(reason: str) -> dict[str, object]:
+    return {
+        "isError": True,
+        "content": [{"type": "text", "text": reason}],
+        "_meta": {"io.authfi/refusal": {"code": "EMAP001", "reason": reason}},
+    }
+
+
+def test_an_approval_raised_by_another_run_says_to_raise_the_call_again() -> None:
+    outcome = read_result(_refused("approval was raised by another run of this agent"))
+
+    assert isinstance(outcome, ToolRefused)
+    assert outcome.why == "approval_other_run"
+    assert outcome.next_step is not None and "again" in outcome.next_step
+    assert outcome.as_dict()["why"] == "approval_other_run"
+    assert outcome.next_step in outcome.model_text
+
+
+def test_any_other_refusal_is_not_read_as_another_run() -> None:
+    outcome = read_result(_refused("the approval was denied"))
+
+    assert isinstance(outcome, ToolRefused)
+    assert outcome.why == "refused"
+    assert outcome.next_step is None
