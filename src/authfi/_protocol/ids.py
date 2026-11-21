@@ -3,7 +3,8 @@
 - A request id is ``afr-`` and a 26-character ULID: sortable, and inside the alphabet the gateway
   keeps on its call record (``[A-Za-z0-9._:-]{1,128}``; no underscore). One is made per logical
   call and sent unchanged on every retry.
-- An idempotency key is a UUIDv7, made by the caller per logical operation.
+- An idempotency key is a UUIDv7, made by the caller per logical operation. A tool call's is kept by an
+  :class:`IdempotencyLedger` so each attempt of that call sends the same one.
 - ``traceparent`` names the framework step executing when the call is made. A framework whose tracer is not
   OpenTelemetry context registers a step source (:func:`register_step_source`) for the credential it exports
   steps for; the active OpenTelemetry span is the step otherwise (when ``opentelemetry-api`` is installed), and with
@@ -12,6 +13,7 @@
 
 from __future__ import annotations
 
+import collections
 import importlib
 import logging
 import os
@@ -20,13 +22,14 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Hashable, MutableMapping
 from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
 __all__ = [
     "REQUEST_ID_PATTERN",
+    "IdempotencyLedger",
     "Step",
     "StepSource",
     "idempotency_key",
@@ -90,6 +93,36 @@ def idempotency_key() -> str:
     rand_b = rand & ((1 << 62) - 1)  # 62 bits
     value = (millis & ((1 << 48) - 1)) << 80 | 0x7 << 76 | rand_a << 64 | 0b10 << 62 | rand_b
     return str(uuid.UUID(int=value))
+
+
+class IdempotencyLedger:
+    """The ``Idempotency-Key`` of each tool call in flight: one per logical call, the same on every attempt of it.
+
+    A call is named by what the caller sent (session, JSON-RPC id, tool and arguments), so an attempt sent again
+    after a failure, a renewal of the credential or a nonce challenge finds its key, and a different call gets its
+    own. ``done`` forgets a call the platform answered, so a later call that looks the same is a new one. Bounded:
+    the oldest call is forgotten first.
+    """
+
+    def __init__(self, limit: int = 4096) -> None:
+        self._limit = limit
+        self._keys: collections.OrderedDict[Hashable, str] = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def key(self, call: Hashable) -> str:
+        """The key of ``call``, made on its first attempt."""
+        with self._lock:
+            found = self._keys.get(call)
+            if found is None:
+                found = self._keys[call] = idempotency_key()
+                while len(self._keys) > self._limit:
+                    self._keys.popitem(last=False)
+            return found
+
+    def done(self, call: Hashable) -> None:
+        """Forget ``call``: it was answered."""
+        with self._lock:
+            self._keys.pop(call, None)
 
 
 def _fresh_traceparent() -> str:

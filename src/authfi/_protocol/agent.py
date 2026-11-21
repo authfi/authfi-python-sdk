@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 from urllib.parse import quote
 
-from authfi._protocol.errors import CIBA_GRANT, api_error, oauth_error
+from authfi._protocol.errors import CIBA_GRANT, api_error, oauth_error, take_over_error
 from authfi._protocol.http import Attempt, Flow, HttpRequest, HttpResponse, Retry, call, pause
 from authfi._protocol.oauth import (
     ACCESS_TOKEN_TYPE,
@@ -49,6 +49,9 @@ from authfi.secret import Secret
 
 __all__ = [
     "CIBA_GRANT",
+    "KEY_MOVE_LIFETIME",
+    "KEY_MOVE_TYP",
+    "MANDATE_CHAIN_TOKEN_TYPE",
     "TASK_DETAIL_TYPE",
     "TOKEN_EXCHANGE_GRANT",
     "TRANSACTION_TOKEN_PATH",
@@ -68,9 +71,11 @@ __all__ = [
     "parse_agent_configuration",
     "parse_approval",
     "parse_ciba_start",
+    "parse_take_over",
     "parse_task_start",
     "parse_transaction_token",
     "read_approval_request",
+    "take_over_request",
     "task_details",
     "task_request",
     "transaction_token_request",
@@ -363,6 +368,52 @@ def task_request(
         token_request(token_endpoint, form, None, retry=Retry.NEVER_AFTER_SEND, dpop=dpop),
         per_attempt=lambda: Attempt(form={"actor_token": actor_assertion(token_endpoint)}),
     )
+
+
+#: The ``subject_token_type`` of a root presented for renewal: the task's own chain.
+MANDATE_CHAIN_TOKEN_TYPE = "urn:authfi:params:oauth:token-type:mandate-chain"
+#: The ``typ`` of the JWS the key that holds a task signs to hand it to another key.
+KEY_MOVE_TYP = "mandate-key-move+jwt"
+#: Seconds a key move lives. The platform accepts at most 60; a move is one use and short.
+KEY_MOVE_LIFETIME = 30
+
+
+def take_over_request(
+    token_endpoint: str,
+    *,
+    root: str,
+    mandate_id: str,
+    key_move: str,
+    actor_assertion: Callable[[str], str],
+    dpop: Callable[[str, str, str | None], str],
+) -> HttpRequest:
+    """The renewal that moves a task to the key of this request: the handed-over root and the sender's key move.
+
+    The ``actor_token`` is the agent's own assertion, new for every attempt, naming the key that signs the proof.
+    Never sent again after it may have arrived: the key move is good once.
+    """
+    if not _given(root) or not _given(mandate_id) or not _given(key_move):
+        raise ConfigurationError("a takeover needs the root, the task's id and the key move")
+    details = json.dumps([{"type": TASK_DETAIL_TYPE, "mandate_id": mandate_id}], separators=(",", ":"))
+    form = {
+        "grant_type": TOKEN_EXCHANGE_GRANT,
+        "subject_token": root,
+        "subject_token_type": MANDATE_CHAIN_TOKEN_TYPE,
+        "actor_token_type": _JWT_TOKEN_TYPE,
+        "authorization_details": details,
+        "authfi_key_move": key_move,
+    }
+    return dataclasses.replace(
+        token_request(token_endpoint, form, None, retry=Retry.NEVER_AFTER_SEND, dpop=dpop),
+        per_attempt=lambda: Attempt(form={"actor_token": actor_assertion(token_endpoint)}),
+    )
+
+
+def parse_take_over(response: HttpResponse) -> TokenResponse:
+    """The task's new root, or the typed refusal (see :func:`~authfi._protocol.errors.take_over_error`)."""
+    if response.status != 200:
+        raise take_over_error(response, "the token endpoint")
+    return parse_token_response(response, "the token endpoint", grant=TOKEN_EXCHANGE_GRANT)
 
 
 def parse_task_start(response: HttpResponse) -> TokenResponse | TaskPending:

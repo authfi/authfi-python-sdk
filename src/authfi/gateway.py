@@ -15,6 +15,7 @@ the model as the tool's answer. Only the token itself being refused (HTTP 401) i
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -45,7 +46,13 @@ from authfi._protocol.gateway import (
     with_approval,
 )
 from authfi._protocol.http import HttpRequest
-from authfi._protocol.ids import inject_traceparent, request_id, step_traceparent, valid_traceparent
+from authfi._protocol.ids import (
+    IdempotencyLedger,
+    inject_traceparent,
+    request_id,
+    step_traceparent,
+    valid_traceparent,
+)
 from authfi._transport import user_agent
 from authfi.errors import ConfigurationError, GatewayTokenRefused
 from authfi.tokens import AsyncTokenSource, TokenSource
@@ -223,6 +230,12 @@ def _proofless(headers: Mapping[str, str]) -> tuple[dict[str, str], Callable[[st
     return {k: v for k, v in headers.items() if k.lower() != "dpop"}, signer
 
 
+#: Set on the answer a refused token was turned into: the call is still to be sent again, with its key.
+_REFUSED_EXTENSION = "authfi_token_refused"
+#: Statuses that leave a tool call open: the caller may send it again, and the attempt must carry the same key.
+_OPEN_STATUSES = frozenset({401, 408, 425, 429})
+
+
 class _RefusalAsJsonRpc:
     """An async transport that answers a 401 to a JSON-RPC request as that request's JSON-RPC error."""
 
@@ -266,6 +279,7 @@ class _RefusalAsJsonRpc:
             200,
             json={"jsonrpc": "2.0", "id": rid, "error": error},
             request=request,
+            extensions={_REFUSED_EXTENSION: True},
         )
 
     async def __aenter__(self) -> _RefusalAsJsonRpc:
@@ -327,6 +341,7 @@ class _GatewayBase:
         #: ``<issuer>/mcp``: the MCP gateway, and the base URL of the Anthropic API on the AI gateway.
         self.mcp_url = project.issuer + "/mcp"
         self._mcp_path = urlsplit(self.mcp_url).path
+        self._calls = IdempotencyLedger()
 
     def model_base_url(self, api: ModelApi) -> str:
         """The base URL to give a provider SDK: ``<issuer>/mcp`` for Anthropic, ``<issuer>/mcp/v1`` for OpenAI."""
@@ -388,6 +403,7 @@ class _GatewayBase:
         self._warn_if_unproven(request)
         if "x-request-id" not in request.headers:
             request.headers["X-Request-Id"] = self._next_request_id()
+        self._idempotent(request)
         headers = dict(request.headers)
         carried = self._carried_traceparent(request)
         if carried is not None:
@@ -401,6 +417,16 @@ class _GatewayBase:
         stepped = step_traceparent(getattr(self, "source", None))
         return replace(request, headers={**request.headers, "traceparent": stepped}) if stepped else request
 
+    def _rpc_message(self, request: httpx.Request) -> Mapping[str, Any] | None:
+        """The JSON-RPC message a POST to the MCP gateway carries, when the body can be read."""
+        if request.method != "POST" or request.url.path != self._mcp_path:
+            return None
+        try:
+            body: object = json.loads(request.content)
+        except (httpx.RequestNotRead, ValueError):  # a streamed body, or not JSON
+            return None
+        return cast("Mapping[str, Any]", body) if isinstance(body, dict) else None
+
     def _carried_traceparent(self, request: httpx.Request) -> str | None:
         """The step an MCP request names in its ``_meta.traceparent``, which is the one that made the call.
 
@@ -408,15 +434,39 @@ class _GatewayBase:
         executing when the request leaves is the session's, not the call's. The MCP convention for trace context
         is ``params._meta.traceparent``, which the caller writes while its own step is current.
         """
-        if request.method != "POST" or request.url.path != self._mcp_path:
-            return None
-        try:
-            body: object = json.loads(request.content)
-        except (httpx.RequestNotRead, ValueError):  # a streamed body, or not JSON
-            return None
-        params = cast("Mapping[str, Any]", body).get("params") if isinstance(body, dict) else None
+        body = self._rpc_message(request)
+        params = body.get("params") if body is not None else None
         meta = cast("Mapping[str, Any]", params).get("_meta") if isinstance(params, dict) else None
         return valid_traceparent(cast("Mapping[str, Any]", meta).get("traceparent")) if isinstance(meta, dict) else None
+
+    def _idempotent(self, request: httpx.Request) -> None:
+        """Give a ``tools/call`` its ``Idempotency-Key``: fresh for each logical call, the same on each attempt of it.
+
+        The call is named by its session, JSON-RPC id, tool and arguments (without an approval id, which the
+        adapter adds when it sends a held call again). A key the caller set is kept.
+        """
+        body = self._rpc_message(request)
+        if body is None or body.get("method") != "tools/call":
+            return
+        params = body.get("params")
+        fields: Mapping[str, Any] = cast("Mapping[str, Any]", params) if isinstance(params, dict) else {}
+        arguments: object = fields.get("arguments")
+        shown, _ = strip_approval_argument(
+            cast("Mapping[str, Any]", arguments) if isinstance(arguments, dict) else None
+        )
+        digest = hashlib.sha256(json.dumps(shown, sort_keys=True, separators=(",", ":"), default=str).encode()).digest()
+        call = (request.headers.get("mcp-session-id", ""), repr(body.get("id")), str(fields.get("name")), digest)
+        request.extensions["authfi_call"] = call
+        if "idempotency-key" not in request.headers:
+            request.headers["Idempotency-Key"] = self._calls.key(call)
+
+    def _answered(self, response: httpx.Response) -> None:
+        """Forget the key of a call the platform answered, so a later call that looks the same is a new one."""
+        call = response.request.extensions.get("authfi_call")
+        if call is None or response.extensions.get(_REFUSED_EXTENSION):
+            return
+        if response.status_code not in _OPEN_STATUSES and response.status_code < 500:
+            self._calls.done(call)
 
     def _warn_if_unproven(self, request: httpx.Request) -> None:
         """Say once that a model call has no DPoP proof, which the AI gateway refuses when its check enforces."""
@@ -484,6 +534,9 @@ class Gateway(_GatewayBase):
         def on_request(request: Any) -> None:
             self._stamp(request)
 
+        def on_response(response: Any) -> None:
+            self._answered(response)
+
         return package.Client(
             auth=self.source.httpx_auth(package),
             follow_redirects=False,
@@ -491,7 +544,7 @@ class Gateway(_GatewayBase):
             if timeout is not None
             else package.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
             headers={"User-Agent": self._user_agent(), **(headers or {})},
-            event_hooks={"request": [on_request]},
+            event_hooks={"request": [on_request], "response": [on_response]},
         )
 
     def cloud_credentials(
@@ -591,6 +644,9 @@ class AsyncGateway(_GatewayBase):
         async def on_request(request: Any) -> None:
             self._stamp(request)
 
+        async def on_response(response: Any) -> None:
+            self._answered(response)
+
         return package.AsyncClient(
             auth=self.source.httpx_auth(package),
             follow_redirects=False,
@@ -598,7 +654,7 @@ class AsyncGateway(_GatewayBase):
             if timeout is not None
             else package.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
             headers={"User-Agent": self._user_agent(), **(headers or {})},
-            event_hooks={"request": [on_request]},
+            event_hooks={"request": [on_request], "response": [on_response]},
             transport=transport,
         )
 

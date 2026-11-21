@@ -15,7 +15,7 @@ from authfi.agents.agent import (
     TransactionToken,
 )
 from authfi.agents.keys import ASSERTION_LIFETIME, AgentKey, KeyAlgorithm, Signer, assert_public_jwk
-from authfi.agents.task import AsyncTask, Task
+from authfi.agents.task import AsyncTask, Handover, Task
 
 __all__ = [
     "ASSERTION_LIFETIME",
@@ -28,6 +28,7 @@ __all__ = [
     "AsyncTask",
     "CibaRequest",
     "DelegatedToken",
+    "Handover",
     "KeyAlgorithm",
     "Signer",
     "Task",
