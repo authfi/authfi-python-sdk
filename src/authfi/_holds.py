@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -26,6 +26,9 @@ __all__ = [
     "text_of",
     "wait_for_decision",
 ]
+
+#: What joins a tool's name to its arguments in a call's key.
+NUL = chr(0)
 
 #: How many held or decided calls are remembered until the run comes back for them.
 MEMORY = 10_000
@@ -54,7 +57,7 @@ def text_of(result: object) -> str:
 
 def call_key(tool: str, args: Mapping[str, Any]) -> str:
     """One name for one call: the tool and its arguments."""
-    return tool + "\x00" + json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
+    return tool + NUL + json.dumps(args, sort_keys=True, separators=(",", ":"), default=str)
 
 
 class HeldCalls:
@@ -99,13 +102,29 @@ class HeldCalls:
         while len(self._calls) > MEMORY:
             self._calls.popitem(last=False)
 
+    def saved(self) -> list[dict[str, Any]]:
+        """The held calls as plain data (``approval_id``, ``tool``, ``args``), to keep beside a run's saved state."""
+        out: list[dict[str, Any]] = []
+        for key, (entry, _) in self._calls.items():
+            if isinstance(entry, Held):
+                tool, _, raw = key.partition(NUL)
+                out.append({"approval_id": entry.approval_id, "tool": tool, "args": json.loads(raw)})
+        return out
+
+    def adopt(self, held: Sequence[Mapping[str, Any]]) -> None:
+        """Remember calls :meth:`saved` in another process, so they are sent again with their approval."""
+        for call in held:
+            approval_id, tool, args = call.get("approval_id"), call.get("tool"), call.get("args")
+            if isinstance(approval_id, str) and isinstance(tool, str) and isinstance(args, Mapping):
+                self.remember(tool, cast("Mapping[str, Any]", args), Held(approval_id))
+
     def clear(self) -> None:
         """Forget every remembered call."""
         self._calls.clear()
 
     def holds(self, tool: str) -> bool:
         """Whether any call of ``tool`` is held, so its next call must wait for a person even if unannounced."""
-        prefix = tool + "\x00"
+        prefix = tool + NUL
         return any(key.startswith(prefix) and isinstance(entry, Held) for key, (entry, _) in self._calls.items())
 
     async def send(

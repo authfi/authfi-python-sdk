@@ -41,12 +41,23 @@ def _scope(name: str) -> str:
     return f"mcp:{server}.{tool}"
 
 
+OTHER_RUN = "approval was raised by another run of this agent"
+
+
 class FakeGateway:
     """Use as a context manager; ``issuer`` is its address."""
 
     def __init__(
-        self, *, approvals_readable: bool = False, token_lifetime: int = 900, api_origin: str | None = None
+        self,
+        *,
+        approvals_readable: bool = False,
+        token_lifetime: int = 900,
+        api_origin: str | None = None,
+        resume_binding: str = "agent",
     ) -> None:
+        #: The project's ``resume_binding``: ``run`` refuses an approval raised by another run of the agent.
+        self.resume_binding = resume_binding
+        self._here = threading.local()
         #: Where discovery says the machine APIs are, for a project on a custom domain; the issuer's when None.
         self.api_origin = api_origin
         self.approvals_readable = approvals_readable
@@ -223,6 +234,13 @@ class FakeGateway:
                 {},
                 json.dumps({"access_token": token, "token_type": "Bearer", "expires_in": self.token_lifetime}).encode(),
             )
+        if path == "/apis/regional/v1/ai/auth/request-approval":
+            asked = json.loads(body)
+            approval_id = str(uuid.uuid4())
+            with self._lock:
+                self.approvals[approval_id] = {"status": "pending", "asked": asked}
+            record = {"approval_id": approval_id, "status": "pending", "requesting_action": asked["requesting_action"]}
+            return 201, {}, json.dumps({"data": record}).encode()
         if not self._authorized(headers) or (self.tools_revoked and path == "/mcp"):
             return (
                 401,
@@ -237,6 +255,8 @@ class FakeGateway:
             return self._chat(json.loads(body))
         message = cast(dict[str, Any], json.loads(body))
         method, rid = message.get("method"), message.get("id")
+        # The SDK stamps every call "<run id>.<n>": the run is what comes before the counter.
+        self._here.run = (headers.get("x-request-id") or "").rsplit(".", 1)[0]
         if rid is None:
             return 202, {}, b""
         if method == "initialize":
@@ -288,9 +308,16 @@ class FakeGateway:
             if approval is None:
                 approval_id = str(uuid.uuid4())
                 with self._lock:
-                    self.approvals[approval_id] = {"status": "pending", "tool": name, "args": args}
+                    self.approvals[approval_id] = {
+                        "status": "pending",
+                        "tool": name,
+                        "args": args,
+                        "run": self._here.run,
+                    }
                 return self._hold(rid, approval_id, "approval_required")
             record = self.approvals.get(approval)
+            if record is not None and self.resume_binding == "run" and record.get("run") != self._here.run:
+                return self._refuse(rid, name, code="approval_run", approval_id=approval, reason=OTHER_RUN)
             if record is None or record["status"] in ("expired", "used", "denied"):
                 code = "approval_" + (record["status"] if record else "expired")
                 return self._refuse(rid, name, code=code, approval_id=approval)
@@ -309,10 +336,16 @@ class FakeGateway:
         return 200, {}, _rpc(rid, _text(text, is_error=True))
 
     def _refuse(
-        self, rid: Any, name: str, *, code: str | None = None, approval_id: str | None = None
+        self,
+        rid: Any,
+        name: str,
+        *,
+        code: str | None = None,
+        approval_id: str | None = None,
+        reason: str | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         if code:
-            reason = code.replace("_", " ")
+            reason = reason or code.replace("_", " ")
             result = _text(f"Refused ({code}): {reason} (approval {approval_id}).", is_error=True)
             result["_meta"] = {"io.authfi/refusal": {"code": code, "reason": reason, "approval_id": approval_id}}
             return 200, {}, _rpc(rid, result)

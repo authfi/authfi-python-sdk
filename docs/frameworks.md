@@ -386,7 +386,10 @@ gateway's tools to the permission flow, so `can_use_tool` always runs for them;
 
 Without `wait_for_decision`, a held call is refused for now with "This action is waiting for a
 person's approval in AuthFI."; the same call made after the person decides goes with the approval. The
-approval id never reaches the model, and one the model writes is removed. `can_use_tool` never
+approval id never reaches the model, and one the model writes is removed. `wait_for_decision` has
+`approval_timeout` seconds (default 900): when they pass, or it raises, the call is refused for now and never
+run, the approval stays open, and the same call made later goes with it. If it finds the agent's token refused,
+the run ends. `can_use_tool` never
 grants a lasting permission. Tools that are not AuthFI's are refused, unless you pass your own
 `can_use_tool` to `options()`, which then decides them.
 
@@ -467,3 +470,29 @@ and adds `authfi.agent_id` to `OTEL_RESOURCE_ATTRIBUTES`. Call it before the run
 
 `agent(name=..., instruction=..., model=..., tools=...)` builds an `LlmAgent` with all of it;
 `before_tool_callback` and `after_tool_callback` you pass run after the integration's.
+
+## A person decides in AuthFI, and the agent continues by itself
+
+A call the gateway holds (a risky tool, DLP, over budget, a changed tool pin) waits for a person in AuthFI. With
+`approval_poll` the integration polls the approval with the agent's own token (`GET .../ai/auth/approvals/{id}`;
+a token held for a person is refused by that route) until it is approved, denied, expired or cancelled, then
+resumes through the framework's own hook and sends the call again: the gateway decides, so a denial still reaches
+the model as a refusal. Nothing is decided by a local click, and the approval id never reaches the model.
+
+| Framework | How |
+|---|---|
+| Claude Agent SDK | `ClaudeAgentIntegration(..., approval_poll=True)`: `can_use_tool` waits, then allows or refuses |
+| LangGraph | `LangGraphIntegration(..., approval_poll=True)`: the approval node polls before it calls `interrupt()` |
+| LangChain agents | `AuthFIApprovalMiddleware(langchain, approval_poll=True)` (extra `langchain-hitl`): the hold becomes the middleware's `tool_approval` interrupt; `request=[...]` asks a person before a tool runs |
+| OpenAI Agents, Pydantic AI | `mcp_server(approval_poll=True)` / `toolset(approval_poll=True)`: `resolve()` waits, then approves the item |
+| Google ADK | `await_decision(pending)` returns the answer to ADK's confirmation |
+
+Every wait is bounded by `approval_timeout` (900 s): nobody deciding leaves the approval open and the framework's
+own pause in place. A revoked or suspended agent, one that may not read approvals, or an unknown approval raises
+`ApprovalUnavailable` at once (`reason`: `agent_refused`, `agent_not_allowed`, `approval_not_found`).
+
+**After a restart.** LangGraph's checkpoint and ADK's session carry the approval id themselves. OpenAI Agents,
+Pydantic AI and LangChain agents keep it in memory: save `held()` beside the run's state and give it to `adopt()` in
+the new process, so it resumes the call the person decided instead of raising a second approval. A project that
+binds approvals to the run (`resume_binding` `run`, the default) answers a resumed call with "approval was raised by
+another run of this agent"; the model then reads `approval_other_run` and that the call must be raised again.

@@ -92,6 +92,7 @@ jobs:
           - { extras: "langchain", tests: "tests/unit/test_langchain_core.py" }
           - { extras: "langchain-anthropic,otel", tests: "tests/unit/test_langchain.py tests/unit/test_langchain_core.py" }
           - { extras: "langgraph,langchain-anthropic,otel", tests: "tests/unit/test_langgraph.py tests/unit/test_langgraph_agent_security.py" }
+          - { extras: "langchain-hitl,langgraph,langchain-anthropic,otel", tests: "tests/unit/test_langchain_hitl.py" }
           - { extras: "langgraph-auth", tests: "tests/unit/test_langgraph_auth.py" }
           - { extras: "openai-agents,otel", tests: "tests/unit/test_openai_agents.py tests/unit/test_openai_agents_agent_security.py" }
           - { extras: "claude-agent,otel", tests: "tests/unit/test_claude_agent.py tests/unit/test_claude_agent_cli.py tests/unit/test_claude_agent_agent_security.py" }
