@@ -1184,3 +1184,74 @@ async def test_a_wait_that_finds_the_agent_revoked_stops_the_run(
     assert isinstance(decision, PermissionResultDeny)
     assert decision.interrupt is True
     assert isinstance(claude.token_refused, GatewayTokenRefused)
+
+
+# --- approval_poll ----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def _polling(readable: FakeGateway, key_file: Path, **options: Any) -> tuple[ClaudeAgentIntegration, AsyncAuthFI]:
+    project = AsyncAuthFI(readable.issuer)
+    claude = ClaudeAgentIntegration(
+        project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")),
+        approval_poll=True,
+        poll_interval=0.01,
+        **options,
+    )
+    return claude, project
+
+
+async def test_a_held_call_continues_by_itself_once_the_person_decides(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        await asyncio.sleep(0.2)
+        assert not deciding.done()
+        (approval_id,) = readable.pending()
+        readable.decide(approval_id, "approved")
+        decision = await asyncio.wait_for(deciding, 5)
+
+        assert isinstance(decision, PermissionResultAllow)
+        answer = await _handler(claude, STEP_UP)(ARGS)
+        assert "answered for pallets/flask" in answer["content"][0]["text"]
+        assert approval_id not in json.dumps(answer)
+
+
+async def test_a_denied_approval_reaches_the_model_as_refused(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        await asyncio.sleep(0.2)
+        (approval_id,) = readable.pending()
+        readable.decide(approval_id, "denied")
+        assert isinstance(await asyncio.wait_for(deciding, 5), PermissionResultAllow)
+        answer = await _handler(claude, STEP_UP)(ARGS)
+        assert "approval_denied" in answer["content"][0]["text"]
+        assert readable.tool_calls == []
+
+
+async def test_an_undecided_approval_is_refused_for_now_when_the_poll_times_out(
+    readable: FakeGateway, key_file: Path
+) -> None:
+    claude, project = await _polling(readable, key_file, approval_timeout=0.1)
+    async with project:
+        decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+        assert isinstance(decision, PermissionResultDeny)
+        assert "did not come in time" in decision.message
+        assert len(readable.pending()) == 1
+
+
+async def test_an_agent_revoked_while_waiting_ends_the_run(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        await asyncio.sleep(0.2)
+        readable.revoked = True
+        decision = await asyncio.wait_for(deciding, 5)
+        assert isinstance(decision, PermissionResultDeny)
+        assert decision.interrupt is True
