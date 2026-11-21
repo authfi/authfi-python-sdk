@@ -67,6 +67,7 @@ from authfi._protocol.ids import link_step_owner
 from authfi._protocol.oauth import ClientAuth, TokenResponse, client_credentials_request, parse_token_response
 from authfi.agents._legacy import LegacyAgentMixin, is_legacy_agent, legacy_agent_arguments
 from authfi.agents.keys import Signer, client_assertion
+from authfi.agents.subagent import AsyncSubAgent, SubAgent, spawn, spawn_async
 from authfi.agents.task import AsyncTask, Task, refuse_nested
 from authfi.errors import (
     AuthFIDeprecationWarning,
@@ -1205,6 +1206,25 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             return self.await_task(started, timeout=timeout)
         return started
 
+    def sub_agent(
+        self,
+        name: str,
+        *,
+        permissions: Sequence[str],
+        audience: str | None = None,
+        run_id: str | None = None,
+        framework: str | None = None,
+    ) -> SubAgent:
+        """A sub-agent: an agent of its own, made for one part of this agent's work (``with agent.sub_agent(...)``).
+
+        It has an agent id and a WIMSE id of its own, so the console and the audit tape name it and every call it
+        makes is held to what it holds. It holds only what this agent holds: asking for a permission this agent lacks
+        raises :class:`~authfi.APIError` with the code ``ESUBAGENT002`` and nothing is made. Give it to an adapter in
+        the agent's place (``LangGraphIntegration(sub)``). ``framework`` and ``run_id`` are recorded with it, so the
+        console shows which framework mechanism made it and in which run.
+        """
+        return spawn(self, name, permissions, audience, run_id, framework)
+
     @property
     def cloud(self) -> CloudAccess:
         """Short-lived cloud credentials through the gateway: ``agent.cloud.credentials(account, role)``."""
@@ -1668,6 +1688,18 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         if isinstance(started, TaskPending):
             return await self.await_task(started, timeout=timeout)
         return started
+
+    async def sub_agent(
+        self,
+        name: str,
+        *,
+        permissions: Sequence[str],
+        audience: str | None = None,
+        run_id: str | None = None,
+        framework: str | None = None,
+    ) -> AsyncSubAgent:
+        """See :meth:`AgentAuth.sub_agent`. Use it as ``async with await agent.sub_agent(...)``."""
+        return await spawn_async(self, name, permissions, audience, run_id, framework)
 
     @property
     def cloud(self) -> AsyncCloudAccess:
