@@ -7,6 +7,13 @@
         thumbprint: what you register in the console
     authfi token
         the agent's current access token, on one line (a tool's apiKeyHelper)
+    authfi login --issuer URL [--no-browser] [--reregister]
+        signs a person in once, in a browser, for the project's /llm door (needs authfi[login])
+    authfi token --resource llm [--issuer URL]
+        a fresh person access token for /llm, one line (Claude Code's apiKeyHelper, run as ``python -I -m authfi``;
+        refuses to start otherwise: ``authfi login`` prints the exact command); bare ``token`` is the agent's
+    authfi logout [--issuer URL] [--forget-allow]
+        revokes the person's refresh token and deletes what is stored
     authfi headers
         {"Authorization": "Bearer ..."} as JSON (an MCP server's headersHelper); with
         AUTHFI_RUN_ID set, X-Request-Id too
@@ -14,7 +21,7 @@
         the platform's red-team corpus against your agent's configuration, read back from your call
         tape; without --send it prints what it would send (see :mod:`authfi.redteam`)
 
-``token`` and ``headers`` read the agent as ``AuthFI.from_env().agent_from_env()`` does:
+``token`` (without ``--resource``) and ``headers`` read the agent as ``AuthFI.from_env().agent_from_env()`` does:
 ``AUTHFI_ISSUER``, ``AUTHFI_AGENT_ID``, ``AUTHFI_AGENT_KEY_FILE``, ``AUTHFI_AGENT_KID`` and
 ``AUTHFI_AGENT_RESOURCE``. A failure prints the reason on stderr and exits 1 with nothing on
 stdout, so a calling tool never mistakes an error for a credential.
@@ -28,7 +35,9 @@ import os
 import sys
 from collections.abc import Sequence
 
-from authfi import redteam
+import httpx
+
+from authfi import _login, redteam
 from authfi._protocol.ids import is_valid_request_id
 from authfi.agents.keys import AgentKey, KeyAlgorithm
 from authfi.client import AuthFI
@@ -44,7 +53,39 @@ def _parser() -> argparse.ArgumentParser:
     keygen.add_argument("--out", required=True, help="the file to write the private key to (must not exist)")
     keygen.add_argument("--alg", choices=["EdDSA", "ES256", "PS256"], default="EdDSA")
     keygen.add_argument("--kid", help="the key id; the public key's thumbprint by default")
-    commands.add_parser("token", help="print the agent's current access token")
+    token = commands.add_parser("token", help="print the agent's current access token")
+    token.add_argument("--resource", choices=["llm"], help="print the signed-in person's token for this door instead")
+    token.add_argument("--issuer", help="the project origin; default AUTHFI_ISSUER, else the one signed in to")
+    token.add_argument(
+        "--min-validity",
+        type=float,
+        default=_login.DEFAULT_MIN_VALIDITY,
+        help="seconds a reused token must still have left (--resource only)",
+    )
+    login = commands.add_parser("login", help="sign a person in, for Claude Code's use of the /llm door")
+    login.add_argument("--issuer", help="the project origin, such as https://acme.authfi.io")
+    login.add_argument("--no-browser", action="store_true", help="print the address instead of opening a browser")
+    login.add_argument("--reregister", action="store_true", help="register this machine's client again")
+    login.add_argument(
+        "--allow-proxy",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="let `authfi token` run behind this proxy host",
+    )
+    login.add_argument(
+        "--allow-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="let `authfi token` run with this exact CA or TLS variable value",
+    )
+    login.add_argument("--timeout", type=float, default=_login.CALLBACK_TIMEOUT, help="seconds to wait for the browser")
+    logout = commands.add_parser("logout", help="revoke the person's refresh token and delete what is stored")
+    logout.add_argument("--issuer", help="the project origin; default the one signed in to")
+    logout.add_argument(
+        "--forget-allow", action="store_true", help="also drop every proxy host and value allowed with `authfi login`"
+    )
     commands.add_parser("headers", help="print the agent's request headers as JSON")
     redteam.add_arguments(
         commands.add_parser("redteam", help="run the red-team corpus against your agent (a dry run unless --send)")
@@ -60,9 +101,54 @@ def _keygen(out: str, alg: str, kid: str | None) -> int:
     return 0
 
 
+def _person_command(args: argparse.Namespace) -> int:
+    """``login``, ``logout`` and ``token --resource``: a person's own credential, kept in the credential store."""
+    try:
+        runtime = _login.Runtime(env=os.environ, vault=_login.open_vault(), http_client=_http_client())
+        if args.command == "login":
+            return _login.login(
+                runtime,
+                args.issuer,
+                browser=not args.no_browser,
+                reregister=args.reregister,
+                timeout=args.timeout,
+                allow_proxies=args.allow_proxy,
+                allow_env=args.allow_env,
+            )
+        if args.command == "logout":
+            return _login.logout(runtime, args.issuer, forget_allow=args.forget_allow)
+        token = _login.access_token(runtime, args.issuer, min_validity=args.min_validity)
+    except AuthFIError as error:
+        print(f"authfi: {error.message}", file=sys.stderr)
+        return 1
+    sys.stdout.write(token + "\n")
+    return 0
+
+
+def _isolated() -> bool:
+    """``True`` when Python was started with ``-I``: no ``PYTHON*`` variables, no user site, no working directory."""
+    return bool(sys.flags.isolated)
+
+
+def _http_client() -> httpx.Client | None:
+    """The HTTP client the person commands use; the SDK's own by default."""
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; returns the exit code."""
     args = _parser().parse_args(argv)
+    if args.command == "token" and args.resource and not _isolated():
+        # Python has already read PYTHONPATH and the user site by now: the environment guard cannot undo that.
+        print(
+            "authfi: this helper was not started in isolated mode, so Python may already have run code chosen by "
+            "the environment (PYTHONPATH, the user site or the working directory); set Claude Code's apiKeyHelper "
+            f"to: {_login.helper_command()}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.command in ("login", "logout") or (args.command == "token" and args.resource):
+        return _person_command(args)
     if args.command == "redteam":
         return redteam.command(args, os.environ, print, lambda text: print(text, file=sys.stderr))
     try:

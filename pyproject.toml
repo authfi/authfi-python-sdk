@@ -36,6 +36,8 @@ classifiers = [
 authfi = "authfi.cli:main"
 
 [project.optional-dependencies]
+# `authfi login`: the person's refresh token lives in the operating system's credential store, never in a file.
+login = ["keyring>=25,<26"]
 fastapi = ["fastapi>=0.115,<1"]
 flask = ["flask>=3.0,<4"]
 # mcp stays below 2: its 2.x needs an httpx2 client factory where these adapters pass an httpx one (the OpenAI Agents
@@ -127,6 +129,7 @@ dev = [
     "llama-index-tools-mcp>=0.4.6,<0.5",
     "opentelemetry-sdk>=1.30,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+    "keyring>=25,<26",
 ]
 
 [tool.uv]
