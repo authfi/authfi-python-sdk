@@ -1,6 +1,6 @@
 """LlamaIndex: Claude on the AI gateway, the gateway's governed tools, approvals a workflow waits for, steps.
 
-``pip install "authfi[llama-index] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[llama-index]"``
 
 ::
 
@@ -61,7 +61,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.llama_index needs LlamaIndex with its Anthropic and MCP packages: "
-        "pip install 'authfi[llama-index] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[llama-index]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of

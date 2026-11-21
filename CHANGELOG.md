@@ -5,13 +5,15 @@ and the project uses [Semantic Versioning](https://semver.org/).
 
 ## [0.2.0]
 
+The first public release, on PyPI as `authfi`: `pip install authfi`.
+
 The SDK is rebuilt on one core that every area shares: people signing in, APIs verifying tokens,
 machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md).
 
 ### Added
 
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
-  project's `/llm` door (`pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`). The login registers a public client once per machine (RFC 7591),
+  project's `/llm` door (`pip install "authfi[login]"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`
   with `openid llm:invoke offline_access`. The refresh token lives in the operating system's credential store and
   nowhere else: with no usable store the login refuses before it contacts the project. `token --resource llm` renews under a

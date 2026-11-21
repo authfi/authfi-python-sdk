@@ -36,7 +36,7 @@ try:
 except ImportError as error:  # pragma: no cover - exercised by installing the core package alone
     raise ConfigurationError(
         "authfi.langgraph_auth needs langgraph-sdk: "
-        f"pip install 'authfi[langgraph-auth] @ git+https://github.com/authfi/authfi-python-sdk@main' ({error})"
+        f"pip install 'authfi[langgraph-auth]' ({error})"
     ) from error
 
 __all__ = ["auth_from_env", "create_auth", "resource_of"]

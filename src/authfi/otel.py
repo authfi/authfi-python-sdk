@@ -44,7 +44,7 @@ try:
 except ImportError as error:  # pragma: no cover - exercised by installing the core package alone
     raise ConfigurationError(
         "authfi.otel needs the OpenTelemetry SDK and OTLP exporter: "
-        f"pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main' ({error})"
+        f"pip install 'authfi[otel]' ({error})"
     ) from error
 
 if TYPE_CHECKING:

@@ -19,7 +19,7 @@ the graph pauses; once the person has decided in AuthFI, it resumes and the gate
 ## Run it
 
 ```bash
-pip install "authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langgraph]"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python agent.py "Read the wiki contents of pallets/flask"

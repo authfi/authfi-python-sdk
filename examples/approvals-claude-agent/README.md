@@ -17,7 +17,7 @@ calls go through the AuthFI gateways, and a call that needs a person's approval 
 ## Run it
 
 ```bash
-pip install "authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[claude-agent]"
 cp .env.example .env    # fill it in; the agent's key must be a file
 set -a; . ./.env; set +a
 python support_agent.py "Read the wiki contents of pallets/flask"

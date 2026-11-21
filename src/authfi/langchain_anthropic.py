@@ -1,6 +1,6 @@
 """A Claude model for LangChain on the AuthFI AI gateway, whose token tracers never see.
 
-``pip install "authfi[langchain-anthropic] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[langchain-anthropic]"``
 
 Make the model with :meth:`authfi.langchain.LangChainIntegration.chat_model`. LangChain's documented way to give
 ``ChatAnthropic`` a bearer token is ``default_headers={"Authorization": ...}``, and LangSmith records a model's
@@ -24,7 +24,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.langchain_anthropic needs langchain-anthropic: "
-        "pip install 'authfi[langchain-anthropic] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[langchain-anthropic]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, httpx_of

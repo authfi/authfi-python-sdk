@@ -1,6 +1,6 @@
 """FastAPI: protect routes with AuthFI access tokens.
 
-``pip install "authfi[fastapi] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[fastapi]"``
 
 ::
 
@@ -32,7 +32,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.fastapi needs FastAPI: "
-        "pip install 'authfi[fastapi] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[fastapi]'"
     ) from exc
 
 from authfi._resource import (

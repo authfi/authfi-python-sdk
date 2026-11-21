@@ -75,7 +75,7 @@ token and answers it in `AuthFI-Run-Id`.
 ### Steps to AuthFI
 
 ```bash
-pip install "authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[otel]"
 ```
 
 One call per integration sends the agent's steps (which agent ran, which tool, which model call, how long, how
@@ -117,7 +117,7 @@ options = await af.claude_agent().options(model="claude-haiku-5-5", export_steps
 ## LangChain
 
 ```bash
-pip install "authfi[langchain-anthropic] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langchain-anthropic]"
 ```
 
 `authfi[langchain]` installs only `langchain-core`: `LangChainIntegration.gateway` is the credential for any chat
@@ -148,7 +148,7 @@ that client's settings in `client_kwargs`.
 ## LangGraph
 
 ```bash
-pip install "authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langgraph]"
 ```
 
 MCP tools run on asyncio, so the integration takes an asyncio credential.
@@ -217,7 +217,7 @@ token is renewed from the agent's key.
 ## OpenAI Agents SDK
 
 ```bash
-pip install "authfi[openai-agents] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[openai-agents]"
 ```
 
 ```python
@@ -282,7 +282,7 @@ the run. The approval id never reaches the model.
 ## Claude Agent SDK
 
 ```bash
-pip install "authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[claude-agent]"
 ```
 
 ```python
@@ -410,7 +410,7 @@ accepted (`NotSupportedError`), as Claude Code could only receive it as a fixed 
 ## Google ADK
 
 ```bash
-pip install "authfi[adk] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[adk]"
 ```
 
 ```python

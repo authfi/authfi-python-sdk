@@ -15,7 +15,7 @@ A reporting job that calls the orders API (see `../protect-an-api`) with its own
 ## Run it
 
 ```bash
-pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python nightly_job.py
