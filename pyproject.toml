@@ -56,6 +56,8 @@ langgraph = [
     "langchain-mcp-adapters>=0.3.2,<0.4",
     "mcp>=1.30,<2",
 ]
+# LangChain's create_agent and its HumanInTheLoopMiddleware (authfi.langchain_hitl): the person decides in AuthFI.
+langchain-hitl = ["authfi[langchain]", "langchain>=1.0,<2"]
 # Auth for a graph deployed on LangSmith Deployment (authfi.langgraph_auth): the deployment already has langgraph-sdk.
 langgraph-auth = ["langgraph-sdk>=0.2,<1"]
 openai-agents = ["openai-agents[litellm]>=0.24,<0.25", "litellm>=1.83,!=1.92.*,<1.106", "mcp>=1.30,<2"]
@@ -114,6 +116,7 @@ dev = [
     "flask>=3.0,<4",
     "anthropic>=1.0,<2",
     "openai>=3.0,<4",
+    "langchain>=1.0,<2",
     "langchain-core>=1.0,<2",
     "langchain-anthropic>=1.7,<1.8",
     "langsmith>=0.14,<1",
@@ -139,6 +142,7 @@ conflicts = [
     [{ extra = "crewai" }, { group = "dev" }],
     [{ extra = "crewai" }, { extra = "langchain" }],
     [{ extra = "crewai" }, { extra = "langchain-anthropic" }],
+    [{ extra = "crewai" }, { extra = "langchain-hitl" }],
     [{ extra = "crewai" }, { extra = "langgraph" }],
     [{ extra = "crewai" }, { extra = "openai-agents" }],
     [{ extra = "crewai" }, { extra = "claude-agent" }],

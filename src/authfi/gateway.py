@@ -31,6 +31,7 @@ from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
     CLOUD_PATH,
     HOLD_MESSAGE,
+    OTHER_RUN_REFUSAL,
     CloudCredential,
     ToolAllowed,
     ToolApprovalRequired,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 __all__ = [
     "APPROVAL_ARGUMENT",
     "HOLD_MESSAGE",
+    "OTHER_RUN_REFUSAL",
     "TOKEN_REFUSED_MESSAGE",
     "AsyncGateway",
     "CloudCredential",

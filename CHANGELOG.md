@@ -10,6 +10,12 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `approval_poll` on the Claude Agent SDK, LangGraph, OpenAI Agents and Pydantic AI integrations, `ADKIntegration.await_decision`
+  and `AsyncGateway.await_approval`: a held call waits for the person's decision in AuthFI, polled with the agent's
+  own token, then continues. `held()`/`adopt()` resume a saved run after a restart. `authfi.langchain_hitl`
+  (extra `langchain-hitl`) is LangChain's `create_agent` pause decided by AuthFI. `ApprovalUnavailable` says why an
+  approval cannot be read (a revoked or suspended agent no longer reads as a project without approval status).
+  `ToolRefused.why` is `approval_other_run` when a project binds approvals to the run.
 - `ClaudeAgentIntegration(approval_timeout=...)`: `wait_for_decision` now has a time limit (900 seconds), and a wait that
   raises no longer escapes `can_use_tool`. Either way the call is refused for now, never run, and the approval stays
   open; a refused token still ends the run.
