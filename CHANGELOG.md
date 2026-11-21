@@ -10,6 +10,14 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `agent.sub_agent(name, permissions=[...])` (and `await agent.sub_agent(...)` on the asyncio agent) makes a sub-agent: an
+  agent of its own, with an agent id and a WIMSE id the console and the audit tape name, so every call it makes is its own
+  and not its parent's. It is a credential like a task: give it to an adapter in the agent's place, use it as
+  `with agent.sub_agent(...) as sub:`, and leaving the block forgets it. It holds no key, so only its parent can get a
+  token for it, and it holds only what its parent holds: a request for more raises `APIError` with the code
+  `ESUBAGENT002` and nothing is made. Its token is renewed from what the parent holds at that moment. A sub-agent can make
+  sub-agents the same way, up to eight generations below the registered agent. `framework=` and `run_id=` are recorded
+  with it. Needs agent-identity with sub-agents (schemas V498).
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`

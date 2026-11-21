@@ -467,3 +467,19 @@ and adds `authfi.agent_id` to `OTEL_RESOURCE_ATTRIBUTES`. Call it before the run
 
 `agent(name=..., instruction=..., model=..., tools=...)` builds an `LlmAgent` with all of it;
 `before_tool_callback` and `after_tool_callback` you pass run after the integration's.
+
+## Sub-agents with an identity of their own
+
+A framework's sub-agent (a LangGraph subgraph, a CrewAI crew member, an OpenAI Agents handoff target, a Claude Agent SDK
+subagent) calls as its parent unless you give it a credential of its own. Make one with `agent.sub_agent(name,
+permissions=[...])` and give it to the adapter that runs that part, in the agent's place, the way a task is:
+
+```python
+with agent.sub_agent("crm lookup", permissions=["mcp:crm.read"], framework="langgraph") as crm:
+    integration = LangGraphIntegration(crm)   # the subgraph's calls are the sub-agent's, held to what it holds
+```
+
+The sub-agent has its own agent id (`crm.agent_id`) and WIMSE id (`crm.wimse_id`), so the console draws it under its
+parent and the audit tape records which part of the run did what. It holds only what its parent holds: asking for more
+raises `APIError` with the code `ESUBAGENT002` and nothing is made. A sub-agent can make sub-agents the same way.
+
