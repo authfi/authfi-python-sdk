@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -15,7 +16,7 @@ from langchain_core.runnables import RunnableConfig  # module level: a tool's an
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
+from authfi import AgentKey, ApprovalUnavailable, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from authfi.langgraph import APPROVAL_NODE, AuthFIState, Hold, LangGraphIntegration, ask, route_after_tools
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
@@ -566,3 +567,119 @@ async def test_the_models_client_does_not_set_a_traceparent_of_its_own(langgraph
         pytest.skip("this anthropic does not trace")
     assert client.open_telemetry["propagation"] is False
     assert isinstance(client, anthropic.AsyncAnthropic)
+
+
+# --- approval_poll, and a restart ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def test_a_held_call_continues_by_itself_when_the_person_decides(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        langgraph = LangGraphIntegration(af.agent(AGENT, key), approval_poll=True, poll_interval=0.01)
+        graph = await _graph(langgraph)
+        readable.model_script += [_use(STEP_UP), [{"type": "text", "text": "Read it."}]]
+
+        running = asyncio.ensure_future(graph.ainvoke(ask("Read the wiki"), CONFIG))
+        for _ in range(500):
+            if readable.pending():
+                break
+            await asyncio.sleep(0.01)
+        (approval_id,) = readable.pending()
+        assert not running.done()
+        readable.decide(approval_id, "approved")
+        state = await asyncio.wait_for(running, 10)
+
+    assert "__interrupt__" not in state
+    assert state["messages"][-1].content == "Read it."
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert approval_id not in _everything_the_model_read(readable)
+
+
+async def test_an_approval_nobody_decides_in_time_still_interrupts_for_the_application(
+    readable: FakeGateway, key: AgentKey
+) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        langgraph = LangGraphIntegration(
+            af.agent(AGENT, key), approval_poll=True, poll_interval=0.01, approval_timeout=0.05
+        )
+        graph = await _graph(langgraph)
+        readable.model_script += [_use(STEP_UP)]
+        state = await graph.ainvoke(ask("Read the wiki"), CONFIG)
+
+    assert "__interrupt__" in state
+    assert readable.tool_calls == []
+
+
+async def test_an_agent_revoked_while_waiting_stops_the_graph(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        langgraph = LangGraphIntegration(af.agent(AGENT, key), approval_poll=True, poll_interval=0.01)
+        graph = await _graph(langgraph)
+        readable.model_script += [_use(STEP_UP)]
+        running = asyncio.ensure_future(graph.ainvoke(ask("Read the wiki"), CONFIG))
+        for _ in range(500):
+            if readable.pending():
+                break
+            await asyncio.sleep(0.01)
+        readable.revoked = True
+        with pytest.raises(ApprovalUnavailable) as caught:
+            await asyncio.wait_for(running, 10)
+    assert caught.value.reason == "agent_refused"
+
+
+async def _restarted(
+    gateway: FakeGateway, key: AgentKey, saver: InMemorySaver, **options: Any
+) -> tuple[AsyncAuthFI, Any]:
+    """A new process: a new project, agent and integration, with only the checkpoint carried over."""
+    project = AsyncAuthFI(gateway.issuer)
+    langgraph = LangGraphIntegration(project.agent(AGENT, key), **options)
+    tools = await langgraph.tools()
+    graph = langgraph.agent_graph(langgraph.chat_model("claude-haiku-5-5", max_tokens=64), tools, checkpointer=saver)
+    return project, graph
+
+
+async def test_a_restarted_process_resumes_the_held_call_from_the_checkpoint(
+    readable: FakeGateway, key: AgentKey
+) -> None:
+    saver = InMemorySaver()
+    readable.model_script += [_use(STEP_UP), [{"type": "text", "text": "Read it."}]]
+    first, graph = await _restarted(readable, key, saver)
+    async with first:
+        state = await graph.ainvoke(ask("Read the wiki"), CONFIG)
+    approval_id = state["__interrupt__"][0].value["authfi_approvals"][0]["approval_id"]
+    assert approval_id in str(state["authfi_holds"])  # the id lives in the graph state
+
+    readable.decide(approval_id, "approved")
+    second, graph = await _restarted(readable, key, saver)
+    async with second:
+        state = await graph.ainvoke(Command(resume=True), CONFIG)
+
+    assert "__interrupt__" not in state
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert state["messages"][-1].content == "Read it."
+    assert approval_id not in _everything_the_model_read(readable)
+
+
+async def test_a_project_that_binds_approvals_to_the_run_says_to_raise_the_call_again(key: AgentKey) -> None:
+    with FakeGateway(approvals_readable=True, resume_binding="run") as gateway:
+        saver = InMemorySaver()
+        gateway.model_script += [_use(STEP_UP), [{"type": "text", "text": "Asking again."}]]
+        first, graph = await _restarted(gateway, key, saver)
+        async with first:
+            state = await graph.ainvoke(ask("Read the wiki"), CONFIG)
+        approval_id = state["__interrupt__"][0].value["authfi_approvals"][0]["approval_id"]
+        gateway.decide(approval_id, "approved")
+
+        second, graph = await _restarted(gateway, key, saver)
+        async with second:
+            state = await graph.ainvoke(Command(resume=True), CONFIG)
+
+        (answer,) = _tool_messages(state)
+        assert "Raise the call again" in str(answer.content)
+        assert answer.status == "error"
+        assert gateway.tool_calls == []
+        assert approval_id not in _everything_the_model_read(gateway)

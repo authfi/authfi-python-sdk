@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -149,13 +150,28 @@ class LangGraphIntegration:
         source: an asyncio credential (``AsyncAuthFI.agent(...)``, or the ``AsyncDelegatedToken``
             it holds for a person). MCP tools run on asyncio.
         project: the project, for a credential of your own that does not name it.
+        approval_poll: when a call is held, poll its approval with the agent's own token (``poll_interval`` seconds
+            apart, for up to ``approval_timeout``) before the approval node interrupts. A call a person decided in
+            time is sent again at once; otherwise the node interrupts as usual. An agent that is revoked or
+            suspended raises :class:`~authfi.ApprovalUnavailable`. Needs the agent itself as ``source``.
 
     """
 
-    def __init__(self, source: AsyncTokenSource, *, project: AsyncAuthFI | None = None) -> None:
+    def __init__(
+        self,
+        source: AsyncTokenSource,
+        *,
+        project: AsyncAuthFI | None = None,
+        approval_poll: bool = False,
+        approval_timeout: float = 900.0,
+        poll_interval: float = 3.0,
+    ) -> None:
         if not isinstance(cast(object, source), AsyncTokenSource):
             async_gateway_for(source, project)  # raises, naming the asyncio credential to use
         self.source = source
+        self.approval_poll = approval_poll
+        self.approval_timeout = approval_timeout
+        self.poll_interval = poll_interval
         self.langchain = LangChainIntegration(source, project=project)
         self.gateway = cast(AsyncGateway, self.langchain.gateway)
         self.agent_id = self.langchain.agent_id
@@ -280,14 +296,17 @@ class LangGraphIntegration:
         holds = state.get("authfi_holds") or []
         if not holds:
             return {}
-        decision = interrupt(
-            {
-                "authfi_approvals": [
-                    {"approval_id": h["approval_id"], "tool": h["tool"], "args": h["args"]} for h in holds
-                ]
-            }
-        )
-        stop = isinstance(decision, Mapping) and cast(Mapping[str, Any], decision).get("stop") is True
+        undecided = await self._undecided(holds) if self.approval_poll else holds
+        stop = False
+        if undecided:
+            decision = interrupt(
+                {
+                    "authfi_approvals": [
+                        {"approval_id": h["approval_id"], "tool": h["tool"], "args": h["args"]} for h in undecided
+                    ]
+                }
+            )
+            stop = isinstance(decision, Mapping) and cast(Mapping[str, Any], decision).get("stop") is True
         messages: list[ToolMessage] = []
         waiting: list[Hold] = []
         for hold in holds:
@@ -317,6 +336,24 @@ class LangGraphIntegration:
                 )
             )
         return {"messages": messages, "authfi_holds": {"replace": waiting}}
+
+    async def _undecided(self, holds: Sequence[Hold]) -> list[Hold]:
+        """Wait for each hold's approval; the holds nobody decided in ``approval_timeout`` seconds."""
+        tasks = [
+            asyncio.ensure_future(
+                self.gateway.await_approval(
+                    h["approval_id"], timeout=self.approval_timeout, poll_interval=self.poll_interval
+                )
+            )
+            for h in holds
+        ]
+        try:
+            statuses = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            raise
+        return [h for h, status in zip(holds, statuses, strict=True) if status == "pending"]
 
     async def _send_again(self, hold: Hold) -> ToolMessage:
         tool = self._tools.get(hold["tool"])
