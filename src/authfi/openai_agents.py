@@ -510,7 +510,16 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
     for approval (see :meth:`resolve`).
     """
 
-    def __init__(self, gateway: AsyncGateway, *, include_never_allowed: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        gateway: AsyncGateway,
+        *,
+        include_never_allowed: bool = False,
+        approval_poll: bool = False,
+        approval_timeout: float = 900.0,
+        poll_interval: float = 3.0,
+        **kwargs: Any,
+    ) -> None:
         for refused in ("params", "require_approval"):
             if refused in kwargs:
                 raise ConfigurationError(f"{refused} is set by the integration")
@@ -529,6 +538,11 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
         )
         self.gateway = gateway
         self.include_never_allowed = include_never_allowed
+        #: With ``approval_poll``, :meth:`resolve` waits (up to ``approval_timeout`` seconds, polling every
+        #: ``poll_interval``) for a person to decide each held call, with the agent's own token, then sends it again.
+        self.approval_poll = approval_poll
+        self.approval_timeout = approval_timeout
+        self.poll_interval = poll_interval
         self._calls: OrderedDict[str, _Held | _Decided] = OrderedDict()
         self._listed: set[str] = set()
 
@@ -620,11 +634,38 @@ class AuthFIMCPServer(MCPServerStreamableHttp):
             if not isinstance(known, _Decided):
                 known = await self._send(tool, args, known.approval_id if known else None, None)
                 self._remember(key, known)
+            if isinstance(known, _Held) and self.approval_poll:
+                status = await self.gateway.await_approval(
+                    known.approval_id, timeout=self.approval_timeout, poll_interval=self.poll_interval
+                )
+                if status != "pending":
+                    known = await self._send(tool, args, known.approval_id, None)
+                    self._remember(key, known)
             if isinstance(known, _Held):
                 waiting.append(PendingApproval(known.approval_id, tool, args, item))
                 continue
             state.approve(item)
         return waiting
+
+    def held(self) -> list[dict[str, Any]]:
+        """The calls the gateway holds, as data to save beside the run's state: ``approval_id``, ``tool``, ``args``.
+
+        A new process loads the run's state and gives these to :meth:`adopt`, so it resumes the call the
+        person decided instead of raising a second approval. They never go to the model.
+        """
+        out: list[dict[str, Any]] = []
+        for key, entry in self._calls.items():
+            if isinstance(entry, _Held):
+                tool, _, raw = key.partition("\x00")
+                out.append({"approval_id": entry.approval_id, "tool": tool, "args": json.loads(raw)})
+        return out
+
+    def adopt(self, held: Sequence[Mapping[str, Any]]) -> None:
+        """Remember calls saved by :meth:`held` in another process, so :meth:`resolve` sends them with their approval."""
+        for call in held:
+            approval_id, tool, args = call.get("approval_id"), call.get("tool"), call.get("args")
+            if isinstance(approval_id, str) and isinstance(tool, str) and isinstance(args, Mapping):
+                self._remember(_key(tool, cast(Mapping[str, Any], args)), _Held(approval_id))
 
     def _call_of(self, item: ToolApprovalItem) -> tuple[str, dict[str, Any]] | None:
         raw: object = item.raw_item
