@@ -11,14 +11,14 @@ import pytest
 
 pytest.importorskip("agents")
 
-from agents import Agent, ModelSettings, Runner, RunResult
+from agents import Agent, ModelSettings, Runner, RunResult, RunState
 from agents.items import ToolCallOutputItem
 from agents.models.interface import ModelTracing
 from agents.tracing import TracingProcessor
 from agents.tracing.spans import Span
 from agents.tracing.traces import Trace
 
-from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
+from authfi import AgentKey, ApprovalUnavailable, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
 from authfi._protocol.ids import step_traceparent
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from authfi.openai_agents import AuthFIMCPServer, AuthFITraceProcessor, OpenAIAgentsIntegration
@@ -695,3 +695,90 @@ async def test_a_model_call_outside_any_step_is_fresh(fake: FakeGateway, integra
     await _flushed(integration, provider)
 
     assert _step_of(fake.model_requests()[0]["headers"])[2] == "00"
+
+
+# --- approval_poll, and a restart --------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def test_resolve_waits_for_the_person_and_the_run_continues(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
+        integration.configure_tracing()
+        async with integration.mcp_server(approval_poll=True, poll_interval=0.01) as tools:
+            agent, result = await _paused(readable, integration, tools)
+            state = result.to_state()
+
+            resolving = asyncio.ensure_future(tools.resolve(state, result.interruptions))
+            for _ in range(500):
+                if readable.pending():
+                    break
+                await asyncio.sleep(0.01)
+            (approval_id,) = readable.pending()
+            assert not resolving.done()
+            readable.decide(approval_id, "approved")
+            assert await asyncio.wait_for(resolving, 10) == []
+            result = await Runner.run(agent, state, run_config=integration.run_config())
+
+    assert result.final_output == "Finished."
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert approval_id not in _everything_the_model_read(readable)
+
+
+async def test_resolve_returns_a_call_nobody_decided_in_time(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
+        integration.configure_tracing()
+        async with integration.mcp_server(approval_poll=True, poll_interval=0.01, approval_timeout=0.05) as tools:
+            _agent_, result = await _paused(readable, integration, tools)
+            (waiting,) = await tools.resolve(result.to_state(), result.interruptions)
+    assert readable.pending() == [waiting.approval_id]
+
+
+async def test_an_agent_revoked_while_resolve_waits_raises(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
+        integration.configure_tracing()
+        async with integration.mcp_server(approval_poll=True, poll_interval=0.01) as tools:
+            _agent_, result = await _paused(readable, integration, tools)
+            resolving = asyncio.ensure_future(tools.resolve(result.to_state(), result.interruptions))
+            for _ in range(500):
+                if readable.pending():
+                    break
+                await asyncio.sleep(0.01)
+            readable.revoked = True
+            with pytest.raises(ApprovalUnavailable):
+                await asyncio.wait_for(resolving, 10)
+
+
+async def test_a_restarted_process_resumes_a_saved_run_with_the_approval(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = OpenAIAgentsIntegration(af.agent(AGENT, key))
+        integration.configure_tracing()
+        async with integration.mcp_server() as tools:
+            _agent_, result = await _paused(readable, integration, tools)
+            (waiting,) = await tools.resolve(result.to_state(), result.interruptions)
+            saved = json.dumps({"state": result.to_state().to_json(), "held": tools.held()})
+    assert waiting.approval_id in saved
+    readable.decide(waiting.approval_id, "approved")
+
+    async with AsyncAuthFI(readable.issuer) as af2:  # a new process: nothing but the saved text carries over
+        integration = OpenAIAgentsIntegration(af2.agent(AGENT, key))
+        integration.configure_tracing()
+        async with integration.mcp_server() as tools:
+            agent = _agent(integration, tools)
+            loaded = json.loads(saved)
+            state = await RunState.from_json(agent, loaded["state"])
+            tools.adopt(loaded["held"])
+            assert await tools.resolve(state, state.get_interruptions()) == []
+            result = await Runner.run(agent, state, run_config=integration.run_config())
+
+    assert result.final_output == "Finished."
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert len(readable.approvals) == 1  # the saved approval was used; no second one was raised
+    assert waiting.approval_id not in _everything_the_model_read(readable)
