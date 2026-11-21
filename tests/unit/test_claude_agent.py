@@ -5,6 +5,7 @@ The gateway is the real-HTTP stand-in; Claude Code itself is not started.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -1130,3 +1131,56 @@ def test_a_value_nested_too_deep_is_refused_and_a_real_nesting_is_not() -> None:
         AgentNames().rewrite(_nested_depth(MAX_DEPTH + 10), "")
     assert (refused.value.status, refused.value.kind) == (413, "too-deep")
     assert b"claude_code" in AgentNames().rewrite(_nested_depth(3), "")
+
+
+# --- a wait that does not end, and one that fails ---------------------------------------------------
+
+
+async def test_a_wait_that_never_ends_is_refused_and_the_approval_stays_open(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    async def never(pending: PendingApproval) -> None:
+        await asyncio.Event().wait()
+
+    claude = ClaudeAgentIntegration(
+        af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=never, approval_timeout=0.05
+    )
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert decision.interrupt is False
+    assert "did not come in time" in decision.message
+    (approval_id,) = fake.pending()
+    assert approval_id not in decision.message
+    fake.decide(approval_id, "approved")
+    assert isinstance(await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT), PermissionResultAllow)
+
+
+async def test_a_wait_that_fails_is_refused_to_the_model_without_its_error(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    def broken(pending: PendingApproval) -> None:
+        raise RuntimeError("poll failed for " + pending.approval_id)
+
+    claude = ClaudeAgentIntegration(af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=broken)
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert "could not be checked" in decision.message
+    (approval_id,) = fake.pending()
+    assert approval_id not in decision.message
+    assert fake.tool_calls == []
+
+
+async def test_a_wait_that_finds_the_agent_revoked_stops_the_run(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    def revoked(pending: PendingApproval) -> None:
+        fake.revoked = True
+
+    claude = ClaudeAgentIntegration(af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=revoked)
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert decision.interrupt is True
+    assert isinstance(claude.token_refused, GatewayTokenRefused)

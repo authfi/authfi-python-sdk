@@ -37,6 +37,7 @@ in its environment.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -172,6 +173,9 @@ _TRACE_SWITCHES = {
 #: How long it remembers one. A call nobody ran is forgotten, so a later identical call is sent afresh.
 MEMORY_SECONDS = 120.0
 
+#: How long ``wait_for_decision`` may take before the call is refused for now (the approval stays open).
+APPROVAL_TIMEOUT = 900.0
+
 #: Returns, or resolves, once the person has decided; its value is not read: the gateway decides.
 WaitForDecision = Callable[["PendingApproval"], object]
 CanUseTool = Callable[
@@ -193,7 +197,9 @@ class ClaudeAgentIntegration:
         wait_for_decision: awaited with a :class:`PendingApproval` when the gateway holds a call;
             return once the person has decided in AuthFI. Without it, a held call is refused for now
             with "This action is waiting for a person's approval in AuthFI.", and the same call made later is
-            sent with the approval.
+            sent with the approval. It is given ``approval_timeout`` seconds; after that, or if it fails, the
+            call is refused for now (never run) and the approval stays open. A refused token ends the run.
+        approval_timeout: seconds ``wait_for_decision`` may take.
         project: the project, for a credential of your own that does not name it.
         server_name: the name of the gateway's MCP server in Claude Code.
 
@@ -204,6 +210,7 @@ class ClaudeAgentIntegration:
         source: AsyncAgentAuth,
         *,
         wait_for_decision: WaitForDecision | None = None,
+        approval_timeout: float = APPROVAL_TIMEOUT,
         project: AsyncAuthFI | None = None,
         server_name: str = "authfi",
     ) -> None:
@@ -233,6 +240,7 @@ class ClaudeAgentIntegration:
         self.gateway = async_gateway_for(cast(AsyncTokenSource, source), project)
         self.agent_id = source.agent_id
         self.wait_for_decision = wait_for_decision
+        self.approval_timeout = approval_timeout
         self.server_name = server_name
         self.prefix = f"mcp__{server_name}__"
         #: The gateway's refusal of the token, once it happened: the run was stopped.
@@ -378,9 +386,10 @@ class ClaudeAgentIntegration:
             if not isinstance(known, Decided):
                 known = await self._send(tool, args, known.approval_id if isinstance(known, Held) else None, asked_by)
             if isinstance(known, Held) and self.wait_for_decision is not None:
-                decided = self.wait_for_decision(PendingApproval(known.approval_id, tool, args))
-                if inspect.isawaitable(decided):
-                    await decided
+                waited = await self._wait(self.wait_for_decision, PendingApproval(known.approval_id, tool, args))
+                if waited is not None:
+                    self._calls.remember(tool, args, known)
+                    return PermissionResultDeny(message=waited)
                 known = await self._send(tool, args, known.approval_id, asked_by)
         except GatewayTokenRefused as refused:
             return PermissionResultDeny(message=str(refused), interrupt=True)
@@ -388,6 +397,40 @@ class ClaudeAgentIntegration:
         if isinstance(known, Held):
             return PermissionResultDeny(message=HOLD_MESSAGE)
         return PermissionResultAllow(updated_input=args)
+
+    async def _wait(self, wait: WaitForDecision, pending: PendingApproval) -> str | None:
+        """Run ``wait_for_decision``; the words to refuse the call with if it timed out or failed, else ``None``.
+
+        A refused token (the agent was revoked while it waited) is raised, so the run ends.
+        """
+        logger = self.gateway.project.logger
+
+        async def run() -> None:
+            decided = wait(pending)
+            if inspect.isawaitable(decided):
+                await decided
+
+        try:
+            await asyncio.wait_for(run(), self.approval_timeout)
+        except TimeoutError:
+            logger.info(
+                "approval %s was not decided in %s seconds for %s",
+                pending.approval_id,
+                self.approval_timeout,
+                pending.tool,
+            )
+            return (
+                f"The approval for {pending.tool} did not come in time, so the action did not run. "
+                "It still waits for the person."
+            )
+        except Exception as error:
+            refused = token_refusal(error)
+            if refused is not None:
+                self.token_refused = refused
+                raise refused from error
+            logger.warning("waiting for approval %s failed: %s", pending.approval_id, type(error).__name__)
+            return f"The approval for {pending.tool} could not be checked, so the action did not run."
+        return None
 
     async def _subagent_started(
         self, input_data: HookInput, tool_use_id: str | None, context: HookContext
