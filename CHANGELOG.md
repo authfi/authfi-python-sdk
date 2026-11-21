@@ -20,7 +20,9 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - Every tool call through the gateway client carries one `Idempotency-Key`: fresh for each logical call, the same on
   every attempt of it (a nonce challenge, a refused token, a server error). A test runs a whole task, a handover and a
   takeover and finds no run key in the environment, any file, any log, an error report or any byte the gateway received.
-
+- `ClaudeAgentIntegration(approval_timeout=...)`: `wait_for_decision` now has a time limit (900 seconds), and a wait that
+  raises no longer escapes `can_use_tool`. Either way the call is refused for now, never run, and the approval stays
+  open; a refused token still ends the run.
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login]"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`

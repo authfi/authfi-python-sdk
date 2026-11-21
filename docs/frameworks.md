@@ -386,7 +386,10 @@ gateway's tools to the permission flow, so `can_use_tool` always runs for them;
 
 Without `wait_for_decision`, a held call is refused for now with "This action is waiting for a
 person's approval in AuthFI."; the same call made after the person decides goes with the approval. The
-approval id never reaches the model, and one the model writes is removed. `can_use_tool` never
+approval id never reaches the model, and one the model writes is removed. `wait_for_decision` has
+`approval_timeout` seconds (default 900): when they pass, or it raises, the call is refused for now and never
+run, the approval stays open, and the same call made later goes with it. If it finds the agent's token refused,
+the run ends. `can_use_tool` never
 grants a lasting permission. Tools that are not AuthFI's are refused, unless you pass your own
 `can_use_tool` to `options()`, which then decides them.
 
