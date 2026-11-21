@@ -6,7 +6,7 @@ the caller and whose actor is the agent.
 
 Run it::
 
-    pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+    pip install "authfi"
     cp .env.example .env    # then fill it in
     python voice_refund.py priya@acme.com 4411
 """

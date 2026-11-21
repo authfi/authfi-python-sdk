@@ -1,6 +1,6 @@
 """LangChain: the AuthFI AI gateway for any chat model, with a Claude model ready made.
 
-``pip install "authfi[langchain] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[langchain]"``
 
 ::
 
@@ -32,7 +32,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.langchain needs langchain-core: "
-        "pip install 'authfi[langchain] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[langchain]'"
     ) from exc
 
 if TYPE_CHECKING:

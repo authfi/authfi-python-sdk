@@ -1,6 +1,6 @@
 """Pydantic AI: Claude on the AI gateway, the gateway's governed tools, approvals through deferred tools.
 
-``pip install "authfi[pydantic-ai] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[pydantic-ai]"``
 
 ::
 
@@ -63,7 +63,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.pydantic_ai needs Pydantic AI with MCP: "
-        "pip install 'authfi[pydantic-ai] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[pydantic-ai]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of

@@ -2,7 +2,7 @@
 
 Run it::
 
-    pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+    pip install "authfi"
     cp .env.example .env    # then fill it in
     python refund_with_gate.py 4411 120
 """

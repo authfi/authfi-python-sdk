@@ -15,7 +15,7 @@ credential.
 ## Run it
 
 ```bash
-pip install "authfi[langchain-anthropic] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langchain-anthropic]"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python summarise.py

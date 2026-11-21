@@ -1,6 +1,6 @@
 """Google ADK: the model's credential, the gateway's tools, approvals through ADK's tool confirmation.
 
-``pip install "authfi[adk] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[adk]"``
 
 ::
 
@@ -54,7 +54,7 @@ try:
     from pydantic import PrivateAttr
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "authfi.adk needs Google ADK: pip install 'authfi[adk] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "authfi.adk needs Google ADK: pip install 'authfi[adk]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for

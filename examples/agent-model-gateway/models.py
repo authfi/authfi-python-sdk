@@ -5,7 +5,7 @@ api_key, default headers or any setting a tracer records.
 
 Run it::
 
-    pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main" anthropic openai
+    pip install "authfi" anthropic openai
     cp .env.example .env    # then fill it in
     python models.py
 """

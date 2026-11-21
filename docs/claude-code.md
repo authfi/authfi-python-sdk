@@ -5,7 +5,7 @@ sign-in, not a shared key and not a personal Anthropic account. You sign in once
 asks `authfi token --resource llm` for a fresh access token whenever it needs one.
 
 ```bash
-pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[login]"
 authfi login --issuer https://acme.authfi.io
 ```
 

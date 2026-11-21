@@ -1,6 +1,6 @@
 """CrewAI: Claude on the AI gateway, the gateway's governed tools, approvals a crew waits for, steps over OTLP.
 
-``pip install "authfi[crewai] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[crewai]"``
 
 ::
 
@@ -88,7 +88,7 @@ try:
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
         "authfi.crewai needs CrewAI with MCP: "
-        "pip install 'authfi[crewai] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "pip install 'authfi[crewai]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for

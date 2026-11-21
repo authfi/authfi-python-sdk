@@ -1,6 +1,6 @@
 """Flask: protect views with AuthFI access tokens.
 
-``pip install "authfi[flask] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[flask]"``
 
 ::
 
@@ -31,7 +31,7 @@ try:
     from flask import Flask, Response, g, jsonify, request
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "authfi.flask needs Flask: pip install 'authfi[flask] @ git+https://github.com/authfi/authfi-python-sdk@main'"
+        "authfi.flask needs Flask: pip install 'authfi[flask]'"
     ) from exc
 
 from authfi._resource import (

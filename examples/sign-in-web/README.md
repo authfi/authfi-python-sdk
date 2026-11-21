@@ -19,7 +19,7 @@ In the AuthFI console, add a web application with the redirect URI `http://local
 (or your app's address) and the sign-out redirect `http://localhost:8000/`.
 
 ```bash
-pip install "authfi[fastapi] @ git+https://github.com/authfi/authfi-python-sdk@main" uvicorn
+pip install "authfi[fastapi]" uvicorn
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 uvicorn fastapi_app:app --port 8000

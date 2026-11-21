@@ -196,9 +196,8 @@ class KeyringVault:
 
 _NO_STORE = (
     "authfi login keeps your refresh token in the operating system's credential store and will not write it to a "
-    "file: {why}. Install the keyring package (pip install 'authfi[login] @ "
-    "git+https://github.com/authfi/authfi-python-sdk@main'); on Linux it needs a Secret Service such as GNOME "
-    "Keyring or KWallet."
+    "file: {why}. Install the keyring package (pip install 'authfi[login]'); on Linux it needs a Secret Service "
+    "such as GNOME Keyring or KWallet."
 )
 
 #: The backends that keep a secret under the operating system's own protection. Anything else (``keyrings.alt``'s
