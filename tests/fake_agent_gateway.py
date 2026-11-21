@@ -34,6 +34,7 @@ from tests.fake_gateway import ALLOWED, STEP_UP, FakeGateway
 
 CIBA = "urn:openid:params:grant-type:ciba"
 EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
+CHAIN = "urn:authfi:params:oauth:token-type:mandate-chain"
 CLOUD_PATH = "/mcp/v1/cloud/credentials"
 #: The gateway's own tool, as ``tools/list`` advertises it.
 CLOUD_TOOL: dict[str, Any] = {
@@ -105,6 +106,12 @@ class AgentGateway(FakeGateway):
         self.exchanges: list[dict[str, str]] = []
         self.task_requests: list[dict[str, Any]] = []
         self.pending_tasks: dict[str, dict[str, Any]] = {}
+        #: mandate id -> the key that holds the task now (``mandates.holder``): a root of any other key is refused.
+        self.holders: dict[str, str] = {}
+        self.mandates: dict[str, dict[str, Any]] = {}
+        #: Every renewal asked for: its form, and how it was let through (``same_key``, ``signed_by_previous``)
+        self.renewals: list[dict[str, str]] = []
+        self.spent_moves: set[str] = set()
         #: (account, role) -> "allow", "approval", or "forbidden"
         self.cloud_roles: dict[tuple[str, str], str] = {("prod", "deployer"): "allow", ("prod", "admin"): "approval"}
         self.cloud_calls: list[dict[str, Any]] = []
@@ -285,6 +292,10 @@ class AgentGateway(FakeGateway):
                 self.refused_proofs.append("dpop_proof_key_mismatch")
                 return None, unauth
         if info["claims"]["exp"] < time.time():
+            return None, unauth
+        if info["kind"] == "task" and self.holders.get(info["mandate_id"]) != info["jkt"]:
+            # The root of a key the task moved from stops at once, whatever is left of its life.
+            self.refused_proofs.append("task_not_held_by_key")
             return None, unauth
         return info, None
 
@@ -477,6 +488,8 @@ class AgentGateway(FakeGateway):
         grant = form.get("grant_type")
         if grant == EXCHANGE:
             self.exchanges.append(form)
+            if form.get("subject_token_type") == CHAIN:
+                return self._renew(form, jkt)
             return self._exchange(form, jkt)
         if not form.get("client_assertion"):
             return 400, {}, b'{"error":"invalid_request"}'
@@ -586,7 +599,85 @@ class AgentGateway(FakeGateway):
             return 400, {}, json.dumps(body).encode()
         return 200, {}, self._root(mandate, agent, jkt)
 
+    def _renew(self, form: dict[str, str], jkt: str | None) -> tuple[int, dict[str, str], bytes]:
+        """A root renewed, and the task moved to the key of the request when the holder signed the move (design 2.2)."""
+
+        def refuse(code: str, why: str, status: int = 400) -> tuple[int, dict[str, str], bytes]:
+            return status, {}, json.dumps({"error": code, "error_description": why}).encode()
+
+        if jkt is None:
+            return refuse("invalid_grant", "the request carries no proof")
+        claims = jwt.decode(
+            form.get("actor_token", ""), options={"verify_signature": False, "verify_aud": False, "verify_exp": False}
+        )
+        if claims.get("aud") != self.issuer + "/oauth/token" or claims.get("iss") != claims.get("sub"):
+            return refuse("invalid_client", "client authentication failed", 401)
+        if claims["jti"] in self._seen_jti:
+            return refuse("invalid_client", "client authentication failed", 401)
+        self._seen_jti.add(claims["jti"])
+        agent = claims["sub"]
+        (entry,) = json.loads(form["authorization_details"])
+        mandate_id = entry["mandate_id"]
+        root = self.issued.get(form.get("subject_token", ""))
+        if (
+            root is None
+            or root["kind"] != "task"
+            or root["mandate_id"] != mandate_id
+            or root["claims"]["client_id"] != agent
+        ):
+            return refuse("invalid_grant", "the root is not one this agent may renew")
+        if mandate_id in self.ended:
+            return refuse("invalid_grant", "the task is not active")
+        holder = self.holders[mandate_id]
+        if root["jkt"] != holder:
+            return refuse("invalid_grant", "the root was minted for a key that no longer holds this task")
+        if claims.get("cnf", {}).get("jkt") != jkt:
+            return refuse("invalid_grant", "the actor assertion does not name the key that signed the request")
+        how = "same_key"
+        if jkt != holder:
+            move = form.get("authfi_key_move", "")
+            if not move:
+                return refuse("invalid_grant", "a move needs the holder's signed key move here")
+            bad = self._key_move_refusal(move, mandate_id, holder, jkt)
+            if bad is not None:
+                return refuse("invalid_grant", bad)
+            how = "signed_by_previous"
+        self.renewals.append({**form, "how": how})
+        return 200, {}, self._root(self.mandates[mandate_id], agent, jkt)
+
+    def _key_move_refusal(self, move: str, mandate_id: str, holder: str, new_key: str) -> str | None:
+        """Why a key move does not hold, derived from its bytes as the platform does; ``None`` when it does."""
+        header = jwt.get_unverified_header(move)
+        jwk = header.get("jwk")
+        if header.get("typ") != "mandate-key-move+jwt" or not isinstance(jwk, dict) or "d" in jwk:
+            return "the key move is not a mandate-key-move JWS carrying its key"
+        if thumbprint(cast(dict[str, Any], jwk)) != holder:
+            return "the key move is not signed by the key that holds the task"
+        alg = header["alg"]
+        try:
+            payload = jwt.decode(
+                move,
+                jwt.PyJWK(cast(dict[str, Any], jwk), algorithm=alg).key,
+                algorithms=[alg],
+                options={"verify_exp": False, "verify_iat": False, "verify_aud": False},
+            )
+        except jwt.PyJWTError:
+            return "the key move's signature does not verify"
+        now = time.time()
+        if payload.get("mandate_id") != mandate_id or payload.get("jkt") != new_key:
+            return "the key move is for another task or another key"
+        if not payload.get("jti"):
+            return "the key move carries no usable jti"
+        if payload["exp"] <= now or payload["iat"] > now + 5 or payload["exp"] - payload["iat"] > 60:
+            return "the key move is expired or lives longer than a minute"
+        if payload["jti"] in self.spent_moves:
+            return "the key move has already been used"
+        self.spent_moves.add(payload["jti"])
+        return None
+
     def _root(self, mandate: dict[str, Any], agent: str, jkt: str) -> bytes:
+        self.mandates[mandate["id"]] = mandate
+        self.holders[mandate["id"]] = jkt
         template: Template = mandate["template_def"]
         token, _ = self._mint(
             "task",

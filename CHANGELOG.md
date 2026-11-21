@@ -10,6 +10,15 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 
 ### Added
 
+- `Task.hand_over(to=<thumbprint>)` and `AgentAuth.take_over(...)` (and `AsyncAgentAuth.take_over`) give a whole task to
+  another process with no key travelling: the receiver reports `run_key_thumbprint()`, the sender signs a 30-second,
+  single-use key move with its run key and hands over the root and the move (`Handover`, `to_wire()` / `from_wire()`),
+  and the platform renews the root for the receiver's key and stops the sender's. Each refusal is a typed
+  `TakeOverRefused`: `KeyMoveRefused`, `KeyMoveSpent`, `TaskMoved`, `TaskEnded`, `TaskNotYours`, `TakeOverSlowDown`.
+- Every tool call through the gateway client carries one `Idempotency-Key`: fresh for each logical call, the same on
+  every attempt of it (a nonce challenge, a refused token, a server error). A test runs a whole task, a handover and a
+  takeover and finds no run key in the environment, any file, any log, an error report or any byte the gateway received.
+
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login] @ git+https://github.com/authfi/authfi-python-sdk@main"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`

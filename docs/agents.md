@@ -183,6 +183,62 @@ person gives a task. Its credential goes only to AuthFI's origins, does not prin
 pickle. `ClaudeAgentIntegration` does not take a task: Claude Code's own model calls go through a proxy that sends
 the agent's credential, not the task's.
 
+### Handing a task to another process
+
+One process holds a task at a time, under its run key. The run key is made once in the process, kept in memory,
+and never written to a file, logged, put in an environment variable or sent: only its public thumbprint and the
+proofs it signs leave. A forked child makes its own.
+
+To give the whole task to another process, the receiver says which key it holds, the sender signs a move to that
+key, and the platform renews the task's root for the receiver's key. No private key travels.
+
+```python
+# Receiving process
+to = agent.run_key_thumbprint()          # a string; send it to the process that holds the task
+
+# Sending process
+handover = task.hand_over(to=to)         # a Handover: the root and a key move signed by this process's run key
+channel.send(handover.to_wire())         # JSON text; it is a credential, so send it privately and do not log it
+
+# Receiving process, within 30 seconds of the hand over
+task = agent.take_over(channel.receive())      # a Handover, or its to_wire() text
+```
+
+- `hand_over` closes the task in the sender. From then on the sender's own calls raise `ConfigurationError`
+  (`code == "task_closed"`), and once the receiver has taken the task the platform refuses the sender's root
+  although it has life left. A move is good once and for 30 seconds: a second hand over needs a task the sender
+  still holds.
+- The `Handover` holds a root that is bound to the sender's key and a move that names the receiver's key. Neither
+  is a private key, and neither is any use to a process whose run key is not the one named. `repr()` and pickling
+  do not show or take them.
+- `take_over` is refused before it is sent when the handover was made for another key (`ConfigurationError`,
+  `code == "handover_for_another_key"`) or its move has run out. A task is one level deep: `take_over` inside a
+  task is refused as `agent.task` is.
+- The same methods exist on `AsyncAgentAuth` (`await agent.run_key_thumbprint()`, `await agent.take_over(...)`);
+  `hand_over` does no I/O and is a plain call on `AsyncTask` too.
+
+The platform's refusals are typed. Each is a `TakeOverRefused` (an `OAuthError`, `code == "invalid_grant"` unless
+noted) with the platform's reason in `description`:
+
+| Error | The platform said |
+|---|---|
+| `KeyMoveRefused` | the move is not signed by the key that holds the task, is for another task or another key, has expired or lives longer than a minute, or is unreadable |
+| `KeyMoveSpent` | the move has already been used |
+| `TaskMoved` | the root belongs to a key that no longer holds the task, another key took it first, or this key already holds it |
+| `TaskEnded` | the task is not active, or cannot be taken over now |
+| `TaskNotYours` | there is no such task for this agent, or the root is not one this agent may renew |
+| `TakeOverSlowDown` (`code == "slow_down"`) | a move of this task is already asked for, or too many were asked this hour |
+| `TemporarilyUnavailable` | the platform could not check the root or move the task now; ask again |
+| `TakeOverRefused` | any other refusal of a takeover, such as an approval used twice |
+
+### One idempotency key per tool call
+
+Every `tools/call` the gateway client sends carries an `Idempotency-Key` (a UUIDv7): a fresh one for each logical
+call, and the same one on every attempt of it, whether the attempt is sent again after a DPoP nonce challenge, a
+refused token or a server error. A call is named by its MCP session, its JSON-RPC id, its tool and its arguments;
+once the platform has answered it, a later call that looks the same is a new call with a new key. A key you set on
+the request yourself is kept. The gateway uses the key to run a spending call once.
+
 ## Cloud credentials, just in time
 
 ```python

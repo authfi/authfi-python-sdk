@@ -110,6 +110,30 @@ httpx.Client(auth=agent.httpx_auth())          # its own token, for the AuthFI g
 The agent signs a short assertion with a key that never leaves the process; its token is reused
 and renewed before it expires. See [docs/agents.md](docs/agents.md).
 
+## Hand a task to another process
+
+A task is held by the run key of one process, a key that lives in that process's memory and is never written,
+logged, put in an environment variable or sent. To give the whole task to another process, no key travels: the
+receiver says which key it holds, the sender signs a move to it, and the platform moves the task.
+
+```python
+# In the process that will take the task (a worker, a sub-process of your orchestrator):
+to = agent.run_key_thumbprint()                  # the public thumbprint only; send it to the sender
+
+# In the process that holds it:
+wire = task.hand_over(to=to).to_wire()           # the root and a 30-second signed move; send them privately
+
+# Back in the receiver, within 30 seconds:
+with agent.take_over(wire) as task:              # holds the task now; the sender's root stops at once
+    ...
+```
+
+The sender's task is closed from the moment it hands over. `take_over` refuses with a `TakeOverRefused` that
+says why: `KeyMoveRefused` (the move is not the holder's, is for another task or key, or has run out),
+`KeyMoveSpent` (a move is good once), `TaskMoved` (another process took the task first), `TaskEnded`,
+`TaskNotYours` and `TakeOverSlowDown` (too many asks for one task). A platform that cannot decide now raises
+`TemporarilyUnavailable`. Details in [docs/agents.md](docs/agents.md#handing-a-task-to-another-process).
+
 ## Act for a person
 
 ```python

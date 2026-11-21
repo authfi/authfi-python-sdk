@@ -54,9 +54,12 @@ from authfi._protocol.agent import (
     parse_agent_configuration,
     parse_approval,
     parse_ciba_start,
+    parse_take_over,
     parse_task_start,
     parse_transaction_token,
     read_approval_request,
+    take_over_request,
+    task_details,
     task_request,
     transaction_token_request,
     transaction_token_url,
@@ -67,13 +70,14 @@ from authfi._protocol.ids import link_step_owner
 from authfi._protocol.oauth import ClientAuth, TokenResponse, client_credentials_request, parse_token_response
 from authfi.agents._legacy import LegacyAgentMixin, is_legacy_agent, legacy_agent_arguments
 from authfi.agents.keys import Signer, client_assertion
-from authfi.agents.task import AsyncTask, Task, refuse_nested
+from authfi.agents.task import AsyncTask, Handover, Task, refuse_nested
 from authfi.errors import (
     AuthFIDeprecationWarning,
     AuthFIError,
     ConfigurationError,
     ConsentExpired,
     DiscoveryError,
+    KeyMoveRefused,
     NotSupportedError,
     OAuthError,
     WaitTimeout,
@@ -424,6 +428,35 @@ class _AgentBase:
             raise OAuthError(
                 "invalid_response", "the token endpoint answered a task that no key holds: it is not usable", 200
             )
+        return held
+
+    def _take_over_request(self, handover: Handover, key: _dpop.DPoPKey, endpoint: str) -> HttpRequest:
+        """The request that moves ``handover``'s task to ``key``, after the refusals that need no platform."""
+        if handover.to != key.thumbprint:
+            raise ConfigurationError(
+                "this handover was signed for another process's key: ask this process for its run_key_thumbprint() "
+                "and have the sender hand over to that",
+                code="handover_for_another_key",
+            )
+        if self._clock.time() >= handover.expires_at:
+            raise KeyMoveRefused("invalid_grant", "the key move has expired: it lives 30 seconds, ask for a new one")
+        return take_over_request(
+            endpoint,
+            root=handover.root.reveal(),
+            mandate_id=handover.mandate_id,
+            key_move=handover.move.reveal(),
+            actor_assertion=self._task_actor(key),
+            dpop=_dpop.signer(key, self._clock.time),
+        )
+
+    def _taken_over(self, handover: Handover, response: TokenResponse, key: _dpop.DPoPKey) -> _dpop.DPoPKey:
+        """The key that holds the task the platform answered, which must be the one that was handed over."""
+        held = self._task_root(response, key)
+        if task_details(response).mandate_id != handover.mandate_id:
+            raise OAuthError(
+                "invalid_response", "the token endpoint answered a different task than was handed over", 200
+            )
+        self._log.info("agent %s took over task %s", self.agent_id, handover.mandate_id)
         return held
 
     def _pending_task(self, pending: TaskPending) -> TaskPending:
@@ -1186,6 +1219,30 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
         self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
         return task
 
+    def run_key_thumbprint(self) -> str:
+        """The thumbprint of this process's run key: what a sender hands a task over to (:meth:`Task.hand_over`).
+
+        The public half only. The key itself is made once in this process, stays in its memory, and is never
+        written, logged or sent.
+        """
+        return self._task_key(self.project.metadata()).thumbprint
+
+    def take_over(self, handover: Handover | str) -> Task:
+        """Hold a task another process handed over, under this process's run key.
+
+        ``handover`` is what the sender's :meth:`Task.hand_over` made, or the text of its ``to_wire()``. The
+        platform renews the task's root for this key on the sender's signed key move, and from then on refuses the
+        sender's root. A refusal is a :class:`~authfi.TakeOverRefused` (see its subclasses). A task is one level
+        deep: this is refused inside one.
+        """
+        refuse_nested()
+        handed = Handover.from_wire(handover) if isinstance(handover, str) else handover
+        metadata = self.project.metadata()
+        key = self._task_key(metadata)
+        request = self._take_over_request(handed, key, metadata.token_endpoint)
+        response = parse_take_over(self._send(request))
+        return Task(self, response, self._taken_over(handed, response, key), self._clock.time)
+
     def task(
         self,
         template: str,
@@ -1649,6 +1706,20 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         task = AsyncTask(self, response, self._task_root(response, key), self._clock.time)
         self._log.info("agent %s holds task %s", self.agent_id, task.mandate_id)
         return task
+
+    async def run_key_thumbprint(self) -> str:
+        """See :meth:`AgentAuth.run_key_thumbprint`."""
+        return self._task_key(await self.project.metadata()).thumbprint
+
+    async def take_over(self, handover: Handover | str) -> AsyncTask:
+        """See :meth:`AgentAuth.take_over`."""
+        refuse_nested()
+        handed = Handover.from_wire(handover) if isinstance(handover, str) else handover
+        metadata = await self.project.metadata()
+        key = self._task_key(metadata)
+        request = self._take_over_request(handed, key, metadata.token_endpoint)
+        response = parse_take_over(await self._send(request))
+        return AsyncTask(self, response, self._taken_over(handed, response, key), self._clock.time)
 
     async def task(
         self,

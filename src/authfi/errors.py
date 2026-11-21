@@ -34,10 +34,17 @@ __all__ = [
     "InvalidIdToken",
     "InvalidPendingSignIn",
     "InvalidToken",
+    "KeyMoveRefused",
+    "KeyMoveSpent",
     "KnownCode",
     "NotSupportedError",
     "OAuthError",
     "StepUpRequired",
+    "TakeOverRefused",
+    "TakeOverSlowDown",
+    "TaskEnded",
+    "TaskMoved",
+    "TaskNotYours",
     "TemporarilyUnavailable",
     "TransportError",
     "WaitTimeout",
@@ -224,6 +231,42 @@ class ConsentDenied(OAuthError):
 
 class ConsentExpired(OAuthError):
     """The person's consent ran out: the CIBA request expired, or a delegated token outlived it."""
+
+
+class TakeOverRefused(OAuthError):
+    """The platform refused to move a task to this process's key (:meth:`~authfi.AgentAuth.take_over`).
+
+    Each refusal the platform documents is a subclass; this base is also what an ``invalid_grant`` the SDK
+    has no subclass for raises, with the platform's own words in :attr:`~OAuthError.description`.
+    """
+
+
+class KeyMoveRefused(TakeOverRefused):
+    """The key move the sender signed does not hold.
+
+    It is not signed by the key that holds the task, names another task or another key, has expired (a move
+    lives 30 seconds) or is not readable. A new one comes from a new hand over.
+    """
+
+
+class KeyMoveSpent(TakeOverRefused):
+    """The key move was already used. A move is good once; the task is held by whichever process used it."""
+
+
+class TaskMoved(TakeOverRefused):
+    """The root belongs to a key that no longer holds the task, or another process took the task first."""
+
+
+class TaskEnded(TakeOverRefused):
+    """The task is not active: it ended, or reached its deadline."""
+
+
+class TaskNotYours(TakeOverRefused):
+    """There is no such task for this agent, or the root is not one this agent may renew."""
+
+
+class TakeOverSlowDown(TakeOverRefused):
+    """Too many takeovers of this task were asked for (one open at a time, five an hour). Wait before asking again."""
 
 
 class WaitTimeout(AuthFIError):
