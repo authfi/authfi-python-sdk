@@ -20,7 +20,10 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - Every tool call through the gateway client carries one `Idempotency-Key`: fresh for each logical call, the same on
   every attempt of it (a nonce challenge, a refused token, a server error). A test runs a whole task, a handover and a
   takeover and finds no run key in the environment, any file, any log, an error report or any byte the gateway received.
-
+- A workload-bound instance can ask for a task: `request_task` and `await_task` on `InstanceAuth` and `AsyncInstanceAuth` send the
+  instance's own access token as the actor (`actor_token_type` the access-token type) in place of a client assertion, which an
+  instance holds no key to sign, and the task is held by the instance's own key, the one that signs the request's proof.
+  Before this a bound agent, the only kind that can be registered, raised `instance_assertion` when it asked for a task.
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login]"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`
