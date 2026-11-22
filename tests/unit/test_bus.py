@@ -33,7 +33,7 @@ class FakeBus:
         self._reject = reject
         self._listener = socket.socket(socket.AF_UNIX)
         self._listener.bind(address)
-        self._listener.listen(256)  # the swap test opens 120 connections faster than the accept loop takes them
+        self._listener.listen(socket.SOMAXCONN)
         self._listener.settimeout(0.2)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._accept, daemon=True)
