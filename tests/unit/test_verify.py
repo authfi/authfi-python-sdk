@@ -360,6 +360,8 @@ def test_a_tampered_payload_does_not_verify(verify: Any, platform: Platform) -> 
         ["https://acme.authfi.io"],
         ["https://acme.authfi.io/mcp"],
         ["https://acme.authfi.io/mcp/v1"],
+        ["https://acme.authfi.io/llm"],
+        ["https://acme.authfi.io/llm/v1"],
         ["authfi-console"],
         ["authfi-workspace"],
         ["api_orders", "https://acme.authfi.io/mcp"],

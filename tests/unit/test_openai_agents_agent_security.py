@@ -77,7 +77,7 @@ async def test_the_model_and_the_tools_prove_the_key_and_answer_a_nonce(
     assert model and all(r["headers"]["authorization"].startswith("DPoP ") and "dpop" in r["headers"] for r in model)
     assert gw.nonce_challenges >= 2 and gw.refused_proofs == []
     paths = {p["path"] for p in gw.proofs}
-    assert {"/mcp", "/mcp/v1/messages"} <= paths
+    assert {"/mcp", "/llm/v1/messages"} <= paths
 
 
 async def test_a_model_call_that_is_the_first_to_meet_a_new_nonce_answers_it_once(
@@ -85,6 +85,7 @@ async def test_a_model_call_that_is_the_first_to_meet_a_new_nonce_answers_it_onc
 ) -> None:
     """LiteLLM is given the proof in a header, so the adapter answers the nonce itself."""
     await integration.gateway.source.token()
+    await integration.gateway.llm_source.token()  # the model token is minted before the nonce changes
     challenges = gw.nonce_challenges
     gw._nonce = "nonce-rotated"
 
@@ -130,6 +131,6 @@ async def test_inside_a_task_a_call_outside_it_reaches_the_model_with_what_it_ca
     assert "Use a tool the task allows" in read and "new task" not in read.lower()
     assert result.final_output == "I will stop here."
     carried = {
-        r["headers"]["authorization"].split(" ", 1)[1] for r in gw.requests if r["path"] in {"/mcp", "/mcp/v1/messages"}
+        r["headers"]["authorization"].split(" ", 1)[1] for r in gw.requests if r["path"] in {"/mcp", "/llm/v1/messages"}
     }
     assert {gw.issued[t]["kind"] for t in carried} == {"task"}

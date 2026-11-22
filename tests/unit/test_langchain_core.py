@@ -22,7 +22,7 @@ def integration() -> Iterator[LangChainIntegration]:
 
 def test_the_integration_holds_the_gateway_for_any_chat_model(integration: LangChainIntegration) -> None:
     assert integration.agent_id == "agt_core1"
-    assert integration.gateway.model_base_url("anthropic").endswith("/mcp")
+    assert integration.gateway.model_base_url("anthropic").endswith("/llm")
 
 
 def test_a_claude_model_without_langchain_anthropic_says_which_extra_to_install(

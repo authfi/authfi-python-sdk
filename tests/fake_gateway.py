@@ -8,7 +8,9 @@ It speaks the wire the platform speaks today:
 - ``/mcp``: MCP over streamable HTTP with JSON answers, tool names ``<server>__<tool>``, a refusal
   as an ``isError`` result with ``_meta["io.authfi/refusal"]``, a hold as the gateway's exact
   "Waiting for approval ..." text;
-- ``/mcp/v1/messages``: the Anthropic Messages API, playing back ``model_script``;
+- ``/llm/v1/messages`` and ``/llm/v1/chat/completions``: the Anthropic and OpenAI APIs, playing back ``model_script``;
+- one door per token: a token requested with ``resource=<issuer>/llm`` is refused on ``/mcp`` and ``/otlp``, and any
+  other on ``/llm`` (kept in ``wrong_door``); a request naming two resources is refused at the token endpoint;
 - the approval address, which answers 403 unless ``approvals_readable``.
 
 A bearer starting with ``tok-`` is accepted; anything else gets 401. Every request is kept.
@@ -52,6 +54,12 @@ class FakeGateway:
         self.approvals_readable = approvals_readable
         self.token_lifetime = token_lifetime
         self.minted: list[str] = []
+        #: The ``resource`` each token was requested with (``None``: none given, the tool door), by token.
+        self.token_resources: dict[str, str | None] = {}
+        #: Every ``resource`` asked for at the token endpoint, in order.
+        self.mint_resources: list[str | None] = []
+        #: ``(path, resource)`` of each call refused because its token was minted for the other door.
+        self.wrong_door: list[tuple[str, str | None]] = []
         self.requests: list[dict[str, Any]] = []
         self.approvals: dict[str, dict[str, Any]] = {}
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
@@ -210,14 +218,26 @@ class FakeGateway:
     def _authorized(self, headers: dict[str, str]) -> bool:
         return not self.revoked and headers.get("authorization", "").startswith("Bearer tok-")
 
+    def _wrong_door(self, path: str, resource: str | None) -> bool:
+        """Whether a token requested with ``resource`` is refused at ``path``: each door takes its own and no other."""
+        llm = self.issuer + "/llm"
+        if path == "/llm" or path.startswith("/llm/"):
+            return resource != llm
+        return resource == llm
+
     def _post(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, str], bytes]:
         if path == "/oauth/token":
-            form = {k: v[0] for k, v in parse_qs(body.decode()).items()}
+            parsed = parse_qs(body.decode())
+            form = {k: v[0] for k, v in parsed.items()}
             if form.get("grant_type") != "client_credentials" or not form.get("client_assertion"):
                 return 400, {}, b'{"error":"invalid_request"}'
+            if len(parsed.get("resource", [])) > 1:
+                return 400, {}, b'{"error":"invalid_target","error_description":"one resource per token"}'
             with self._lock:
                 token = f"tok-minted-{len(self.minted) + 1}"
                 self.minted.append(token)
+                self.token_resources[token] = form.get("resource")
+                self.mint_resources.append(form.get("resource"))
             return (
                 200,
                 {},
@@ -229,12 +249,22 @@ class FakeGateway:
                 {"WWW-Authenticate": 'Bearer error="invalid_token", error_description="revoked"'},
                 (b'{"error":"invalid_token"}'),
             )
+        token = headers.get("authorization", "").partition(" ")[2]
+        if self._wrong_door(path, self.token_resources.get(token)):
+            self.wrong_door.append((path, self.token_resources.get(token)))
+            return (
+                401,
+                {"WWW-Authenticate": 'Bearer error="invalid_token", error_description="wrong door"'},
+                b'{"error":"invalid_token"}',
+            )
         if path == "/otlp/v1/traces":
             return 200, {"Content-Type": "application/x-protobuf"}, b""
-        if path.endswith("/v1/messages"):
+        if path == "/llm/v1/messages":
             return self._model(json.loads(body))
-        if path.endswith("/v1/chat/completions"):
+        if path == "/llm/v1/chat/completions":
             return self._chat(json.loads(body))
+        if path == "/llm" or path.startswith(("/llm/", "/mcp/v1/")):
+            return 404, {}, b'{"error":"not_found"}'
         message = cast(dict[str, Any], json.loads(body))
         method, rid = message.get("method"), message.get("id")
         if rid is None:

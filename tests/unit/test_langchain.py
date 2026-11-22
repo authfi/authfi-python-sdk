@@ -70,7 +70,7 @@ def test_the_model_calls_the_gateway_with_the_agents_token(
 
     assert answer.content == "Refund sent."
     (request,) = fake.model_requests()
-    assert request["path"] == "/mcp/v1/messages"
+    assert request["path"] == "/llm/v1/messages"
     assert request["headers"]["authorization"] == "Bearer tok-minted-1"
     assert request["headers"]["x-request-id"].startswith(f"{integration.run_id}.")
     assert request["json"]["model"] == "claude-haiku-5-5"
@@ -260,9 +260,12 @@ def test_export_steps_sends_the_runs_to_authfi_and_not_to_langsmith(
     assert steps, "LangChain's run reached AuthFI as spans"
     assert all(s["attributes"]["authfi.agent_id"] == AGENT for s in steps)
     assert all(s["attributes"]["authfi.run_id"] == agent.run_id for s in steps)
-    assert all(s["headers"]["authorization"] == "Bearer tok-minted-1" for s in steps)
+    tool_token = next(token for token, resource in fake.token_resources.items() if resource is None)
+    assert all(
+        s["headers"]["authorization"] == "Bearer " + tool_token for s in steps
+    )  # the tool door's, not the model's
     posted = b"".join(r["body"] for r in fake.requests if r["path"] == "/otlp/v1/traces")
-    assert fake.minted[0].encode() not in posted
+    assert all(token.encode() not in posted for token in fake.minted)
     assert (b"99417" in posted) is capture_content
 
 

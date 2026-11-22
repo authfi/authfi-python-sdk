@@ -439,7 +439,7 @@ class AuthFIModel(LitellmModel):
 
     async def _with_token(self, settings: ModelSettings) -> ModelSettings:
         url = self.gateway.model_base_url("anthropic") + "/v1/messages"
-        headers = {**(settings.extra_headers or {}), **(await self.gateway.source.headers("POST", url))}
+        headers = {**(settings.extra_headers or {}), **(await self.gateway.headers("POST", url))}
         return dataclasses.replace(settings, extra_headers=headers)
 
     @override

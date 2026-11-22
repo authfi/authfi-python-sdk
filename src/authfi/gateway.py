@@ -1,8 +1,10 @@
 """The AuthFI gateways, read the same way by every framework adapter.
 
-``<issuer>/mcp`` is the MCP gateway (governed tools) and the AI gateway (model calls). A
-:class:`Gateway` gives an agent's credential to any HTTP client that talks to them, reads what the
-gateway answered (:class:`ToolOutcome`), and asks for cloud credentials::
+``<issuer>/mcp`` is the MCP gateway (governed tools) and ``<issuer>/llm`` is the AI gateway (model calls).
+Each door takes only a token minted for it, so a :class:`Gateway` holds two tokens on one key (one run): the
+credential's own for ``/mcp`` and a second, requested with ``resource=<issuer>/llm``, for ``/llm``. It gives
+them to any HTTP client that talks to the gateways, each to its own door and never to the other, reads what
+the gateway answered (:class:`ToolOutcome`), and asks for cloud credentials::
 
     gateway = agent.gateway()
     client = gateway.http_client()                 # the current token on every request; no redirects
@@ -29,16 +31,19 @@ from authfi._decision_span import record_decision
 from authfi._log import warn_once
 from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
-    CLOUD_PATH,
     HOLD_MESSAGE,
     CloudCredential,
+    CloudHandle,
     ToolAllowed,
     ToolApprovalRequired,
     ToolOutcome,
     ToolRefused,
-    cloud_request,
+    cloud_issue_request,
+    cloud_redeem_request,
+    cloud_redeem_url,
     governance_of,
-    parse_cloud,
+    parse_cloud_handle,
+    parse_cloud_secret,
     read_result,
     scope_of,
     strip_approval_argument,
@@ -48,7 +53,7 @@ from authfi._protocol.http import HttpRequest
 from authfi._protocol.ids import inject_traceparent, request_id, step_traceparent, valid_traceparent
 from authfi._transport import user_agent
 from authfi.errors import ConfigurationError, GatewayTokenRefused
-from authfi.tokens import AsyncTokenSource, TokenSource
+from authfi.tokens import AsyncTokenSource, TokenSource, door_auth
 
 if TYPE_CHECKING:
     from authfi.client import AsyncAuthFI, AuthFI
@@ -73,8 +78,8 @@ __all__ = [
 
 ModelApi = Literal["anthropic", "openai"]
 
-#: Where the AI gateway's model routes begin, under the gateway's resource.
-MODEL_PATH_PREFIX = "/mcp/v1/"
+#: Where the AI gateway's model routes begin, under its own resource (``<issuer>/llm``).
+MODEL_PATH_PREFIX = "/llm/v1/"
 
 #: The JSON-RPC error an MCP client gets when the gateway refuses the token (see ``mcp_client_factory``).
 TOKEN_REFUSED_RPC_CODE = -32001
@@ -324,17 +329,30 @@ class AsyncCloudAccess:
 class _GatewayBase:
     def __init__(self, project: AuthFI | AsyncAuthFI) -> None:
         self._project = project
-        #: ``<issuer>/mcp``: the MCP gateway, and the base URL of the Anthropic API on the AI gateway.
+        #: ``<issuer>/mcp``: the MCP gateway (governed tools), with the cloud credential secret door under it.
         self.mcp_url = project.issuer + "/mcp"
         self._mcp_path = urlsplit(self.mcp_url).path
+        #: ``<issuer>/llm``: the AI gateway (model calls), the resource of the model token.
+        self.llm_url = project.issuer + "/llm"
+        self._llm_path = urlsplit(self.llm_url).path
 
     def model_base_url(self, api: ModelApi) -> str:
-        """The base URL to give a provider SDK: ``<issuer>/mcp`` for Anthropic, ``<issuer>/mcp/v1`` for OpenAI."""
+        """The base URL to give a provider SDK: ``<issuer>/llm`` for Anthropic, ``<issuer>/llm/v1`` for OpenAI."""
         if api == "anthropic":
-            return self.mcp_url
+            return self.llm_url
         if api == "openai":
-            return self.mcp_url + "/v1"
+            return self.llm_url + "/v1"
         raise ConfigurationError(f"the AI gateway speaks the anthropic and openai APIs, not {api!r}")
+
+    def _on_llm_door(self, path: str) -> bool:
+        """Whether ``path`` is under the AI gateway's resource, so it takes the model token and nothing else."""
+        return path == self._llm_path or path.startswith(self._llm_path + "/")
+
+    def _no_llm_token(self) -> ConfigurationError:
+        return ConfigurationError(
+            f"{type(getattr(self, 'source', None)).__name__} cannot make a token for the AI gateway ({self.llm_url}), "
+            "which refuses the token meant for the tool gateway. Use an agent or a machine client for model calls."
+        )
 
     @staticmethod
     def scope_of(tool: object) -> str | None:
@@ -425,11 +443,11 @@ class _GatewayBase:
             return
         warn_once(
             self._project.logger,
-            ("model-call-unproven", self.mcp_url),
+            ("model-call-unproven", self.llm_url),
             "a model call to %s carries a Bearer token and no DPoP proof; the AI gateway refuses such a call once its "
             "proof check (MCP_MODEL_PROOF_CHECK) is enforced, unless the workload is caged. Use a credential that is "
             "bound to this process's key (authfi.connect(), or agent(..., dpop=True)).",
-            self.mcp_url,
+            self.llm_url,
         )
 
     def _now(self) -> float:
@@ -445,10 +463,32 @@ class Gateway(_GatewayBase):
         super().__init__(project)
         self.project = project
         self.source = source
+        self._llm: TokenSource | bool | None = False
         self._clients: dict[str, Any] = {}
         #: Short-lived cloud credentials: ``gateway.cloud.credentials(account, role)``.
         self.cloud = CloudAccess(self)
         project._track(self)  # pyright: ignore[reportPrivateUsage]
+
+    @property
+    def llm_source(self) -> TokenSource:
+        """The credential's token for ``<issuer>/llm``.
+
+        Requested with that resource on the same key and cached apart from :attr:`source`'s. Raises
+        :class:`~authfi.ConfigurationError` for a credential that cannot make one.
+        """
+        if self._llm is False:
+            self._llm = self.source.for_llm(self.llm_url)
+        if self._llm is None:
+            raise self._no_llm_token()
+        return cast(TokenSource, self._llm)
+
+    def _source_for(self, path: str) -> TokenSource:
+        """The credential whose token ``path`` takes: the model token under ``/llm``, the tool token anywhere else."""
+        return self.llm_source if self._on_llm_door(path) else self.source
+
+    def headers(self, method: str, url: str) -> dict[str, str]:
+        """The headers that carry the right token to ``url``: the model token under ``/llm``, else the tool token."""
+        return self._source_for(urlsplit(url).path).headers(method, url)
 
     @overload
     def http_client(self) -> httpx.Client: ...
@@ -485,7 +525,7 @@ class Gateway(_GatewayBase):
             self._stamp(request)
 
         return package.Client(
-            auth=self.source.httpx_auth(package),
+            auth=door_auth(package, self.source, self._source_for),
             follow_redirects=False,
             timeout=timeout
             if timeout is not None
@@ -509,11 +549,9 @@ class Gateway(_GatewayBase):
         once a person has decided. A refusal raises :class:`~authfi.APIError` with the gateway's
         code. The platform caps ``expires_in``.
         """
-        api_origin = self.project.resolve_api_origin()
-        url = api_origin + CLOUD_PATH
-        authorization, proof = _proofless(self.source.headers("POST", url))
-        request = cloud_request(
-            api_origin,
+        authorization, proof = _proofless(self.source.headers("POST", self.mcp_url))
+        request = cloud_issue_request(
+            self.mcp_url,
             authorization,
             account=account,
             role=role,
@@ -522,14 +560,30 @@ class Gateway(_GatewayBase):
             approval_id=approval_id,
             dpop=proof,
         )
-        response = self.project._transport.send(self._stepped(request))  # pyright: ignore[reportPrivateUsage]
+        transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
+        response = transport.send(self._stepped(request))
         if response.status == 401:
-            raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
-        credential, held = parse_cloud(response, self._now())
+            raise GatewayTokenRefused(
+                self.mcp_url, response.header("WWW-Authenticate"), request_id=response.answer_request_id
+            )
+        handle, held = parse_cloud_handle(response)
         if held is not None:
             self.project.logger.info("cloud credentials for %s wait for approval %s", role, held)
             return CloudCredentialOutcome("approval_required", approval_id=held)
-        return CloudCredentialOutcome("issued", credential=credential)
+        return CloudCredentialOutcome("issued", credential=self._redeem(handle))
+
+    def _redeem(self, handle: CloudHandle | None) -> CloudCredential:
+        """The secret of an issued handle, fetched once with the credential that was issued it."""
+        if handle is None:  # pragma: no cover - parse_cloud_handle returns a handle or an approval
+            raise ConfigurationError("no cloud credential handle to redeem")
+        url = cloud_redeem_url(self.mcp_url, handle.credential_id)
+        authorization, proof = _proofless(self.source.headers("POST", url))
+        response = self.project._transport.send(  # pyright: ignore[reportPrivateUsage]
+            self._stepped(cloud_redeem_request(url, authorization, proof))
+        )
+        if response.status == 401:
+            raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
+        return parse_cloud_secret(response, handle, self._now())
 
     def close(self) -> None:
         """Close the HTTP clients this gateway made."""
@@ -550,6 +604,7 @@ class AsyncGateway(_GatewayBase):
         super().__init__(project)
         self.project = project
         self.source = source
+        self._llm: AsyncTokenSource | bool | None = False
         #: The gateway's refusal of this credential, as an MCP client last saw it; ``None`` once it is
         #: accepted again. For frameworks that turn every tool failure into text for the model.
         self.token_refused: GatewayTokenRefused | None = None
@@ -557,6 +612,23 @@ class AsyncGateway(_GatewayBase):
         #: See :attr:`Gateway.cloud`.
         self.cloud = AsyncCloudAccess(self)
         project._track(self)  # pyright: ignore[reportPrivateUsage]
+
+    @property
+    def llm_source(self) -> AsyncTokenSource:
+        """See :attr:`Gateway.llm_source`."""
+        if self._llm is False:
+            self._llm = self.source.for_llm(self.llm_url)
+        if self._llm is None:
+            raise self._no_llm_token()
+        return cast(AsyncTokenSource, self._llm)
+
+    def _source_for(self, path: str) -> AsyncTokenSource:
+        """See :meth:`Gateway._source_for`."""
+        return self.llm_source if self._on_llm_door(path) else self.source
+
+    async def headers(self, method: str, url: str) -> dict[str, str]:
+        """See :meth:`Gateway.headers`."""
+        return await self._source_for(urlsplit(url).path).headers(method, url)
 
     @overload
     def http_client(self) -> httpx.AsyncClient: ...
@@ -592,7 +664,7 @@ class AsyncGateway(_GatewayBase):
             self._stamp(request)
 
         return package.AsyncClient(
-            auth=self.source.httpx_auth(package),
+            auth=door_auth(package, self.source, self._source_for),
             follow_redirects=False,
             timeout=timeout
             if timeout is not None
@@ -634,11 +706,9 @@ class AsyncGateway(_GatewayBase):
         approval_id: str | None = None,
     ) -> CloudCredentialOutcome:
         """See :meth:`Gateway.cloud_credentials`."""
-        api_origin = await self.project.resolve_api_origin()
-        url = api_origin + CLOUD_PATH
-        authorization, proof = _proofless(await self.source.headers("POST", url))
-        request = cloud_request(
-            api_origin,
+        authorization, proof = _proofless(await self.source.headers("POST", self.mcp_url))
+        request = cloud_issue_request(
+            self.mcp_url,
             authorization,
             account=account,
             role=role,
@@ -647,14 +717,30 @@ class AsyncGateway(_GatewayBase):
             approval_id=approval_id,
             dpop=proof,
         )
-        response = await self.project._transport.send(self._stepped(request))  # pyright: ignore[reportPrivateUsage]
+        transport = self.project._transport  # pyright: ignore[reportPrivateUsage]
+        response = await transport.send(self._stepped(request))
         if response.status == 401:
-            raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
-        credential, held = parse_cloud(response, self._now())
+            raise GatewayTokenRefused(
+                self.mcp_url, response.header("WWW-Authenticate"), request_id=response.answer_request_id
+            )
+        handle, held = parse_cloud_handle(response)
         if held is not None:
             self.project.logger.info("cloud credentials for %s wait for approval %s", role, held)
             return CloudCredentialOutcome("approval_required", approval_id=held)
-        return CloudCredentialOutcome("issued", credential=credential)
+        return CloudCredentialOutcome("issued", credential=await self._redeem(handle))
+
+    async def _redeem(self, handle: CloudHandle | None) -> CloudCredential:
+        """See :meth:`Gateway._redeem`."""
+        if handle is None:  # pragma: no cover - parse_cloud_handle returns a handle or an approval
+            raise ConfigurationError("no cloud credential handle to redeem")
+        url = cloud_redeem_url(self.mcp_url, handle.credential_id)
+        authorization, proof = _proofless(await self.source.headers("POST", url))
+        response = await self.project._transport.send(  # pyright: ignore[reportPrivateUsage]
+            self._stepped(cloud_redeem_request(url, authorization, proof))
+        )
+        if response.status == 401:
+            raise GatewayTokenRefused(url, response.header("WWW-Authenticate"), request_id=response.answer_request_id)
+        return parse_cloud_secret(response, handle, self._now())
 
     async def aclose(self) -> None:
         """Close the HTTP clients this gateway made."""
