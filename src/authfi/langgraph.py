@@ -55,10 +55,7 @@ try:
     from langgraph.types import Command, interrupt
     from mcp.types import CallToolResult, TextContent
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.langgraph needs LangGraph: "
-        "pip install 'authfi[langgraph]'"
-    ) from exc
+    raise ImportError("authfi.langgraph needs LangGraph: pip install 'authfi[langgraph]'") from exc
 
 from authfi._adapters import async_gateway_for
 from authfi.gateway import HOLD_MESSAGE, AsyncGateway, ToolAllowed, ToolRefused, token_refusal

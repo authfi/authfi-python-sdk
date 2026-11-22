@@ -30,10 +30,7 @@ from authfi.tokens import AsyncTokenSource, TokenSource
 try:
     import langchain_core  # noqa: F401  # pyright: ignore[reportUnusedImport]
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.langchain needs langchain-core: "
-        "pip install 'authfi[langchain]'"
-    ) from exc
+    raise ImportError("authfi.langchain needs langchain-core: pip install 'authfi[langchain]'") from exc
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace import TracerProvider

@@ -23,8 +23,7 @@ try:
     from pydantic import PrivateAttr, SecretStr
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "authfi.langchain_anthropic needs langchain-anthropic: "
-        "pip install 'authfi[langchain-anthropic]'"
+        "authfi.langchain_anthropic needs langchain-anthropic: pip install 'authfi[langchain-anthropic]'"
     ) from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, httpx_of

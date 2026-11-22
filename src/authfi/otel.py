@@ -43,8 +43,7 @@ try:
     from requests.auth import AuthBase
 except ImportError as error:  # pragma: no cover - exercised by installing the core package alone
     raise ConfigurationError(
-        "authfi.otel needs the OpenTelemetry SDK and OTLP exporter: "
-        f"pip install 'authfi[otel]' ({error})"
+        f"authfi.otel needs the OpenTelemetry SDK and OTLP exporter: pip install 'authfi[otel]' ({error})"
     ) from error
 
 if TYPE_CHECKING:

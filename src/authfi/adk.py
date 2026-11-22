@@ -53,9 +53,7 @@ try:
     from google.genai import types
     from pydantic import PrivateAttr
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.adk needs Google ADK: pip install 'authfi[adk]'"
-    ) from exc
+    raise ImportError("authfi.adk needs Google ADK: pip install 'authfi[adk]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
 from authfi._holds import Held, HeldCalls

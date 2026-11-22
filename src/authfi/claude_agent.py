@@ -66,10 +66,7 @@ try:
     from mcp.client.streamable_http import streamable_http_client
     from mcp.types import CallToolResult, Tool
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.claude_agent needs the Claude Agent SDK: "
-        "pip install 'authfi[claude-agent]'"
-    ) from exc
+    raise ImportError("authfi.claude_agent needs the Claude Agent SDK: pip install 'authfi[claude-agent]'") from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi._claude_steps import DEFAULT_MAIN_NAME, AgentNames

@@ -61,10 +61,7 @@ try:
     from pydantic_ai.settings import ModelSettings
     from pydantic_ai.toolsets.abstract import ToolsetTool
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.pydantic_ai needs Pydantic AI with MCP: "
-        "pip install 'authfi[pydantic-ai]'"
-    ) from exc
+    raise ImportError("authfi.pydantic_ai needs Pydantic AI with MCP: pip install 'authfi[pydantic-ai]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
 from authfi._holds import Decided, Held, HeldCalls, text_of
