@@ -1206,13 +1206,23 @@ async def _polling(readable: FakeGateway, key_file: Path, **options: Any) -> tup
     return claude, project
 
 
+async def _held(readable: FakeGateway) -> str:
+    """The approval the held call has opened, waited for: the call reaches the gateway on its own schedule."""
+    for _ in range(500):
+        pending = readable.pending()
+        if pending:
+            (approval_id,) = pending
+            return approval_id
+        await asyncio.sleep(0.01)
+    raise AssertionError("the held call opened no approval")
+
+
 async def test_a_held_call_continues_by_itself_once_the_person_decides(readable: FakeGateway, key_file: Path) -> None:
     claude, project = await _polling(readable, key_file)
     async with project:
         deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
-        await asyncio.sleep(0.2)
+        approval_id = await _held(readable)
         assert not deciding.done()
-        (approval_id,) = readable.pending()
         readable.decide(approval_id, "approved")
         decision = await asyncio.wait_for(deciding, 5)
 
@@ -1226,8 +1236,7 @@ async def test_a_denied_approval_reaches_the_model_as_refused(readable: FakeGate
     claude, project = await _polling(readable, key_file)
     async with project:
         deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
-        await asyncio.sleep(0.2)
-        (approval_id,) = readable.pending()
+        approval_id = await _held(readable)
         readable.decide(approval_id, "denied")
         assert isinstance(await asyncio.wait_for(deciding, 5), PermissionResultAllow)
         answer = await _handler(claude, STEP_UP)(ARGS)
@@ -1250,7 +1259,7 @@ async def test_an_agent_revoked_while_waiting_ends_the_run(readable: FakeGateway
     claude, project = await _polling(readable, key_file)
     async with project:
         deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
-        await asyncio.sleep(0.2)
+        await _held(readable)
         readable.revoked = True
         decision = await asyncio.wait_for(deciding, 5)
         assert isinstance(decision, PermissionResultDeny)
