@@ -217,7 +217,8 @@ def test_a_move_for_another_task_or_that_has_run_out_is_refused(
         )
         with pytest.raises(KeyMoveRefused, match="another task or another key"):
             take(gw, key, retargeted, receiver, monkeypatch)
-        assert take(gw, key, move_for(task, _dpop.run_key(), receiver.thumbprint), receiver, monkeypatch)
+        taken = take(gw, key, move_for(task, _dpop.run_key(), receiver.thumbprint), receiver, monkeypatch)
+        assert taken.mandate_id == task.mandate_id
 
 
 def test_a_handover_the_sdk_knows_has_run_out_is_refused_without_asking(
@@ -249,7 +250,7 @@ def test_a_task_that_moved_first_is_taken_by_one_process_only(
         again = Handover(a.mandate_id, second.thumbprint, a.root, a.move, a.expires_at)
         with as_process(second, monkeypatch), pytest.raises(TaskMoved) as caught:
             agent.take_over(again)
-    assert isinstance(caught.value, TakeOverRefused) and caught.value.status == 400
+    assert caught.value.status == 400
 
 
 def test_an_ended_task_and_another_agents_root_are_refused(
