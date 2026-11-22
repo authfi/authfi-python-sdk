@@ -117,7 +117,7 @@ def test_the_task_is_held_by_the_instances_own_key(platform: TaskPlatform, token
 def test_a_start_whose_proof_is_by_another_key_is_refused(platform: TaskPlatform, token_file: Path) -> None:
     agent = authfi.connect(env_for(platform, token_file), http_client=platform.client(), clock=FakeClock())
     assert isinstance(agent, InstanceAuth)
-    agent._task_key = lambda metadata: _dpop.DPoPKey()  # type: ignore[method-assign,assignment]  # pyright: ignore
+    agent._task_key = lambda metadata: _dpop.DPoPKey()  # type: ignore[method-assign]  # pyright: ignore
     with pytest.raises(authfi.AuthFIError):
         agent.request_task("support.refund", subject_token=Secret("person-token"))
     agent.project.close()
@@ -134,9 +134,7 @@ def test_an_agent_that_signs_its_own_assertion_keeps_the_assertion_type() -> Non
 
 
 async def test_an_async_instance_starts_a_task_the_same_way(platform: TaskPlatform, token_file: Path) -> None:
-    agent = authfi.connect_async(
-        env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock()
-    )
+    agent = authfi.connect_async(env_for(platform, token_file), http_client=platform.async_client(), clock=FakeClock())
     assert isinstance(agent, AsyncInstanceAuth)
     task = await agent.request_task("support.refund", subject_token=Secret("person-token"))
     assert isinstance(task, AsyncTask)
@@ -144,4 +142,3 @@ async def test_an_async_instance_starts_a_task_the_same_way(platform: TaskPlatfo
     assert form["actor_token_type"] == ACCESS_TOKEN_TYPE
     assert form["actor_token"] == await agent.token()
     await agent.project.aclose()
-
