@@ -2,7 +2,7 @@
 
 Run it::
 
-    pip install "authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main"
+    pip install "authfi[langgraph]"
     cp .env.example .env    # then fill it in
     python refund_in_a_task.py 4411 "$PERSONS_ACCESS_TOKEN"
 """

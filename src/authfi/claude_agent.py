@@ -1,6 +1,6 @@
 """The Claude Agent SDK: approvals through ``can_use_tool``, credentials that renew themselves, content off.
 
-``pip install "authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[claude-agent]"``
 
 ::
 
@@ -66,10 +66,7 @@ try:
     from mcp.client.streamable_http import streamable_http_client
     from mcp.types import CallToolResult, Tool
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.claude_agent needs the Claude Agent SDK: "
-        "pip install 'authfi[claude-agent] @ git+https://github.com/authfi/authfi-python-sdk@main'"
-    ) from exc
+    raise ImportError("authfi.claude_agent needs the Claude Agent SDK: pip install 'authfi[claude-agent]'") from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
 from authfi._claude_steps import DEFAULT_MAIN_NAME, AgentNames
@@ -442,7 +439,7 @@ class ClaudeAgentIntegration:
         else:
             self.gateway.project.logger.warning(
                 "export_steps sends Claude Code's trace to AuthFI as it is, naming no agent on its spans: "
-                "pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main' "
+                "pip install 'authfi[otel]' "
                 "to have each span say which agent made it"
             )
         return {**_TRACE_SWITCHES, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": endpoint}

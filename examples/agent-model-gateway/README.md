@@ -15,7 +15,7 @@ through the AuthFI AI gateway.
 ## Run it
 
 ```bash
-pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main" anthropic openai
+pip install "authfi" anthropic openai
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python models.py

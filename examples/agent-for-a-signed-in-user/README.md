@@ -18,7 +18,7 @@ both who the person is and that the assistant acted.
 ## Run it
 
 ```bash
-pip install "authfi[fastapi] @ git+https://github.com/authfi/authfi-python-sdk@main" uvicorn
+pip install "authfi[fastapi]" uvicorn
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 uvicorn assistant_api:app

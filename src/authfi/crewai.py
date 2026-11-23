@@ -1,6 +1,6 @@
 """CrewAI: Claude on the AI gateway, the gateway's governed tools, approvals a crew waits for, steps over OTLP.
 
-``pip install "authfi[crewai] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[crewai]"``
 
 ::
 
@@ -86,10 +86,7 @@ try:
     from mcp.types import Tool as MCPTool
     from pydantic import PrivateAttr
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.crewai needs CrewAI with MCP: "
-        "pip install 'authfi[crewai] @ git+https://github.com/authfi/authfi-python-sdk@main'"
-    ) from exc
+    raise ImportError("authfi.crewai needs CrewAI with MCP: pip install 'authfi[crewai]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
 from authfi._holds import Decided, Held, HeldCalls, guard, text_of, wait_for_decision

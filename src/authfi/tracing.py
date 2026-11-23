@@ -24,8 +24,7 @@ try:
     from opentelemetry.sdk.trace import Event, ReadableSpan, Span, SpanProcessor
 except ImportError as error:  # pragma: no cover - exercised by installing the core package alone
     raise ConfigurationError(
-        "authfi.tracing needs the OpenTelemetry SDK: "
-        f"pip install 'authfi[otel] @ git+https://github.com/authfi/authfi-python-sdk@main' ({error})"
+        f"authfi.tracing needs the OpenTelemetry SDK: pip install 'authfi[otel]' ({error})"
     ) from error
 
 if TYPE_CHECKING:

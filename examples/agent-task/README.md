@@ -20,7 +20,7 @@ it, and the gateway holds every call to it.
 ## Run it
 
 ```bash
-pip install "authfi[langgraph] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[langgraph]"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python refund_in_a_task.py 4411 "$PERSONS_ACCESS_TOKEN"

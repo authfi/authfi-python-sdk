@@ -2,7 +2,7 @@
 
 Run it::
 
-    pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+    pip install "authfi"
     authfi keygen --out agent.key            # register the printed public JWK in the console
     cp .env.example .env                     # then fill it in
     python list_tools.py
