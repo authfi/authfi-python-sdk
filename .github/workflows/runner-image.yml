@@ -6,7 +6,9 @@ name: Runner image
 
 on:
   pull_request:
-    paths: ["runner/**", "src/**", "pyproject.toml", ".github/workflows/runner-image.yml"]
+    # Not src/**: an SDK source change does not change the image recipe, and building three framework images on
+    # every source PR queued the whole repository behind one runner. The tag build still builds from the tagged source.
+    paths: ["runner/**", "pyproject.toml", ".github/workflows/runner-image.yml"]
   push:
     tags: ["fw-runner-v*.*.*"]
 
