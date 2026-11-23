@@ -50,8 +50,7 @@ def _adapter(module: str, extra: str) -> Any:
         return importlib.import_module(module)
     except ImportError as error:
         raise ConfigurationError(
-            f"{module} needs its framework installed: pip install 'authfi[{extra}] @ "
-            f"git+https://github.com/authfi/authfi-python-sdk@main' ({error})"
+            f"{module} needs its framework installed: pip install 'authfi[{extra}]' ({error})"
         ) from error
 
 

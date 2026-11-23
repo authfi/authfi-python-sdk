@@ -1,6 +1,6 @@
 """The OpenAI Agents SDK: traces with no token and no content, governed tools, approvals through the SDK.
 
-``pip install "authfi[openai-agents] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[openai-agents]"``
 
 ::
 
@@ -82,10 +82,7 @@ try:
     from mcp.types import Tool as MCPTool
     from openai import AsyncOpenAI
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.openai_agents needs the OpenAI Agents SDK: "
-        "pip install 'authfi[openai-agents] @ git+https://github.com/authfi/authfi-python-sdk@main'"
-    ) from exc
+    raise ImportError("authfi.openai_agents needs the OpenAI Agents SDK: pip install 'authfi[openai-agents]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
 from authfi._protocol.ids import Step, inject_traceparent, register_step_source, step_traceparent

@@ -16,7 +16,7 @@ it.
 ## Run it
 
 ```bash
-pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python refund_with_gate.py 4411 120

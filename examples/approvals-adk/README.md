@@ -15,7 +15,7 @@ approval becomes ADK's own tool confirmation; it is answered once the person has
 ## Run it
 
 ```bash
-pip install "authfi[adk] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[adk]"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python refund_agent.py "Read the wiki contents of pallets/flask"

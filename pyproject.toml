@@ -90,7 +90,9 @@ path = "src/authfi/_version.py"
 packages = ["src/authfi"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/authfi", "tests", "conformance", "scripts", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
+# The source and the documents only: no tests, scripts, test vectors or examples travel in the package.
+include = ["src/authfi", "docs", "CHANGELOG.md", "README.md", "LICENSE", "NOTICE"]
+exclude = ["examples", "tests", "scripts", "conformance", "runner"]
 
 [dependency-groups]
 # What the adapters job installs beside one extra, at that extra's lowest and newest versions.

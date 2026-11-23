@@ -15,7 +15,7 @@ person has decided in AuthFI.
 ## Run it
 
 ```bash
-pip install "authfi[openai-agents] @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi[openai-agents]"
 cp .env.example .env    # fill it in
 set -a; . ./.env; set +a
 python research_agent.py "Read the wiki contents of pallets/flask"

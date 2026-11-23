@@ -6,7 +6,7 @@ records) see both.
 
 Run it::
 
-    pip install "authfi[fastapi] @ git+https://github.com/authfi/authfi-python-sdk@main" uvicorn
+    pip install "authfi[fastapi]" uvicorn
     cp .env.example .env    # then fill it in
     uvicorn assistant_api:app
 """

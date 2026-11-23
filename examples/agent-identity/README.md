@@ -14,7 +14,7 @@ An AI agent with its own key, its own token, and the AuthFI gateway.
 ## Run it
 
 ```bash
-pip install "authfi @ git+https://github.com/authfi/authfi-python-sdk@main"
+pip install "authfi"
 authfi keygen --out agent.key
 ```
 
