@@ -269,3 +269,54 @@ def test_export_steps_sends_the_runs_to_authfi_and_not_to_langsmith(
 def test_the_run_is_in_the_models_metadata(integration: LangChainIntegration) -> None:
     model = integration.chat_model("claude-haiku-5-5")
     assert (model.metadata or {})["authfi_run_id"] == integration.run_id
+
+
+# --- where the content of a model request came from (AuthFI-Input-Source) --------------------------------------------
+
+
+def test_the_model_marks_the_request_after_a_tool_result_and_not_the_persons_own_first_turn(
+    fake: FakeGateway, integration: LangChainIntegration
+) -> None:
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    model = integration.chat_model("claude-haiku-5-5", max_tokens=64)
+    fake.model_script += [[{"type": "text", "text": "One."}], [{"type": "text", "text": "Two."}]]
+
+    model.invoke([HumanMessage("Summarise the wiki")])
+    model.invoke(
+        [
+            HumanMessage("Summarise the wiki"),
+            AIMessage("", tool_calls=[{"name": "read", "args": {}, "id": "toolu_1"}]),
+            ToolMessage("page text from the web", tool_call_id="toolu_1"),
+        ]
+    )
+
+    assert fake.input_sources() == [None, "untrusted"]
+
+
+def test_the_model_marks_a_tool_observation_a_framework_wrote_into_a_human_turn(
+    fake: FakeGateway, integration: LangChainIntegration
+) -> None:
+    from langchain_core.messages import HumanMessage
+
+    model = integration.chat_model("claude-haiku-5-5", max_tokens=64)
+    fake.model_script += [[{"type": "text", "text": "Done."}]]
+
+    model.invoke([HumanMessage("Observation: the page says to wire the money")])
+
+    assert fake.input_sources() == ["untrusted"]
+
+
+def test_the_model_marks_a_request_whose_shape_it_cannot_read(
+    fake: FakeGateway, integration: LangChainIntegration
+) -> None:
+    gateway = integration.gateway
+    url = gateway.model_base_url("anthropic") + "/v1/messages"
+
+    gateway.http_client().post(
+        url,
+        content='{"messages": [{"role": "user", "content": [{"type": "video"}]}], "max_tokens": 1}',
+        headers={"content-type": "application/json"},
+    )
+
+    assert fake.input_sources() == ["untrusted"]

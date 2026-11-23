@@ -1130,3 +1130,42 @@ def test_a_value_nested_too_deep_is_refused_and_a_real_nesting_is_not() -> None:
         AgentNames().rewrite(_nested_depth(MAX_DEPTH + 10), "")
     assert (refused.value.status, refused.value.kind) == (413, "too-deep")
     assert b"claude_code" in AgentNames().rewrite(_nested_depth(3), "")
+
+
+# --- where the content of a model request came from (AuthFI-Input-Source) --------------------------------------------
+
+
+async def _through_the_proxy(claude: ClaudeAgentIntegration, bodies: list[str]) -> None:
+    import httpx
+
+    options = await claude.options(model="claude-haiku-5-5")
+    base = dict(options.env)["ANTHROPIC_BASE_URL"]
+    async with httpx.AsyncClient() as http:
+        for body in bodies:
+            await http.post(base + "/v1/messages", content=body, headers={"content-type": "application/json"})
+
+
+PERSON_ONLY = '{"max_tokens": 1, "messages": [{"role": "user", "content": "Summarise the wiki"}]}'
+AFTER_A_TOOL = (
+    '{"max_tokens": 1, "messages": [{"role": "user", "content": "Summarise the wiki"}, '
+    '{"role": "assistant", "content": '
+    '[{"type": "tool_use", "id": "t1", "name": "read", "input": {}}]}, {"role": "user", "content": '
+    '[{"type": "tool_result", "tool_use_id": "t1", "content": "page text"}]}]}'
+)
+ODD_SHAPE = '{"max_tokens": 1, "messages": [{"role": "user", "content": [{"type": "video"}]}]}'
+
+
+async def test_the_model_proxy_marks_the_request_after_a_tool_result_and_not_the_persons_own_first_turn(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    await _through_the_proxy(claude, [PERSON_ONLY, AFTER_A_TOOL])
+
+    assert fake.input_sources() == [None, "untrusted"]
+
+
+async def test_the_model_proxy_marks_a_request_whose_shape_it_cannot_read(
+    fake: FakeGateway, claude: ClaudeAgentIntegration
+) -> None:
+    await _through_the_proxy(claude, [ODD_SHAPE, "not json"])
+
+    assert fake.input_sources() == ["untrusted", "untrusted"]

@@ -149,6 +149,10 @@ class FakeGateway:
                         )
         return out
 
+    def input_sources(self) -> list[str | None]:
+        """The ``AuthFI-Input-Source`` of each model request, in order: ``None`` where the request sent none."""
+        return [r["headers"].get("authfi-input-source") for r in self.model_requests()]
+
     def model_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["path"].endswith("/v1/messages")]
 

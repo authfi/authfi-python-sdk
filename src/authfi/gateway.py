@@ -53,6 +53,8 @@ from authfi._protocol.ids import (
     step_traceparent,
     valid_traceparent,
 )
+from authfi._protocol.input_source import HEADER as INPUT_SOURCE_HEADER
+from authfi._protocol.input_source import UNTRUSTED, is_model_request, request_is_untrusted
 from authfi._transport import user_agent
 from authfi.errors import ConfigurationError, GatewayTokenRefused
 from authfi.tokens import AsyncTokenSource, TokenSource
@@ -401,6 +403,7 @@ class _GatewayBase:
 
     def _stamp(self, request: httpx.Request) -> None:
         self._warn_if_unproven(request)
+        self._mark_input_source(request)
         if "x-request-id" not in request.headers:
             request.headers["X-Request-Id"] = self._next_request_id()
         self._idempotent(request)
@@ -411,6 +414,23 @@ class _GatewayBase:
         inject_traceparent(headers, getattr(self, "source", None))
         if "traceparent" in headers and "traceparent" not in request.headers:
             request.headers["traceparent"] = headers["traceparent"]
+
+    @staticmethod
+    def _mark_input_source(request: httpx.Request) -> None:
+        """Mark a model request that holds content which did not come from the person.
+
+        That is tool output, fetched text or anything this code cannot tell. It only adds the header: the gateway lets
+        code add taint and never remove it.
+        """
+        path = request.url.path
+        if request.method != "POST" or not is_model_request(path) or INPUT_SOURCE_HEADER in request.headers:
+            return
+        try:
+            body: bytes | None = request.content
+        except httpx.RequestNotRead:  # a streamed body cannot be read here
+            body = None
+        if request_is_untrusted(path, body):
+            request.headers[INPUT_SOURCE_HEADER] = UNTRUSTED
 
     def _stepped(self, request: HttpRequest) -> HttpRequest:
         """``request`` carrying the executing step's ``traceparent``; without a step the transport adds its own."""

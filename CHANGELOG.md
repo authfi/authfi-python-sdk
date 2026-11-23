@@ -20,7 +20,13 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - Every tool call through the gateway client carries one `Idempotency-Key`: fresh for each logical call, the same on
   every attempt of it (a nonce challenge, a refused token, a server error). A test runs a whole task, a handover and a
   takeover and finds no run key in the environment, any file, any log, an error report or any byte the gateway received.
-
+- A model request says where its content came from. Every model request through the gateway's HTTP clients (every adapter,
+  and Claude Code's model proxy) carries `AuthFI-Input-Source: untrusted` when it holds a tool's output (a `tool_result`
+  block, a `tool` or `function` message, a `function_call_output` item), text a framework labelled as an observation, or a
+  block or shape the SDK does not know; ADK and the OpenAI Agents adapter, which make their own model calls, decide from
+  the content they hold. A request of only what the person typed sends nothing, because the gateway reads one
+  request-level header and lets code add taint, never remove it. `with authfi.untrusted_input():` marks every model
+  request made inside it, for an app that fetches text into a user turn.
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login]"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`

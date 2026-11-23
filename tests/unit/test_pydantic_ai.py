@@ -338,3 +338,41 @@ async def test_export_steps_sends_the_agents_steps_to_authfi(
     posted = b"".join(r["body"] for r in fake.requests if r["path"] == "/otlp/v1/traces")
     assert not any(t.encode() in posted for t in fake.minted)
     assert (b"ada@example.com" in posted) is capture_content
+
+
+# --- where the content of a model request came from (AuthFI-Input-Source) --------------------------------------------
+
+ODD_REQUEST = '{"messages": [{"role": "user", "content": [{"type": "video"}]}], "max_tokens": 1}'
+
+
+async def test_a_tool_result_in_the_next_model_request_is_marked_and_the_persons_own_first_turn_is_not(
+    fake: FakeGateway,
+    integration: PydanticAIIntegration,
+    tools: AuthFIToolset,
+) -> None:
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    await _agent(integration, tools).run(PROMPT)
+
+    assert fake.input_sources() == [None, "untrusted"]
+
+
+async def test_a_run_of_only_what_the_person_said_sends_no_mark(
+    fake: FakeGateway, integration: PydanticAIIntegration, tools: AuthFIToolset
+) -> None:
+    fake.model_script += [[{"type": "text", "text": "Hello."}]]
+
+    await _agent(integration).run(PROMPT)
+
+    assert fake.input_sources() == [None]
+
+
+async def test_a_model_request_whose_shape_the_sdk_cannot_read_is_marked(
+    fake: FakeGateway, integration: PydanticAIIntegration, tools: AuthFIToolset
+) -> None:
+    gateway = integration.gateway
+    url = gateway.model_base_url("anthropic") + "/v1/messages"
+
+    await gateway.http_client().post(url, content=ODD_REQUEST, headers={"content-type": "application/json"})
+
+    assert fake.input_sources() == ["untrusted"]

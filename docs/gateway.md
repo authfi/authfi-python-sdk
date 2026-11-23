@@ -37,6 +37,19 @@ openai.OpenAI(base_url=gateway.model_base_url("openai"), api_key="unused",
 
 The token is never the SDK's `api_key` or a default header, which tracers record.
 
+## Where a model request's content came from
+
+A framework often puts a tool's output or fetched text into a user turn, which the gateway cannot tell from the person's own
+words. The SDK says so with `AuthFI-Input-Source: untrusted` on any model request that holds a tool's output, a text the
+framework labelled `Observation:` or `Tool result:`, or a block or shape it does not know (when in doubt, it marks). A request
+of only what the person typed sends no header: the gateway lets code add taint and never remove it. For text your app fetches
+into a user turn itself:
+
+```python
+with authfi.untrusted_input():
+    answer = run_the_agent(fetched_text)
+```
+
 ## The agent's token is bound to its key
 
 An agent's token is bound to a key this process holds (DPoP). `http_client()`, `new_http_client()`, the
