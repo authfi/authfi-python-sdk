@@ -20,6 +20,9 @@
     authfi claude [--model M] [--small-model M] [-- ARGS]
         Claude Code, through the AuthFI gateways as the agent the environment names, with no Anthropic
         sign-in (see :mod:`authfi.claude_code`)
+    authfi run [--format openai|anthropic] -- TOOL [ARGS]
+        any coding tool (Codex CLI, OpenCode, ...), its base URL and key variables set to the same loopback
+        proxy (see :mod:`authfi.launcher`)
     authfi redteam --origin URL [--baseline FILE] [--send]
         the platform's red-team corpus against your agent's configuration, read back from your call
         tape; without --send it prints what it would send (see :mod:`authfi.redteam`)
@@ -40,7 +43,7 @@ from collections.abc import Sequence
 
 import httpx
 
-from authfi import _login, claude_code, redteam
+from authfi import _login, claude_code, launcher, redteam
 from authfi._protocol.ids import is_valid_request_id
 from authfi.agents.keys import AgentKey, KeyAlgorithm
 from authfi.client import AuthFI
@@ -96,6 +99,9 @@ def _parser() -> argparse.ArgumentParser:
         "--small-model", default=claude_code.DEFAULT_MODEL, help="the model Claude Code uses for its background work"
     )
     claude.add_argument("args", nargs=argparse.REMAINDER, help="arguments for claude, after --")
+    run = commands.add_parser("run", help="run a coding tool (Codex CLI, OpenCode, ...) through the AuthFI gateways")
+    run.add_argument("--format", choices=launcher.FORMATS, default="openai", help="the model API the tool speaks")
+    run.add_argument("args", nargs=argparse.REMAINDER, help="the tool and its arguments, after --")
     redteam.add_arguments(
         commands.add_parser("redteam", help="run the red-team corpus against your agent (a dry run unless --send)")
     )
@@ -163,6 +169,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return claude_code.command(
             passed[1:] if passed[:1] == ["--"] else passed, model=args.model, small_model=args.small_model
         )
+    if args.command == "run":
+        passed = list(args.args)
+        return launcher.command(passed[1:] if passed[:1] == ["--"] else passed, api=args.format)
     if args.command == "redteam":
         return redteam.command(args, os.environ, print, lambda text: print(text, file=sys.stderr))
     try:

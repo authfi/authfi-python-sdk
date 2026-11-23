@@ -157,3 +157,25 @@ def test_the_command_line_passes_what_follows_the_separator(monkeypatch: pytest.
 
     assert cli.main(["claude", "--model", "claude-sonnet-5-5", "--", "--resume", "abc"]) == 0
     assert calls == [(["--resume", "abc"], "claude-sonnet-5-5", claude_code.DEFAULT_MODEL)]
+
+
+async def test_what_the_gateway_does_not_serve_is_refused_cleanly_and_never_sent(
+    fake: FakeGateway, key_file: Path
+) -> None:
+    answers: dict[str, httpx.Response] = {}
+
+    async def as_claude_code(_argv: Sequence[str], env: Mapping[str, str]) -> int:
+        base = env["ANTHROPIC_BASE_URL"]
+        async with httpx.AsyncClient() as client:  # the calls Claude Code makes besides the model call
+            body = {"model": "claude-haiku-5-5", "messages": [{"role": "user", "content": "hi"}]}
+            answers["count"] = await client.post(base + "/v1/messages/count_tokens?beta=true", json=body)
+            answers["models"] = await client.get(base + "/v1/models?limit=1000")
+            answers["hello"] = await client.head(base + "/api/hello")
+        return 0
+
+    await claude_code.run(env=_agent_env(fake, key_file), claude="claude", spawn=as_claude_code, warn=lambda _t: None)
+
+    assert {name: r.status_code for name, r in answers.items()} == {"count": 404, "models": 404, "hello": 404}
+    assert answers["count"].json()["error"]["type"] == "not_found_error"  # Claude Code then estimates the count
+    assert not answers["hello"].content
+    assert not [r for r in fake.requests if r["path"].startswith("/mcp/v1")]
