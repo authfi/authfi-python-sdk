@@ -6,15 +6,35 @@ import base64
 import copy
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import jwt
+import pytest
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
+
+from authfi import _dpop
+
+
+@contextmanager
+def as_process(run_key: _dpop.DPoPKey, patch: pytest.MonkeyPatch) -> Generator[None]:
+    """Code that runs in a process whose run key is ``run_key``: a second process has a key of its own.
+
+    A fork would make one on a platform that has it; this gives the receiving side of a handover its key without one.
+    """
+    with patch.context() as scoped:
+
+        def key_for(advertised: Sequence[str]) -> _dpop.DPoPKey:
+            return run_key
+
+        scoped.setattr(_dpop, "key_for", key_for)
+        yield
+
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ISSUER = "https://acme.authfi.io"

@@ -22,13 +22,17 @@ forgets the credential.
 from __future__ import annotations
 
 import contextvars
+import json
+import re
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, Self, cast
 
 from authfi import _dpop
-from authfi._protocol.agent import TaskDetails, task_details
+from authfi._protocol.agent import KEY_MOVE_LIFETIME, KEY_MOVE_TYP, TaskDetails, task_details
 from authfi._protocol.ids import link_step_owner
 from authfi._protocol.oauth import TokenResponse
 from authfi.errors import ConfigurationError, ConsentExpired
@@ -40,7 +44,7 @@ if TYPE_CHECKING:
     from authfi.agents.agent import AgentAuth, AsyncAgentAuth
     from authfi.client import AsyncAuthFI, AuthFI
 
-__all__ = ["AsyncTask", "Task"]
+__all__ = ["AsyncTask", "Handover", "Task"]
 
 #: Whether the running code is inside a ``with`` task: only to refuse a second one.
 _INSIDE: contextvars.ContextVar[bool] = contextvars.ContextVar("authfi_inside_task", default=False)
@@ -54,6 +58,80 @@ def refuse_nested() -> None:
             "widen it. Finish this task, and ask the person for the next.",
             code="task_nested",
         )
+
+
+#: An RFC 7638 thumbprint of a P-256 or Ed25519 key: SHA-256, base64url, no padding.
+_THUMBPRINT = re.compile(r"[A-Za-z0-9_-]{43}")
+_WIRE_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class Handover:
+    """A task on its way to another process: the root and the key move that lets that process hold it.
+
+    Neither is a private key. The root is bound to the sender's key, so it is no use on its own, and the
+    move names the receiver's key and is good once, for 30 seconds. ``to_wire`` is the text to send to the
+    receiving process over a private channel, and :meth:`~authfi.AgentAuth.take_over` takes the object
+    ``from_wire`` makes from it. No run key is in either.
+    """
+
+    mandate_id: str
+    #: The thumbprint of the key that may take the task.
+    to: str
+    root: Secret
+    move: Secret
+    #: When the key move stops being good (seconds since the epoch).
+    expires_at: float
+
+    def to_wire(self) -> str:
+        """JSON text for the receiving process. It holds the root and the move: send it privately and do not log it."""
+        return json.dumps(
+            {
+                "v": _WIRE_VERSION,
+                "mandate_id": self.mandate_id,
+                "to": self.to,
+                "root": self.root.reveal(),
+                "move": self.move.reveal(),
+                "expires_at": self.expires_at,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_wire(cls, wire: str) -> Handover:
+        """The handover :meth:`to_wire` wrote; :class:`~authfi.ConfigurationError` for anything else."""
+        try:
+            body: object = json.loads(wire)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(
+                "a handover is the text Handover.to_wire() wrote", code="handover_invalid"
+            ) from exc
+        members = {"v", "mandate_id", "to", "root", "move", "expires_at"}
+        if not isinstance(body, dict) or set(cast("dict[str, Any]", body)) != members:
+            raise ConfigurationError("a handover is the text Handover.to_wire() wrote", code="handover_invalid")
+        fields = cast("dict[str, Any]", body)
+        expires = fields["expires_at"]
+        texts = (fields["mandate_id"], fields["to"], fields["root"], fields["move"])
+        if (
+            fields["v"] != _WIRE_VERSION
+            or not all(isinstance(t, str) and t for t in texts)
+            or not isinstance(expires, int | float)
+            or isinstance(expires, bool)
+        ):
+            raise ConfigurationError("a handover is the text Handover.to_wire() wrote", code="handover_invalid")
+        return cls(
+            mandate_id=fields["mandate_id"],
+            to=fields["to"],
+            root=Secret(fields["root"]),
+            move=Secret(fields["move"]),
+            expires_at=float(expires),
+        )
+
+    def __repr__(self) -> str:
+        return f"Handover(mandate_id={self.mandate_id!r}, to={self.to!r})"
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("A handover holds a credential and is sent with to_wire(), not pickled")
 
 
 class _TaskState:
@@ -79,6 +157,7 @@ class _TaskState:
         self._time = time
         self._expires = time() + float(response.expires_in or 300)
         self._reset: list[contextvars.Token[bool]] = []
+        self._handed_over = False
         # The framework exports its steps for the agent's credential; the task's calls name the step through it.
         link_step_owner(self, agent)
 
@@ -111,9 +190,54 @@ class _TaskState:
         """Forget the credential. The platform's record of the task ends with its deadline or a person's decision."""
         self._root = None
 
+    def hand_over(self, *, to: str) -> Handover:
+        """Give the whole task to another process: sign the key move for its key, and stop holding the task here.
+
+        ``to`` is the thumbprint of the receiving process's run key (:meth:`~authfi.AgentAuth.run_key_thumbprint`,
+        which that process sends you). The move is signed with this process's run key, which stays here: what
+        leaves is the root and the move. From the moment the receiver takes the task, the platform refuses this
+        process's root; this task is closed here now, so nothing it does can race the receiver.
+        """
+        if self._root is None:
+            raise ConfigurationError(self._closed_message(), code="task_closed")
+        if _THUMBPRINT.fullmatch(to or "") is None:
+            raise ConfigurationError(
+                "to is the receiving process's run key thumbprint, from its run_key_thumbprint()",
+                code="handover_target_invalid",
+            )
+        if to == self._key.thumbprint:
+            raise ConfigurationError("this process's key already holds the task", code="handover_to_self")
+        now = int(self._time())
+        move = self._key.sign_jwt(
+            {
+                "mandate_id": self.mandate_id,
+                "jkt": to,
+                "iat": now,
+                "exp": now + KEY_MOVE_LIFETIME,
+                "jti": uuid.uuid4().hex,
+            },
+            typ=KEY_MOVE_TYP,
+            carry_public_key=True,
+        )
+        handover = Handover(
+            mandate_id=self.mandate_id,
+            to=to,
+            root=self._root,
+            move=Secret(move),
+            expires_at=float(now + KEY_MOVE_LIFETIME),
+        )
+        self._handed_over = True
+        self.close()
+        return handover
+
+    def _closed_message(self) -> str:
+        if self._handed_over:
+            return "this task was handed over to another process, which holds it now"
+        return "this task is closed: its credential was forgotten when its with block ended"
+
     def _live(self) -> str:
         if self._root is None:
-            raise ConfigurationError("this task is closed: its credential was forgotten when its with block ended")
+            raise ConfigurationError(self._closed_message(), code="task_closed")
         if self._time() >= self._expires:
             raise ConsentExpired("expired_token", "the task has run out; only a person can give the agent another")
         return self._root.reveal()

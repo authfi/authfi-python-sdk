@@ -17,13 +17,20 @@ from authfi.errors import (
     AuthFIError,
     ConsentDenied,
     ConsentExpired,
+    KeyMoveRefused,
+    KeyMoveSpent,
     OAuthError,
     StepUpRequired,
+    TakeOverRefused,
+    TakeOverSlowDown,
+    TaskEnded,
+    TaskMoved,
+    TaskNotYours,
     TemporarilyUnavailable,
     TransportError,
 )
 
-__all__ = ["CIBA_GRANT", "api_error", "describe", "oauth_error", "with_answer"]
+__all__ = ["CIBA_GRANT", "api_error", "describe", "oauth_error", "take_over_error", "with_answer"]
 
 CIBA_GRANT = "urn:openid:params:grant-type:ciba"
 
@@ -102,6 +109,38 @@ def oauth_error(
     else:
         error = OAuthError(code, description, status=status)
     return with_answer(error, response)
+
+
+#: What the platform's ``invalid_grant`` of a renewal says, in the order they are tried. The platform gives a
+#: refusal of a takeover one code and says which in prose, so this is the one place that reads it; an answer that
+#: matches none is a plain :class:`TakeOverRefused` carrying the platform's words.
+_TAKE_OVER_REASONS: tuple[tuple[str, type[TakeOverRefused]], ...] = (
+    ("key move has already been used", KeyMoveSpent),
+    ("the key move", KeyMoveRefused),
+    ("no longer holds this task", TaskMoved),
+    ("moved to another key first", TaskMoved),
+    ("already holds the task", TaskMoved),
+    ("task is not active", TaskEnded),
+    ("cannot be taken over now", TaskEnded),
+    ("no such task", TaskNotYours),
+    ("not one this agent may renew", TaskNotYours),
+)
+
+
+def take_over_error(response: HttpResponse, what: str) -> AuthFIError:
+    """The typed error for a refused takeover: the renewal that moves a task to another key."""
+    error = oauth_error(response, what)
+    if not isinstance(error, OAuthError) or isinstance(error, TemporarilyUnavailable):
+        return error
+    if error.code == "slow_down":
+        refused: OAuthError = TakeOverSlowDown(error.code, error.description, status=error.status)
+    elif error.code == "invalid_grant":
+        said = (error.description or "").lower()
+        kind = next((kind for phrase, kind in _TAKE_OVER_REASONS if phrase in said), TakeOverRefused)
+        refused = kind(error.code, error.description, status=error.status)
+    else:
+        return error
+    return with_answer(refused, response)
 
 
 def api_error(response: HttpResponse, what: str) -> AuthFIError:
