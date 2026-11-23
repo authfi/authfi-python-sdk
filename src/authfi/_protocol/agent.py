@@ -52,6 +52,7 @@ __all__ = [
     "KEY_MOVE_LIFETIME",
     "KEY_MOVE_TYP",
     "MANDATE_CHAIN_TOKEN_TYPE",
+    "TASK_ACTOR_ASSERTION",
     "TASK_DETAIL_TYPE",
     "TOKEN_EXCHANGE_GRANT",
     "TRANSACTION_TOKEN_PATH",
@@ -85,6 +86,8 @@ TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 #: RFC 9396 ``type`` of the one ``authorization_details`` entry that asks for a task.
 TASK_DETAIL_TYPE = "authfi_mandate"
 _JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
+#: The ``actor_token_type`` of a task started by an agent that signs its own assertion.
+TASK_ACTOR_ASSERTION = _JWT_TOKEN_TYPE
 _MAX_TASK_SECONDS = 30 * 24 * 3600
 TRANSACTION_TOKEN_PATH = "/apis/regional/v1/ai/auth/transaction-token"
 _AUTHORIZE_PATH = "/apis/regional/v1/ai/auth/authorize"
@@ -335,12 +338,15 @@ def task_request(
     ttl_seconds: int | None,
     resource: str | None,
     dpop: Callable[[str, str, str | None], str],
+    actor_token_type: str = _JWT_TOKEN_TYPE,
 ) -> HttpRequest:
     """RFC 8693 exchange with RFC 9396 ``authorization_details`` that asks for a task. Never retried after send.
 
     The person's token is the ``subject_token``. The ``actor_token`` is the agent's own signed assertion,
     new for every attempt, that names the DPoP key that will hold the task; the request carries a proof of
-    that key. There is no client authentication: the actor assertion is the agent's.
+    that key. There is no client authentication: the actor assertion is the agent's. A workload-bound instance
+    holds no key it can sign an assertion with: its actor is its own access token (``actor_token_type`` the
+    access-token type), bound to the key that signs the request's proof, which then holds the task.
     """
     if not _given(template):
         raise ConfigurationError("template is required: it is the task's name, such as support.refund")
@@ -359,7 +365,7 @@ def task_request(
         "grant_type": TOKEN_EXCHANGE_GRANT,
         "subject_token": subject_token,
         "subject_token_type": ACCESS_TOKEN_TYPE,
-        "actor_token_type": _JWT_TOKEN_TYPE,
+        "actor_token_type": actor_token_type,
         "authorization_details": details,
     }
     if resource:
