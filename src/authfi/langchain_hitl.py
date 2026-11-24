@@ -1,6 +1,6 @@
 """LangChain's human-in-the-loop pause, decided by AuthFI: a middleware for ``langchain.agents.create_agent``.
 
-``pip install "authfi[langchain-hitl] @ git+https://github.com/authfi/authfi-python-sdk@main"``
+``pip install "authfi[langchain-hitl]"``
 
 ::
 
@@ -50,10 +50,7 @@ try:
     from langchain_core.messages import ToolMessage
     from langgraph.types import Command, interrupt
 except ImportError as exc:  # pragma: no cover - exercised only without the extra
-    raise ImportError(
-        "authfi.langchain_hitl needs langchain 1.x: "
-        "pip install 'authfi[langchain-hitl] @ git+https://github.com/authfi/authfi-python-sdk@main'"
-    ) from exc
+    raise ImportError("authfi.langchain_hitl needs langchain 1.x: pip install 'authfi[langchain-hitl]'") from exc
 
 if TYPE_CHECKING:
     from langgraph.prebuilt.tool_node import ToolCallRequest

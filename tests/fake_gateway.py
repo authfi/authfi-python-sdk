@@ -8,7 +8,8 @@ It speaks the wire the platform speaks today:
 - ``/mcp``: MCP over streamable HTTP with JSON answers, tool names ``<server>__<tool>``, a refusal
   as an ``isError`` result with ``_meta["io.authfi/refusal"]``, a hold as the gateway's exact
   "Waiting for approval ..." text;
-- ``/mcp/v1/messages``: the Anthropic Messages API, playing back ``model_script``;
+- ``/mcp/v1/messages``, ``/mcp/v1/chat/completions`` and ``/mcp/v1/responses``: the Anthropic Messages, OpenAI
+  Chat Completions and OpenAI Responses APIs, playing back ``model_script``;
 - the approval address, which answers 403 unless ``approvals_readable``.
 
 A bearer starting with ``tok-`` is accepted; anything else gets 401. Every request is kept.
@@ -163,6 +164,10 @@ class FakeGateway:
     def model_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["path"].endswith("/v1/messages")]
 
+    def model_calls(self, suffix: str) -> list[dict[str, Any]]:
+        """Every request to the model route ending in ``suffix`` (``/v1/responses``, ``/v1/chat/completions``)."""
+        return [r for r in self.requests if r["path"].endswith(suffix)]
+
     # --- internals -----------------------------------------------------------------------------------
 
     def _record(self, handler: BaseHTTPRequestHandler, body: bytes) -> None:
@@ -253,6 +258,8 @@ class FakeGateway:
             return self._model(json.loads(body))
         if path.endswith("/v1/chat/completions"):
             return self._chat(json.loads(body))
+        if path.endswith("/v1/responses"):
+            return self._response(json.loads(body))
         message = cast(dict[str, Any], json.loads(body))
         method, rid = message.get("method"), message.get("id")
         # The SDK stamps every call "<run id>.<n>": the run is what comes before the counter.
@@ -370,6 +377,12 @@ class FakeGateway:
         text = "".join(str(b.get("text", "")) for b in blocks)
         return 200, {}, _chat_answer(request.get("model"), text)
 
+    def _response(self, request: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
+        with self._lock:
+            blocks = self.model_script.pop(0) if self.model_script else [{"type": "text", "text": "Done."}]
+        text = "".join(str(b.get("text", "")) for b in blocks)
+        return 200, {}, _response_answer(request.get("model"), text)
+
     def _model(self, request: dict[str, Any]) -> tuple[int, dict[str, str], bytes]:
         with self._lock:
             blocks = self.model_script.pop(0) if self.model_script else [{"type": "text", "text": "Done."}]
@@ -412,6 +425,25 @@ def _chat_answer(model: object, text: str) -> bytes:
             "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }
+    ).encode()
+
+
+def _response_answer(model: object, text: str) -> bytes:
+    return json.dumps(
+        {
+            "id": "resp_" + uuid.uuid4().hex[:12],
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
         }
     ).encode()
 

@@ -37,6 +37,7 @@ from authfi._cache import AsyncCache, SyncCache
 from authfi._frameworks import FrameworkCredential
 from authfi._protocol.agent import (
     CIBA_GRANT,
+    TASK_ACTOR_ASSERTION,
     TOKEN_EXCHANGE_GRANT,
     AgentEndpoints,
     ApprovalRecord,
@@ -402,6 +403,9 @@ class _AgentBase:
         return _dpop.authorization_headers(
             minted.access_token.reveal(), minted.key, method, url, clock=self._clock.time
         )
+
+    #: The ``actor_token_type`` of a task's start: an assertion the agent's own key signs, unless it holds none.
+    _task_actor_type: str = TASK_ACTOR_ASSERTION
 
     def _task_actor(self, key: _dpop.DPoPKey) -> Callable[[str], str]:
         """Signs the actor assertion of a task's start: the agent's, naming the key that will hold the task."""
@@ -1185,6 +1189,7 @@ class AgentAuth(LegacyAgentMixin, FrameworkCredential, _AgentBase, TokenSource):
             ttl_seconds=ttl_seconds,
             resource=None,
             dpop=_dpop.signer(key, self._clock.time),
+            actor_token_type=self._task_actor_type,
         )
         started = parse_task_start(self._send(request))
         if isinstance(started, TaskPending):
@@ -1643,6 +1648,10 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
 
     # --- tasks ---------------------------------------------------------------------------------------
 
+    async def _task_actor_for(self, key: _dpop.DPoPKey) -> Callable[[str], str]:
+        """The actor of a task's start, made where a credential has to be awaited first."""
+        return self._task_actor(key)
+
     async def request_task(
         self,
         template: str,
@@ -1665,12 +1674,13 @@ class AsyncAgentAuth(FrameworkCredential, _AgentBase, AsyncTokenSource):
         request = task_request(
             metadata.token_endpoint,
             subject_token=await _async_subject_value(subject_token),
-            actor_assertion=self._task_actor(key),
+            actor_assertion=await self._task_actor_for(key),
             template=template,
             params=params,
             ttl_seconds=ttl_seconds,
             resource=None,
             dpop=_dpop.signer(key, self._clock.time),
+            actor_token_type=self._task_actor_type,
         )
         started = parse_task_start(await self._send(request))
         if isinstance(started, TaskPending):

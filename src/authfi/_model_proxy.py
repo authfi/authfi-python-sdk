@@ -6,10 +6,14 @@ apart from the tool calls this process makes with the key's proof. Pointed at th
 its model calls here, and they leave with this process's credential: bound to the same key, proved per request, on
 the same run as the tools.
 
-The proxy forwards one request: ``POST /v1/messages`` under a secret this process made for the run. The secret is
-in the environment of every tool Claude Code runs, so it does not stand for the right to use the credential: any
-other method or path, including the rest of the gateway's model and cloud routes, is refused unsent. Whatever
-credential the caller sends is dropped; the gateway sees only this process's.
+The proxy forwards the calls of one model API format under a secret this process made for the run: for ``anthropic``
+``POST /v1/messages``, for ``openai`` ``POST /v1/chat/completions`` and ``POST /v1/responses``. The secret is in the
+environment of every tool the launched program runs, so it does not stand for the right to use the credential: any
+other method or path, including the other format's routes and the gateway's cloud routes, is refused unsent, in the
+error shape of the format. That includes what the program asks for and the gateway's model door does not serve
+(``POST /v1/messages/count_tokens``, ``GET /v1/models``, ``HEAD /api/hello``): they are answered 404 here, which
+Claude Code and the OpenAI-format tools take as "not offered". Whatever credential the caller sends is dropped; the
+gateway sees only this process's.
 
 When the application exports Claude Code's steps (``export_steps``), a second route relays Claude Code's trace export to
 AuthFI (:meth:`ModelProxy.relay_traces`): the same listener and secret, one fixed target, with a short list of the
@@ -27,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import re
 import secrets
 import time
@@ -44,7 +49,7 @@ if TYPE_CHECKING:
     from authfi.errors import GatewayTokenRefused
     from authfi.gateway import AsyncGateway
 
-__all__ = ["RUN_HEADER", "ModelProxy"]
+__all__ = ["OPENAI_ROUTES", "ROUTES", "RUN_HEADER", "ModelProxy"]
 
 #: The header the gateway names the call's run in.
 RUN_HEADER = "AuthFI-Run-Id"
@@ -57,6 +62,13 @@ _MAX_BODY = 64 * 1024 * 1024
 #: gateway is reachable through the proxy, whoever holds its secret (the secret is in the environment of every tool
 #: Claude Code runs): not the cloud credential door, not the other model routes, not the tools.
 ROUTES = frozenset({("POST", "/v1/messages")})
+#: The same, for the OpenAI-format tools (Codex CLI, OpenCode).
+OPENAI_ROUTES = frozenset({("POST", "/v1/chat/completions"), ("POST", "/v1/responses")})
+#: The model API formats a proxy can speak, and the calls each forwards.
+_FORMAT_ROUTES = {"anthropic": ROUTES, "openai": OPENAI_ROUTES}
+#: Calls the programs make that the gateway's model door does not serve. Refused unsent and without a warning: each
+#: program has a fallback (Claude Code estimates token counts itself, and lists its own models).
+_NOT_OFFERED = frozenset({("POST", "/v1/messages/count_tokens"), ("GET", "/v1/models"), ("HEAD", "/api/hello")})
 #: The route of Claude Code's trace export, served only after :meth:`ModelProxy.relay_traces`.
 TRACE_ROUTE = ("POST", "/otlp/v1/traces")
 #: The most of a trace export's body that is read (a model request carries a conversation; an export carries spans).
@@ -162,6 +174,7 @@ class ModelProxy:
         gateway: the gateway whose HTTP client (the credential's proof on every request) carries the calls.
         on_refused: called with the gateway's refusal of the token, when a model call is answered 401.
         on_run: called with the run the gateway names on an answer.
+        api: ``anthropic`` (Claude Code; the default) or ``openai`` (Codex CLI, OpenCode): which calls are forwarded.
     """
 
     def __init__(
@@ -170,7 +183,12 @@ class ModelProxy:
         *,
         on_refused: Callable[[GatewayTokenRefused], None],
         on_run: Callable[[str], None],
+        api: str = "anthropic",
     ) -> None:
+        if api not in _FORMAT_ROUTES:
+            raise ValueError(f"the model API format is one of {sorted(_FORMAT_ROUTES)}, not {api!r}")
+        self._api = api
+        self._routes = _FORMAT_ROUTES[api]
         self._gateway = gateway
         self._on_refused = on_refused
         self._on_run = on_run
@@ -267,6 +285,7 @@ class ModelProxy:
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         logger = self._gateway.project.logger
+        method = "GET"
         try:
             try:
                 method, target, headers = await asyncio.wait_for(_read_head(reader), _HEAD_SECONDS)
@@ -276,7 +295,7 @@ class ModelProxy:
                 body = await asyncio.wait_for(_read_body(reader, writer, headers, limit), _BODY_SECONDS)
             except _BadRequest as bad:
                 logger.info("a request to the model proxy was refused: %d %s", bad.status, bad.message)
-                await _answer(writer, bad.status, bad.message)
+                await _answer(writer, bad.status, bad.message, self._api, method == "HEAD")
                 return
             if url is None:
                 await self._forward_traces(writer, headers, body)
@@ -286,10 +305,10 @@ class ModelProxy:
             logger.debug("a model call ended before it was answered")
         except TimeoutError:
             logger.info("a request to the model proxy was not sent in time and was closed")
-            await _answer(writer, 408, "the request was not sent in time")
+            await _answer(writer, 408, "the request was not sent in time", self._api)
         except Exception:
             logger.exception("the model proxy failed on a call")
-            await _answer(writer, 502, "the model call could not be forwarded")
+            await _answer(writer, 502, "the model call could not be forwarded", self._api)
         finally:
             writer.close()
 
@@ -302,9 +321,12 @@ class ModelProxy:
         route = "/" + rest
         if (method, route) == TRACE_ROUTE and self._traces is not None and not query:
             return None
-        if (method, route) not in ROUTES or not _QUERY.fullmatch(query):
-            self._gateway.project.logger.info("the model proxy does not forward %s %r", method, route[:64])
-            raise _BadRequest(404, "not found")
+        if (method, route) not in self._routes or not _QUERY.fullmatch(query):
+            offered = (method, route) in _NOT_OFFERED
+            self._gateway.project.logger.log(
+                10 if offered else 20, "the model proxy does not forward %s %r", method, route[:64]
+            )
+            raise _BadRequest(404, "not offered through the AuthFI gateway" if offered else "not found")
         return self._gateway.mcp_url + route + ("?" + query if query else "")
 
     async def _forward(
@@ -325,7 +347,7 @@ class ModelProxy:
             response: httpx.Response = await client.send(request, stream=True)
         except httpx.HTTPError as error:
             self._gateway.project.logger.warning("a model call could not reach the gateway: %s", type(error).__name__)
-            await _answer(writer, 502, "the AuthFI gateway could not be reached")
+            await _answer(writer, 502, "the AuthFI gateway could not be reached", self._api)
             return
         try:
             run = response.headers.get(RUN_HEADER)
@@ -359,7 +381,7 @@ class ModelProxy:
         """
         relay = self._traces
         if relay is None:  # not served, or stopped while the body was read
-            await _answer(writer, 404, "not found")
+            await _answer(writer, 404, "not found", self._api)
             return
         encoding = next((v for n, v in headers if n.lower() == "content-encoding"), "")
         try:
@@ -367,11 +389,11 @@ class ModelProxy:
                 rewritten = await asyncio.to_thread(relay.rewrite, body, encoding)
         except TraceRefused as refused:
             self._said(refused.kind, refused.message)
-            await _answer(writer, refused.status, refused.message)
+            await _answer(writer, refused.status, refused.message, self._api)
             return
         except Exception as error:  # a bug here is the proxy's, not the export's: a 5xx, which an exporter may retry
             self._said("internal", type(error).__name__)
-            await _answer(writer, 500, "the export could not be processed")
+            await _answer(writer, 500, "the export could not be processed", self._api)
             return
         sent = [(name, value) for name, value in headers if name.lower() in _TRACE_HEADERS]
         if self._trace_client is None:
@@ -386,7 +408,7 @@ class ModelProxy:
             self._gateway.project.logger.warning(
                 "a Claude Code trace export could not reach AuthFI: %s", type(error).__name__
             )
-            await _answer(writer, 502, "AuthFI could not be reached")
+            await _answer(writer, 502, "AuthFI could not be reached", self._api)
             return
         try:
             await _relay(writer, "POST", response)
@@ -499,8 +521,10 @@ async def _relay(
     await writer.drain()
 
 
-async def _answer(writer: asyncio.StreamWriter, status: int, message: str) -> None:
-    """A refusal this proxy makes itself, in the shape the Anthropic API answers errors in."""
+async def _answer(
+    writer: asyncio.StreamWriter, status: int, message: str, api: str = "anthropic", head_only: bool = False
+) -> None:
+    """A refusal this proxy makes itself, in the error shape of the API the caller speaks (no body for HEAD)."""
     reason = {
         400: "Bad Request",
         404: "Not Found",
@@ -510,10 +534,18 @@ async def _answer(writer: asyncio.StreamWriter, status: int, message: str) -> No
         500: "Internal Server Error",
         431: "Header Fields Too Large",
     }.get(status, "Bad Gateway")
-    body = ('{"type":"error","error":{"type":"api_error","message":"' + message + '"}}').encode()
+    caller_error = status < 500 and status != 408
+    if api == "openai":
+        kind = "invalid_request_error" if caller_error else "server_error"
+        detail = {"message": message, "type": kind, "param": None, "code": "not_found" if status == 404 else None}
+        payload: dict[str, Any] = {"error": detail}
+    else:
+        kind = "not_found_error" if status == 404 else "invalid_request_error" if caller_error else "api_error"
+        payload = {"type": "error", "error": {"type": kind, "message": message}}
+    body = json.dumps(payload).encode()
     head = f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n"
     try:
-        writer.write(head.encode() + b"Connection: close\r\n\r\n" + body)
+        writer.write(head.encode() + b"Connection: close\r\n\r\n" + (b"" if head_only else body))
         await writer.drain()
     except ConnectionError:
         return
