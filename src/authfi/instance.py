@@ -57,7 +57,7 @@ from authfi._protocol.instance import (
     parse_challenge,
     pop_claims,
 )
-from authfi._protocol.oauth import ClientAuth, b64url, parse_token_response
+from authfi._protocol.oauth import ACCESS_TOKEN_TYPE, ClientAuth, b64url, parse_token_response
 from authfi._protocol.urls import origin_of
 from authfi._protocol.verify import unverified_claims
 from authfi.agents.agent import (
@@ -65,6 +65,7 @@ from authfi.agents.agent import (
     AsyncAgentAuth,
     _AgentResource,  # pyright: ignore[reportPrivateUsage]
     _AsyncAgentResource,  # pyright: ignore[reportPrivateUsage]
+    _exchange_supported,  # pyright: ignore[reportPrivateUsage]
     _Minted,  # pyright: ignore[reportPrivateUsage]
 )
 from authfi.agents.keys import AgentKey, Signer
@@ -414,6 +415,17 @@ class InstanceAuth(AgentAuth):
     def _ciba_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
         return self._core.key()
 
+    _task_actor_type = ACCESS_TOKEN_TYPE
+
+    def _task_key(self, metadata: ServerMetadata) -> _dpop.DPoPKey:
+        _exchange_supported(metadata)
+        return self._core.key()
+
+    def _task_actor(self, key: _dpop.DPoPKey) -> Callable[[str], str]:
+        """A task is started with the instance's own access token, bound to the key that holds the task."""
+        token = self._authfi_bearer()
+        return lambda audience: token
+
     def _presenter(self) -> Presenter | None:
         minted = self._tokens.get("", lambda: self._mint(None))
         return lambda method, url: self._bearing(minted, method, url, self._project_ref.authfi_origins)
@@ -532,6 +544,17 @@ class AsyncInstanceAuth(AsyncAgentAuth):
 
     def _ciba_key(self, metadata: ServerMetadata, resource: str | None) -> _dpop.DPoPKey | None:
         return self._core.key()
+
+    _task_actor_type = ACCESS_TOKEN_TYPE
+
+    def _task_key(self, metadata: ServerMetadata) -> _dpop.DPoPKey:
+        _exchange_supported(metadata)
+        return self._core.key()
+
+    async def _task_actor_for(self, key: _dpop.DPoPKey) -> Callable[[str], str]:
+        """A task is started with the instance's own access token, bound to the key that holds the task."""
+        token = await self._authfi_bearer()
+        return lambda audience: token
 
     async def _presenter(self) -> Presenter | None:
         minted = await self._tokens.get("", lambda: self._mint(None))

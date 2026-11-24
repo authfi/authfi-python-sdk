@@ -69,6 +69,9 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError("authfi.claude_agent needs the Claude Agent SDK: pip install 'authfi[claude-agent]'") from exc
 
 from authfi._adapters import async_gateway_for, configure_langsmith
+from authfi._claude_env import ATTRIBUTION_HEADER_SWITCH as ATTRIBUTION_HEADER_SWITCH
+from authfi._claude_env import FIXED_CREDENTIALS, model_env
+from authfi._claude_env import PLACEHOLDER_KEY_COMMAND as PLACEHOLDER_KEY_COMMAND
 from authfi._claude_steps import DEFAULT_MAIN_NAME, AgentNames
 from authfi._claude_steps import available as agent_names_available
 from authfi._holds import Decided, Held, HeldCalls
@@ -100,10 +103,6 @@ def _shell_word(word: str) -> str:
     return subprocess.list2cmdline([word]) if os.name == "nt" else shlex.quote(word)
 
 
-#: The key Claude Code is given for the AI gateway. It is not a credential: the loopback proxy drops it and sends
-#: the call with this process's own. Claude Code needs some key to start, and ``echo`` prints one in every shell.
-PLACEHOLDER_KEY_COMMAND = "echo authfi-loopback"
-
 #: How long Claude Code keeps the headers from ``otelHeadersHelper`` before running it again: well inside an agent
 #: token's lifetime of minutes. Its default is 29 minutes, which would send an expired token on a long run.
 HEADERS_HELPER_TTL_MS = 240_000
@@ -113,18 +112,12 @@ HEADERS_HELPER_TTL_MS = 240_000
 #: capped there), and the first export has to run ``otelHeadersHelper``, a process that takes about a second.
 TRACE_EXPORT_INTERVAL_MS = 1_000
 
-#: Claude Code's first system part is ``x-anthropic-billing-header: cc_version=...; cc_entrypoint=...``, and its
-#: three-hex suffix changes with the first user message, so no two runs of one agent send the same system text. "0"
-#: has Claude Code leave the part out. Set by default; the owner's ``env`` (or ``settings["env"]``) wins.
-ATTRIBUTION_HEADER_SWITCH = "CLAUDE_CODE_ATTRIBUTION_HEADER"
-
 #: What the model is offered besides the AuthFI tools: Claude Code's sub-agent tool and none of its built-ins (Bash,
 #: Write, WebFetch, ...). ``ClaudeAgentOptions.tools`` is the set offered; ``allowed_tools`` only skips the prompt.
 DEFAULT_TOOLS = ("Agent",)
 
-#: Environment that would hand Claude Code a fixed credential; the helper is the only way in. Claude
-#: Code inherits this process's environment, so each is also blanked in the environment it is given.
-_FIXED_CREDENTIALS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AUTHFI_AGENT_PRIVATE_KEY")
+#: Environment that would hand Claude Code a fixed credential; the helper is the only way in.
+_FIXED_CREDENTIALS = FIXED_CREDENTIALS
 
 #: Environment the integration sets and the caller may not: a different value would send the agent's
 #: token to another host, run another helper, or switch content on.
@@ -532,15 +525,8 @@ class ClaudeAgentIntegration:
         env = {
             ATTRIBUTION_HEADER_SWITCH: "0",
             **given_env,
-            # Claude Code starts with this process's environment under these: blank, so none reaches it.
-            **dict.fromkeys(_FIXED_CREDENTIALS, ""),
-            "ANTHROPIC_BASE_URL": proxy_url,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-            "ANTHROPIC_SMALL_FAST_MODEL": model,
-            # The AI gateway serves the models the project configures; Anthropic's experimental
-            # beta headers are not passed through to them.
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            # Claude Code starts with this process's environment under these, the fixed credentials blank.
+            **model_env(proxy_url, model),
             "OTEL_RESOURCE_ATTRIBUTES": ",".join(f"{name}={value}" for name, value in resource.items()),
             **(self._trace_env() if export_steps else {}),
             **self.helper_env(),

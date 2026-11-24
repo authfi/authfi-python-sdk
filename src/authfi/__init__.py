@@ -18,10 +18,10 @@ import warnings
 from typing import TYPE_CHECKING, Final
 
 from authfi._connect import connect, connect_async
-from authfi._protocol.input_source import untrusted_input
 from authfi._protocol.agent import CIBA_GRANT as CIBA_GRANT_TYPE
 from authfi._protocol.discovery import ServerMetadata
 from authfi._protocol.ids import idempotency_key, request_id
+from authfi._protocol.input_source import untrusted_input
 from authfi._protocol.oauth import CLIENT_ASSERTION_TYPE
 from authfi._transport import user_agent
 from authfi._version import __version__
@@ -235,7 +235,7 @@ __all__ = [
     "assert_public_jwk",
     "connect",
     "connect_async",
-    "untrusted_input",
     "idempotency_key",
     "request_id",
+    "untrusted_input",
 ]

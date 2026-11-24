@@ -85,8 +85,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     raise ImportError("authfi.openai_agents needs the OpenAI Agents SDK: pip install 'authfi[openai-agents]'") from exc
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
-from authfi._protocol.input_source import add_mark, responses_input_is_untrusted
 from authfi._protocol.ids import Step, inject_traceparent, register_step_source, step_traceparent
+from authfi._protocol.input_source import add_mark, responses_input_is_untrusted
 from authfi.errors import ConfigurationError, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,

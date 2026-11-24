@@ -27,6 +27,10 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   the content they hold. A request of only what the person typed sends nothing, because the gateway reads one
   request-level header and lets code add taint, never remove it. `with authfi.untrusted_input():` marks every model
   request made inside it, for an app that fetches text into a user turn.
+- A workload-bound instance can ask for a task: `request_task` and `await_task` on `InstanceAuth` and `AsyncInstanceAuth` send the
+  instance's own access token as the actor (`actor_token_type` the access-token type) in place of a client assertion, which an
+  instance holds no key to sign, and the task is held by the instance's own key, the one that signs the request's proof.
+  Before this a bound agent, the only kind that can be registered, raised `instance_assertion` when it asked for a task.
 - `authfi login`, `authfi token --resource llm` and `authfi logout` give a person Claude Code's credential for the
   project's `/llm` door (`pip install "authfi[login]"`). The login registers a public client once per machine (RFC 7591),
   signs in with the code flow, PKCE S256 and a one-shot loopback listener (RFC 8252), and asks for `resource=<issuer>/llm`
@@ -41,6 +45,8 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
   is kept in pieces, `login` and `logout` share the renewal's lock, a renewal of unknown outcome is never repeated with
   the spent token, `token --resource llm` prints nothing when its environment would steer the token elsewhere or expose it (another base URL or provider, an unallowed proxy, a CA or TLS variable), and the
   issuer comes from the discovery document.
+- `authfi claude` runs the interactive Claude Code through the AuthFI AI gateway as the agent the environment names (a person's own agent), so a team works in Claude Code with no Anthropic sign-in, subscription or key. It reuses the loopback model proxy of `authfi.claude_agent`; the environment both give Claude Code is now built in one place. Claude Code's `count_tokens`, `models` and `api/hello` calls, which the gateway's model door does not serve, are answered `404` by the proxy and sent nowhere.
+- `authfi run [--format openai|anthropic] -- TOOL [ARGS]` runs any coding tool (Codex CLI, OpenCode) through the same loopback proxy: it sets `OPENAI_BASE_URL`, `OPENAI_API_BASE` and `OPENAI_API_KEY` (or the `ANTHROPIC_*` three) to the proxy and a placeholder key, overrides and names the person's own values, keeps `AUTHFI_*` away from the tool, and replaces `{base_url}` in the tool's arguments. `ModelProxy` takes `api="openai"` to forward `POST /v1/chat/completions` and `POST /v1/responses`, and answers its refusals in that API's error shape. See [docs/agents.md](docs/agents.md).
 - `scripts/b3_np_check.py` runs the platform's DPoP refusals (Bearer, no proof, a replayed proof, a proof for another URL,
   method or token) against a probe project on np, each beside its admitted control. `tests/unit/test_b3_dpop_window.py`
   holds the SDK to the same rules offline: a renewal after the nonce rotated, no downgrade to Bearer after a refusal.

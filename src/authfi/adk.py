@@ -57,8 +57,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for
 from authfi._holds import Held, HeldCalls
-from authfi._protocol.input_source import add_mark, contents_are_untrusted
 from authfi._protocol.ids import inject_traceparent
+from authfi._protocol.input_source import add_mark, contents_are_untrusted
 from authfi.errors import ConfigurationError, GatewayTokenRefused, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,
