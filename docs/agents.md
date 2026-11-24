@@ -294,6 +294,52 @@ delegated tokens are `AsyncDelegatedToken`. Cancel the task to stop a wait.
 | `authfi keygen --out PATH [--alg ...] [--kid ...]` | the public JWK and its thumbprint |
 | `authfi token` | the agent's current token |
 | `authfi headers` | `{"Authorization": "Bearer ..."}` as JSON, with `X-Request-Id` from `AUTHFI_RUN_ID` |
+| `authfi claude [--model M] [--small-model M] [-- ARGS]` | runs Claude Code, its model calls through the AI gateway as this agent |
+| `authfi run [--format openai\|anthropic] -- TOOL [ARGS]` | runs any coding tool (Codex CLI, OpenCode, ...) the same way |
 
 `token` and `headers` read the environment above. A failure prints nothing on standard output and
 exits 1, so a tool that runs them never mistakes an error for a credential.
+
+`authfi claude` runs the interactive Claude Code as the agent the environment names: typically a person's own
+personal-assistant agent bound to their device. Claude Code's model calls go to a loopback proxy in this process, which
+sends them to the project's AI gateway with the agent's credential, so no Anthropic sign-in, subscription or API key is
+used. A person's own `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_BASE_URL` is overridden and named; the
+`AUTHFI_*` variables are not given to Claude Code; its non-essential traffic is off. `--model` is the session's first
+model (`/model` switches among what the gateway serves), `--small-model` the one Claude Code uses for its own
+background work; both default to `claude-haiku-5-5`.
+
+Claude Code also asks for `POST /v1/messages/count_tokens`, `GET /v1/models` (when its gateway model discovery is on)
+and `HEAD /api/hello`. The proxy answers each `404` itself and sends nothing on; Claude Code then estimates token
+counts and keeps its own model list. Claude Code runs the key helper `echo authfi-loopback` from `--settings`; it sends
+that value in `Authorization` and `x-api-key`, and the proxy drops both.
+
+### Other coding tools: `authfi run`
+
+`authfi run [--format openai|anthropic] -- TOOL [ARGS]` starts the same loopback proxy and runs `TOOL` with the
+variables its model SDK reads, set to the proxy and a placeholder key. Every call leaves with the agent's credential
+for the AI gateway. `--format` is the API the tool speaks: `openai` (the default) forwards `POST /v1/chat/completions`
+and `POST /v1/responses`; `anthropic` forwards `POST /v1/messages`. Anything else the tool asks for is answered `404` in
+that API's error shape and sent nowhere.
+
+| format | variables set for the tool |
+|---|---|
+| `openai` | `OPENAI_BASE_URL` and `OPENAI_API_BASE` (`http://127.0.0.1:PORT/SECRET/v1`), `OPENAI_API_KEY` (a placeholder) |
+| `anthropic` | `ANTHROPIC_BASE_URL` (`http://127.0.0.1:PORT/SECRET`), `ANTHROPIC_API_KEY` (a placeholder), `ANTHROPIC_AUTH_TOKEN` (empty) |
+
+A person's own value of any of these is overridden and named on stderr, and `AUTHFI_*` is not passed to the tool. A tool
+that takes its base URL from a configuration file rather than the environment can be given it on the command line:
+`{base_url}` in an argument is replaced by the value `OPENAI_BASE_URL` (or `ANTHROPIC_BASE_URL`) has. The port and
+secret are new for every launch, so each launch is also its own run key, and its own run at the gateway.
+
+**Codex CLI** reads the base URL of its built-in OpenAI provider from the `openai_base_url` key of `config.toml`, which
+the command line can set with `-c`, and the key from the variable a provider's `env_key` names:
+
+```
+authfi run -- codex -c 'openai_base_url="{base_url}"'
+```
+
+**OpenCode** takes a provider's base URL and key variable from the provider block of its configuration, as its
+provider documentation describes for an OpenAI-compatible endpoint, and replaces `{env:NAME}` in that file by the
+environment's value. Set the block's base URL to `{env:OPENAI_BASE_URL}` and its key variable to `OPENAI_API_KEY`, then
+run `authfi run -- opencode`. The block is written once and serves every launch. The model names are the ones
+`GET <issuer>/llm/v1/models` lists, in the form `<provider>/<model>`.
