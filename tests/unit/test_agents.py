@@ -15,6 +15,7 @@ import pytest
 
 from authfi import (
     AgentKey,
+    ApprovalUnavailable,
     AsyncAuthFI,
     AuthFI,
     AuthFISecurityWarning,
@@ -408,12 +409,20 @@ def test_an_approval_is_opened_with_the_agents_own_credential(agent: AgentAuth, 
     assert claims_of(opened["client_assertion"])["aud"] == platform.issuer
 
 
-def test_reading_an_approval_the_project_does_not_let_agents_read(agent: AgentAuth, platform: AgentPlatform) -> None:
-    platform.approval_status = 403
-    with pytest.raises(NotSupportedError) as caught:
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [(401, "agent_refused"), (403, "agent_not_allowed"), (404, "approval_not_found")],
+)
+def test_a_refused_approval_read_says_why_and_stops_the_wait_at_once(
+    agent: AgentAuth, platform: AgentPlatform, status: int, reason: str
+) -> None:
+    platform.approval_status = status
+    with pytest.raises(ApprovalUnavailable) as caught:
         agent.approval("apr-1")
-    assert caught.value.feature == "agent_approval_status"
-    with pytest.raises(NotSupportedError):
+    assert caught.value.reason == reason
+    assert caught.value.status == status
+    assert not isinstance(caught.value, NotSupportedError)
+    with pytest.raises(ApprovalUnavailable):
         agent.wait_for_approval("apr-1")
     assert platform.approval_reads == 2
 

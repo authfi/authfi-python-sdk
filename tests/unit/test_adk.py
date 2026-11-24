@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from google.adk.events import Event
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
-from authfi import AgentKey, AsyncAuthFI, ConfigurationError, GatewayTokenRefused, IntegrationError
+from authfi import AgentKey, ApprovalUnavailable, AsyncAuthFI, ConfigurationError, GatewayTokenRefused, IntegrationError
 from authfi.adk import ADKIntegration, _no_google_mtls
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
@@ -42,10 +43,12 @@ async def adk(fake: FakeGateway, key: AgentKey) -> AsyncIterator[ADKIntegration]
 
 
 class Run:
-    def __init__(self, adk: ADKIntegration) -> None:
+    def __init__(self, adk: ADKIntegration, sessions: Any = None) -> None:
         self.adk = adk
         agent = adk.agent(name="research", instruction="Answer briefly.", model="claude-haiku-5-5")
         self.runner = InMemoryRunner(agent=agent, app_name="authfi-test")
+        if sessions is not None:
+            self.runner.session_service = sessions
         self.session_id = ""
 
     async def send(self, message: types.Content) -> list[Event]:
@@ -473,3 +476,88 @@ async def test_a_model_call_and_a_tool_call_name_the_step_that_made_them(
     # The MCP session was opened inside the agent's step; the call names the tool's own.
     assert exported[calls[0][:2]] == f"execute_tool {ALLOWED}"
     provider.shutdown()
+
+
+# --- approval_poll, and a restart --------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def test_the_person_decides_and_the_run_continues_by_itself(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        adk = ADKIntegration(af.agent(AGENT, key), poll_interval=0.01)
+        readable.model_script += [_use(STEP_UP), [{"type": "text", "text": "Read it."}]]
+        run = Run(adk)
+        (pending,) = adk.held_approvals(await run.ask("Read the wiki"))
+
+        waiting = asyncio.ensure_future(adk.await_decision(pending))
+        await asyncio.sleep(0.1)
+        assert not waiting.done()
+        readable.decide(pending.approval_id, "approved")
+        answer = await asyncio.wait_for(waiting, 10)
+        assert answer is not None
+        events = await run.send(answer)
+
+    assert _final(events) == "Read it."
+    assert readable.tool_calls == [(STEP_UP, ARGS)]
+    assert pending.approval_id not in _everything_the_model_read(readable)
+
+
+@pytest.mark.parametrize("status", ["denied", "expired", "cancelled"])
+async def test_a_decision_against_the_call_reaches_the_model_as_not_run(
+    readable: FakeGateway, key: AgentKey, status: str
+) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        adk = ADKIntegration(af.agent(AGENT, key), poll_interval=0.01)
+        readable.model_script += [_use(STEP_UP), [{"type": "text", "text": "Not done."}]]
+        run = Run(adk)
+        (pending,) = adk.held_approvals(await run.ask("Read the wiki"))
+        readable.decide(pending.approval_id, status)
+        answer = await adk.await_decision(pending)
+        assert answer is not None
+        events = await run.send(answer)
+
+    assert _final(events) == "Not done."
+    assert readable.tool_calls == []
+    assert "Not run" in _everything_the_model_read(readable)
+
+
+async def test_no_decision_in_time_is_none_and_the_approval_stays_open(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        adk = ADKIntegration(af.agent(AGENT, key), poll_interval=0.01, approval_timeout=0.05)
+        readable.model_script += [_use(STEP_UP)]
+        (pending,) = adk.held_approvals(await Run(adk).ask("Read the wiki"))
+        assert await adk.await_decision(pending) is None
+    assert readable.pending() == [pending.approval_id]
+
+
+async def test_an_agent_revoked_while_waiting_raises(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        adk = ADKIntegration(af.agent(AGENT, key), poll_interval=0.01)
+        readable.model_script += [_use(STEP_UP)]
+        (pending,) = adk.held_approvals(await Run(adk).ask("Read the wiki"))
+        readable.revoked = True
+        with pytest.raises(ApprovalUnavailable):
+            await adk.await_decision(pending)
+
+
+async def test_a_restarted_process_resumes_the_session_with_the_approval(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        first = Run(ADKIntegration(af.agent(AGENT, key)))
+        readable.model_script += [_use(STEP_UP), [{"type": "text", "text": "Read it."}]]
+        (pending,) = ADKIntegration.held_approvals(await first.ask("Read the wiki"))
+    readable.decide(pending.approval_id, "approved")
+
+    async with AsyncAuthFI(readable.issuer) as af2:  # a new process: a new integration; only the session carries over
+        second = Run(ADKIntegration(af2.agent(AGENT, key)), sessions=first.runner.session_service)
+        second.session_id = first.session_id
+        events = await second.send(ADKIntegration.answer(pending, confirmed=True))
+
+    assert _final(events) == "Read it."
+    assert readable.tool_calls == [(STEP_UP, ARGS)]
+    assert len(readable.approvals) == 1
+    assert pending.approval_id not in _everything_the_model_read(readable)

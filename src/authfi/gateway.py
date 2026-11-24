@@ -32,6 +32,7 @@ from authfi._protocol.gateway import (
     APPROVAL_ARGUMENT,
     CLOUD_PATH,
     HOLD_MESSAGE,
+    OTHER_RUN_REFUSAL,
     CloudCredential,
     ToolAllowed,
     ToolApprovalRequired,
@@ -54,7 +55,7 @@ from authfi._protocol.ids import (
     valid_traceparent,
 )
 from authfi._transport import user_agent
-from authfi.errors import ConfigurationError, GatewayTokenRefused
+from authfi.errors import ConfigurationError, GatewayTokenRefused, NotSupportedError, WaitTimeout
 from authfi.tokens import AsyncTokenSource, TokenSource
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
 __all__ = [
     "APPROVAL_ARGUMENT",
     "HOLD_MESSAGE",
+    "OTHER_RUN_REFUSAL",
     "TOKEN_REFUSED_MESSAGE",
     "AsyncGateway",
     "CloudCredential",
@@ -547,6 +549,28 @@ class Gateway(_GatewayBase):
             event_hooks={"request": [on_request], "response": [on_response]},
         )
 
+    def await_approval(self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = 3.0) -> str:
+        """Wait for a person to decide a held call's approval; the call is then sent again and the gateway decides.
+
+        Polls the approval with the agent's own token (a token held for a person is refused by that route, so
+        this needs the agent itself). Returns ``approved``, ``denied``, ``expired`` or ``cancelled`` once decided,
+        or ``pending`` when ``timeout`` seconds pass first (the approval stays open). Raises
+        :class:`~authfi.ApprovalUnavailable` at once when the agent's token is refused, the agent may not read
+        approvals or the approval is unknown: waiting longer cannot help.
+        """
+        wait = getattr(self.source, "wait_for_approval", None)
+        if not callable(wait):
+            raise NotSupportedError(
+                "approval_poll",
+                "Polling an approval needs the agent's own credential: the route refuses a token held for a person.",
+            )
+        try:
+            decided = cast("Any", wait)(approval_id, timeout=timeout, poll_interval=poll_interval)
+        except WaitTimeout:
+            return "pending"
+        self.project.logger.info("approval %s is %s", approval_id, decided.status)
+        return cast(str, decided.status)
+
     def cloud_credentials(
         self,
         account: str,
@@ -610,6 +634,28 @@ class AsyncGateway(_GatewayBase):
         #: See :attr:`Gateway.cloud`.
         self.cloud = AsyncCloudAccess(self)
         project._track(self)  # pyright: ignore[reportPrivateUsage]
+
+    async def await_approval(self, approval_id: str, *, timeout: float = 300.0, poll_interval: float = 3.0) -> str:
+        """Wait for a person to decide a held call's approval; the call is then sent again and the gateway decides.
+
+        Polls the approval with the agent's own token (a token held for a person is refused by that route, so
+        this needs the agent itself). Returns ``approved``, ``denied``, ``expired`` or ``cancelled`` once decided,
+        or ``pending`` when ``timeout`` seconds pass first (the approval stays open). Raises
+        :class:`~authfi.ApprovalUnavailable` at once when the agent's token is refused, the agent may not read
+        approvals or the approval is unknown: waiting longer cannot help.
+        """
+        wait = getattr(self.source, "wait_for_approval", None)
+        if not callable(wait):
+            raise NotSupportedError(
+                "approval_poll",
+                "Polling an approval needs the agent's own credential: the route refuses a token held for a person.",
+            )
+        try:
+            decided = await cast("Any", wait)(approval_id, timeout=timeout, poll_interval=poll_interval)
+        except WaitTimeout:
+            return "pending"
+        self.project.logger.info("approval %s is %s", approval_id, decided.status)
+        return cast(str, decided.status)
 
     @overload
     def http_client(self) -> httpx.AsyncClient: ...

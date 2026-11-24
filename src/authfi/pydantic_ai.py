@@ -40,7 +40,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self, cast
@@ -219,7 +219,16 @@ class AuthFIToolset(MCPToolset[Any]):
     approval (see :meth:`resolve`).
     """
 
-    def __init__(self, gateway: AsyncGateway, *, include_never_allowed: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        gateway: AsyncGateway,
+        *,
+        include_never_allowed: bool = False,
+        approval_poll: bool = False,
+        approval_timeout: float = 900.0,
+        poll_interval: float = 3.0,
+        **kwargs: Any,
+    ) -> None:
         for refused in ("client", "http_client", "headers", "auth", "verify", "process_tool_call"):
             if refused in kwargs:
                 raise ConfigurationError(f"{refused} is set by the integration")
@@ -228,6 +237,11 @@ class AuthFIToolset(MCPToolset[Any]):
         super().__init__(transport, **kwargs)
         self.gateway = gateway
         self.include_never_allowed = include_never_allowed
+        #: With ``approval_poll``, :meth:`resolve` waits (up to ``approval_timeout`` seconds, polling every
+        #: ``poll_interval``) for a person to decide each held call, with the agent's own token, then sends it again.
+        self.approval_poll = approval_poll
+        self.approval_timeout = approval_timeout
+        self.poll_interval = poll_interval
         self._held = HeldCalls(gateway)
         self._listed: set[str] = set()
 
@@ -305,8 +319,28 @@ class AuthFIToolset(MCPToolset[Any]):
             if not isinstance(known, Decided):
                 known = await self._send(call.tool_name, args, known.approval_id if known else None)
                 self._held.remember(call.tool_name, args, known)
+            if isinstance(known, Held) and self.approval_poll:
+                status = await self.gateway.await_approval(
+                    known.approval_id, timeout=self.approval_timeout, poll_interval=self.poll_interval
+                )
+                if status != "pending":
+                    known = await self._send(call.tool_name, args, known.approval_id)
+                    self._held.remember(call.tool_name, args, known)
             if isinstance(known, Held):
                 waiting.append(PendingApproval(known.approval_id, call.tool_name, args, call))
                 continue
             results.approvals[call.tool_call_id] = True
         return waiting
+
+    def held(self) -> list[dict[str, Any]]:
+        """The calls the gateway holds, as data to save beside the run's messages: ``approval_id``, ``tool``, ``args``.
+
+        A new process loads the messages and gives these to :meth:`adopt`, so it resumes the call the person decided
+        instead of raising a second approval. They never go to the model.
+        """
+        return self._held.saved()
+
+    def adopt(self, held: Sequence[Mapping[str, Any]]) -> None:
+        """Remember calls saved by :meth:`held` elsewhere, so :meth:`resolve` sends them with their approval."""
+        self._held.adopt(held)
+        self._listed.update(c["tool"] for c in held if isinstance(c.get("tool"), str))

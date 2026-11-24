@@ -20,6 +20,15 @@ machine clients and AI agents. See [docs/migration-0.2.md](docs/migration-0.2.md
 - Every tool call through the gateway client carries one `Idempotency-Key`: fresh for each logical call, the same on
   every attempt of it (a nonce challenge, a refused token, a server error). A test runs a whole task, a handover and a
   takeover and finds no run key in the environment, any file, any log, an error report or any byte the gateway received.
+- `approval_poll` on the Claude Agent SDK, LangGraph, OpenAI Agents and Pydantic AI integrations, `ADKIntegration.await_decision`
+  and `AsyncGateway.await_approval`: a held call waits for the person's decision in AuthFI, polled with the agent's
+  own token, then continues. `held()`/`adopt()` resume a saved run after a restart. `authfi.langchain_hitl`
+  (extra `langchain-hitl`) is LangChain's `create_agent` pause decided by AuthFI. `ApprovalUnavailable` says why an
+  approval cannot be read (a revoked or suspended agent no longer reads as a project without approval status).
+  `ToolRefused.why` is `approval_other_run` when a project binds approvals to the run.
+- `ClaudeAgentIntegration(approval_timeout=...)`: `wait_for_decision` now has a time limit (900 seconds), and a wait that
+  raises no longer escapes `can_use_tool`. Either way the call is refused for now, never run, and the approval stays
+  open; a refused token still ends the run.
 - A workload-bound instance can ask for a task: `request_task` and `await_task` on `InstanceAuth` and `AsyncInstanceAuth` send the
   instance's own access token as the actor (`actor_token_type` the access-token type) in place of a client assertion, which an
   instance holds no key to sign, and the task is held by the instance's own key, the one that signs the request's proof.

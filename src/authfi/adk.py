@@ -175,7 +175,16 @@ class ADKIntegration:
 
     """
 
-    def __init__(self, source: AsyncTokenSource, *, project: AsyncAuthFI | None = None) -> None:
+    def __init__(
+        self,
+        source: AsyncTokenSource,
+        *,
+        project: AsyncAuthFI | None = None,
+        approval_timeout: float = 900.0,
+        poll_interval: float = 3.0,
+    ) -> None:
+        self.approval_timeout = approval_timeout
+        self.poll_interval = poll_interval
         self.source = source
         self.gateway = async_gateway_for(source, project)
         self.agent_id = agent_id_of(source)
@@ -327,6 +336,22 @@ class ADKIntegration:
                     given = cast(dict[str, Any], args) if isinstance(args, dict) else {}
                     out.append(PendingApproval(approval_id, tool, given, call.id))
         return out
+
+    async def await_decision(self, pending: PendingApproval) -> types.Content | None:
+        """Wait for a person to decide ``pending``, then the message that answers ADK's confirmation for it.
+
+        Polls the approval with the agent's own token (``poll_interval`` seconds apart, for up to
+        ``approval_timeout``). Approved: the answer confirms, the call is sent with its approval and the gateway
+        decides. Denied, expired or cancelled: the answer declines, and the model reads that the action did not run.
+        ``None`` when nobody decided in time; the approval stays open. A revoked or suspended agent raises
+        :class:`~authfi.ApprovalUnavailable`. Send the answer to the run to continue it.
+        """
+        status = await self.gateway.await_approval(
+            pending.approval_id, timeout=self.approval_timeout, poll_interval=self.poll_interval
+        )
+        if status == "pending":
+            return None
+        return self.answer(pending, confirmed=status == "approved")
 
     @staticmethod
     def answer(pending: PendingApproval, *, confirmed: bool) -> types.Content:

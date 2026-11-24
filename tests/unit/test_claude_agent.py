@@ -5,6 +5,7 @@ The gateway is the real-HTTP stand-in; Claude Code itself is not started.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator, Iterator
@@ -1130,3 +1131,136 @@ def test_a_value_nested_too_deep_is_refused_and_a_real_nesting_is_not() -> None:
         AgentNames().rewrite(_nested_depth(MAX_DEPTH + 10), "")
     assert (refused.value.status, refused.value.kind) == (413, "too-deep")
     assert b"claude_code" in AgentNames().rewrite(_nested_depth(3), "")
+
+
+# --- a wait that does not end, and one that fails ---------------------------------------------------
+
+
+async def test_a_wait_that_never_ends_is_refused_and_the_approval_stays_open(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    async def never(pending: PendingApproval) -> None:
+        await asyncio.Event().wait()
+
+    claude = ClaudeAgentIntegration(
+        af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=never, approval_timeout=0.05
+    )
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert decision.interrupt is False
+    assert "did not come in time" in decision.message
+    (approval_id,) = fake.pending()
+    assert approval_id not in decision.message
+    fake.decide(approval_id, "approved")
+    assert isinstance(await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT), PermissionResultAllow)
+
+
+async def test_a_wait_that_fails_is_refused_to_the_model_without_its_error(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    def broken(pending: PendingApproval) -> None:
+        raise RuntimeError("poll failed for " + pending.approval_id)
+
+    claude = ClaudeAgentIntegration(af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=broken)
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert "could not be checked" in decision.message
+    (approval_id,) = fake.pending()
+    assert approval_id not in decision.message
+    assert fake.tool_calls == []
+
+
+async def test_a_wait_that_finds_the_agent_revoked_stops_the_run(
+    fake: FakeGateway, af: AsyncAuthFI, key_file: Path
+) -> None:
+    def revoked(pending: PendingApproval) -> None:
+        fake.revoked = True
+
+    claude = ClaudeAgentIntegration(af.agent(AGENT, AgentKey.from_file(key_file, kid="k1")), wait_for_decision=revoked)
+    decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert decision.interrupt is True
+    assert isinstance(claude.token_refused, GatewayTokenRefused)
+
+
+# --- approval_poll ----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def _polling(readable: FakeGateway, key_file: Path, **options: Any) -> tuple[ClaudeAgentIntegration, AsyncAuthFI]:
+    project = AsyncAuthFI(readable.issuer)
+    claude = ClaudeAgentIntegration(
+        project.agent(AGENT, AgentKey.from_file(key_file, kid="k1")),
+        approval_poll=True,
+        poll_interval=0.01,
+        **options,
+    )
+    return claude, project
+
+
+async def _held(readable: FakeGateway) -> str:
+    """The approval the held call has opened, waited for: the call reaches the gateway on its own schedule."""
+    for _ in range(500):
+        pending = readable.pending()
+        if pending:
+            (approval_id,) = pending
+            return approval_id
+        await asyncio.sleep(0.01)
+    raise AssertionError("the held call opened no approval")
+
+
+async def test_a_held_call_continues_by_itself_once_the_person_decides(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        approval_id = await _held(readable)
+        assert not deciding.done()
+        readable.decide(approval_id, "approved")
+        decision = await asyncio.wait_for(deciding, 5)
+
+        assert isinstance(decision, PermissionResultAllow)
+        answer = await _handler(claude, STEP_UP)(ARGS)
+        assert "answered for pallets/flask" in answer["content"][0]["text"]
+        assert approval_id not in json.dumps(answer)
+
+
+async def test_a_denied_approval_reaches_the_model_as_refused(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        approval_id = await _held(readable)
+        readable.decide(approval_id, "denied")
+        assert isinstance(await asyncio.wait_for(deciding, 5), PermissionResultAllow)
+        answer = await _handler(claude, STEP_UP)(ARGS)
+        assert "approval_denied" in answer["content"][0]["text"]
+        assert readable.tool_calls == []
+
+
+async def test_an_undecided_approval_is_refused_for_now_when_the_poll_times_out(
+    readable: FakeGateway, key_file: Path
+) -> None:
+    claude, project = await _polling(readable, key_file, approval_timeout=0.1)
+    async with project:
+        decision = await claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT)
+        assert isinstance(decision, PermissionResultDeny)
+        assert "did not come in time" in decision.message
+        assert len(readable.pending()) == 1
+
+
+async def test_an_agent_revoked_while_waiting_ends_the_run(readable: FakeGateway, key_file: Path) -> None:
+    claude, project = await _polling(readable, key_file)
+    async with project:
+        deciding = asyncio.ensure_future(claude.can_use_tool(_name(STEP_UP), ARGS, CONTEXT))
+        await _held(readable)
+        readable.revoked = True
+        decision = await asyncio.wait_for(deciding, 5)
+        assert isinstance(decision, PermissionResultDeny)
+        assert decision.interrupt is True

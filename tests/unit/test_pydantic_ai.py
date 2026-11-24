@@ -12,9 +12,9 @@ import pytest
 pytest.importorskip("pydantic_ai")
 
 from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults
-from pydantic_ai.messages import ModelRequest, ToolReturnPart
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelRequest, ToolCallPart, ToolReturnPart
 
-from authfi import AgentKey, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
+from authfi import AgentKey, ApprovalUnavailable, AsyncAuthFI, AuthFI, ConfigurationError, GatewayTokenRefused
 from authfi.gateway import APPROVAL_ARGUMENT, HOLD_MESSAGE
 from authfi.pydantic_ai import AuthFIModel, AuthFIToolset, PydanticAIIntegration
 from tests.fake_gateway import ALLOWED, NEVER, STEP_UP, UNGRANTED, FakeGateway
@@ -338,3 +338,104 @@ async def test_export_steps_sends_the_agents_steps_to_authfi(
     posted = b"".join(r["body"] for r in fake.requests if r["path"] == "/otlp/v1/traces")
     assert not any(t.encode() in posted for t in fake.minted)
     assert (b"ada@example.com" in posted) is capture_content
+
+
+# --- approval_poll, and a restart --------------------------------------------------------------------
+
+
+@pytest.fixture
+def readable() -> Iterator[FakeGateway]:
+    with FakeGateway(approvals_readable=True) as gateway:
+        yield gateway
+
+
+async def _first_pending(gateway: FakeGateway) -> str:
+    for _ in range(500):
+        if gateway.pending():
+            return gateway.pending()[0]
+        await asyncio.sleep(0.01)
+    raise AssertionError("no approval was raised")
+
+
+async def test_resolve_waits_for_the_person_and_the_run_continues(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = PydanticAIIntegration(af.agent(AGENT, key))
+        async with integration.toolset(approval_poll=True, poll_interval=0.01) as tools:
+            agent, result = await _deferred(readable, integration, tools)
+            decisions = DeferredToolResults()
+
+            resolving = asyncio.ensure_future(tools.resolve(result.output, decisions))
+            approval_id = await _first_pending(readable)
+            assert not resolving.done()
+            readable.decide(approval_id, "approved")
+            assert await asyncio.wait_for(resolving, 10) == []
+            final = await _resume(agent, result, decisions)
+
+    assert final.output == "Finished."
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert approval_id not in _everything_the_model_read(readable)
+
+
+async def test_resolve_returns_a_call_nobody_decided_in_time(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = PydanticAIIntegration(af.agent(AGENT, key))
+        async with integration.toolset(approval_poll=True, poll_interval=0.01, approval_timeout=0.05) as tools:
+            _, result = await _deferred(readable, integration, tools)
+            (waiting,) = await tools.resolve(result.output, DeferredToolResults())
+    assert readable.pending() == [waiting.approval_id]
+
+
+async def test_an_agent_revoked_while_resolve_waits_raises(readable: FakeGateway, key: AgentKey) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = PydanticAIIntegration(af.agent(AGENT, key))
+        async with integration.toolset(approval_poll=True, poll_interval=0.01) as tools:
+            _, result = await _deferred(readable, integration, tools)
+            resolving = asyncio.ensure_future(tools.resolve(result.output, DeferredToolResults()))
+            await _first_pending(readable)
+            readable.revoked = True
+            with pytest.raises(ApprovalUnavailable):
+                await asyncio.wait_for(resolving, 10)
+
+
+async def test_a_restarted_process_resumes_saved_messages_with_the_approval(
+    readable: FakeGateway, key: AgentKey
+) -> None:
+    async with AsyncAuthFI(readable.issuer) as af:
+        integration = PydanticAIIntegration(af.agent(AGENT, key))
+        async with integration.toolset() as tools:
+            _, result = await _deferred(readable, integration, tools)
+            (waiting,) = await tools.resolve(result.output, DeferredToolResults())
+            saved = json.dumps(
+                {
+                    "messages": ModelMessagesTypeAdapter.dump_python(result.all_messages(), mode="json"),
+                    "requests": result.output.approvals[0].tool_call_id,
+                    "held": tools.held(),
+                }
+            )
+    assert waiting.approval_id in saved
+    readable.decide(waiting.approval_id, "approved")
+
+    async with AsyncAuthFI(readable.issuer) as af2:  # a new process: only the saved text carries over
+        integration = PydanticAIIntegration(af2.agent(AGENT, key))
+        async with integration.toolset() as tools:
+            loaded = json.loads(saved)
+            messages = ModelMessagesTypeAdapter.validate_python(loaded["messages"])
+            tools.adopt(loaded["held"])
+            requests = DeferredToolRequests(approvals=[_tool_call_in(messages, loaded["requests"])])
+            decisions = DeferredToolResults()
+            assert await tools.resolve(requests, decisions) == []
+            agent = _agent(integration, tools)
+            final = await agent.run(message_history=messages, deferred_tool_results=decisions)
+
+    assert final.output == "Finished."
+    assert readable.tool_calls == [(STEP_UP, {"repoName": "pallets/flask"})]
+    assert len(readable.approvals) == 1  # the saved approval was used; no second one was raised
+    assert waiting.approval_id not in _everything_the_model_read(readable)
+
+
+def _tool_call_in(messages: list[ModelMessage], tool_call_id: str) -> ToolCallPart:
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, ToolCallPart) and part.tool_call_id == tool_call_id:
+                return part
+    raise AssertionError("the saved messages hold no such tool call")
