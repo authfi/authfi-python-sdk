@@ -86,6 +86,7 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
 
 from authfi._adapters import PLACEHOLDER_KEY, agent_id_of, async_gateway_for, httpx_of
 from authfi._protocol.ids import Step, inject_traceparent, register_step_source, step_traceparent
+from authfi._protocol.input_source import add_mark, responses_input_is_untrusted
 from authfi.errors import ConfigurationError, IntegrationError
 from authfi.gateway import (
     HOLD_MESSAGE,
@@ -434,9 +435,12 @@ class AuthFIModel(LitellmModel):
         inject_traceparent(cast("dict[str, str]", headers), self.gateway.source)
         return headers
 
-    async def _with_token(self, settings: ModelSettings) -> ModelSettings:
+    async def _with_token(self, settings: ModelSettings, input: Any) -> ModelSettings:
         url = self.gateway.model_base_url("anthropic") + "/v1/messages"
         headers = {**(settings.extra_headers or {}), **(await self.gateway.source.headers("POST", url))}
+        add_mark(
+            headers, responses_input_is_untrusted(input)
+        )  # LiteLLM's own client says nothing of where input came from
         return dataclasses.replace(settings, extra_headers=headers)
 
     @override
@@ -444,7 +448,7 @@ class AuthFIModel(LitellmModel):
         self, system_instructions: str | None, input: Any, model_settings: ModelSettings, *args: Any, **kwargs: Any
     ) -> Any:
         for attempt in (1, 2):
-            settings = await self._with_token(model_settings)
+            settings = await self._with_token(model_settings, input)
             try:
                 return await super().get_response(system_instructions, input, settings, *args, **kwargs)
             except Exception as error:
@@ -460,7 +464,7 @@ class AuthFIModel(LitellmModel):
         self, system_instructions: str | None, input: Any, model_settings: ModelSettings, *args: Any, **kwargs: Any
     ) -> AsyncIterator[Any]:
         for attempt in (1, 2):
-            settings = await self._with_token(model_settings)
+            settings = await self._with_token(model_settings, input)
             started = False
             try:
                 async for event in super().stream_response(system_instructions, input, settings, *args, **kwargs):

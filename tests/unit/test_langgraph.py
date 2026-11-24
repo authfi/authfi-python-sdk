@@ -566,3 +566,42 @@ async def test_the_models_client_does_not_set_a_traceparent_of_its_own(langgraph
         pytest.skip("this anthropic does not trace")
     assert client.open_telemetry["propagation"] is False
     assert isinstance(client, anthropic.AsyncAnthropic)
+
+
+# --- where the content of a model request came from (AuthFI-Input-Source) --------------------------------------------
+
+ODD_REQUEST = '{"messages": [{"role": "user", "content": [{"type": "video"}]}], "max_tokens": 1}'
+
+
+async def test_a_tool_result_in_the_next_model_request_is_marked_and_the_persons_own_first_turn_is_not(
+    fake: FakeGateway,
+    langgraph: LangGraphIntegration,
+) -> None:
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    graph = await _graph(langgraph)
+    await graph.ainvoke(ask("Summarise the wiki"), CONFIG)
+
+    assert fake.input_sources() == [None, "untrusted"]
+
+
+async def test_a_run_of_only_what_the_person_said_sends_no_mark(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    fake.model_script += [[{"type": "text", "text": "Hello."}]]
+
+    graph = await _graph(langgraph)
+    await graph.ainvoke(ask("Hello"), CONFIG)
+
+    assert fake.input_sources() == [None]
+
+
+async def test_a_model_request_whose_shape_the_sdk_cannot_read_is_marked(
+    fake: FakeGateway, langgraph: LangGraphIntegration
+) -> None:
+    gateway = langgraph.gateway
+    url = gateway.model_base_url("anthropic") + "/v1/messages"
+
+    await gateway.http_client().post(url, content=ODD_REQUEST, headers={"content-type": "application/json"})
+
+    assert fake.input_sources() == ["untrusted"]

@@ -473,3 +473,38 @@ async def test_a_model_call_and_a_tool_call_name_the_step_that_made_them(
     # The MCP session was opened inside the agent's step; the call names the tool's own.
     assert exported[calls[0][:2]] == f"execute_tool {ALLOWED}"
     provider.shutdown()
+
+
+# --- where the content of a model request came from (AuthFI-Input-Source) --------------------------------------------
+
+ODD_REQUEST = '{"messages": [{"role": "user", "content": [{"type": "video"}]}], "max_tokens": 1}'
+
+
+async def test_a_tool_result_in_the_next_model_request_is_marked_and_the_persons_own_first_turn_is_not(
+    fake: FakeGateway,
+    adk: ADKIntegration,
+) -> None:
+    fake.model_script += [_use(ALLOWED), [{"type": "text", "text": "Read it."}]]
+
+    await Run(adk).ask("Describe the wiki")
+
+    assert fake.input_sources() == [None, "untrusted"]
+
+
+async def test_a_run_of_only_what_the_person_said_sends_no_mark(fake: FakeGateway, adk: ADKIntegration) -> None:
+    fake.model_script += [[{"type": "text", "text": "Hello."}]]
+
+    await Run(adk).ask("Hello")
+
+    assert fake.input_sources() == [None]
+
+
+async def test_a_model_request_whose_shape_the_sdk_cannot_read_is_marked(
+    fake: FakeGateway, adk: ADKIntegration
+) -> None:
+    gateway = adk.gateway
+    url = gateway.model_base_url("anthropic") + "/v1/messages"
+
+    await gateway.http_client().post(url, content=ODD_REQUEST, headers={"content-type": "application/json"})
+
+    assert fake.input_sources() == ["untrusted"]
