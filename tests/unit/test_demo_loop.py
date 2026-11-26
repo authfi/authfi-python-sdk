@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "runner" / "scripts" / "langgraph"))
-import demo_loop as dl  # noqa: E402
+import demo_loop as dl
 
 JWT = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJhZ3RfMSJ9.c2lnbmF0dXJlLWJ5dGVz"
 
@@ -79,7 +79,9 @@ async def test_a_run_logs_each_step_and_waits_the_interval(capsys: pytest.Captur
     assert names == ["sign_in", "run_start", "tool_call", "tool_call", "model_call_start", "model_call_end"]
 
 
-async def test_a_stop_on_a_tool_call_backs_off_then_signs_in_afresh_and_resumes(capsys: pytest.CaptureFixture[str]) -> None:
+async def test_a_stop_on_a_tool_call_backs_off_then_signs_in_afresh_and_resumes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     stopped = FakeSession("list", RuntimeError("refused: EKILL001 the agent is stopped"))
     opener = Opener(stopped, FakeSession())
     loop = dl.DemoLoop(opener, CFG)
@@ -101,7 +103,9 @@ async def test_a_cut_stream_is_a_stop(capsys: pytest.CaptureFixture[str]) -> Non
     assert any(e["event"] == "stopped" for e in out)
 
 
-async def test_a_refused_token_mint_backs_off_without_crashing_and_never_hammers(capsys: pytest.CaptureFixture[str]) -> None:
+async def test_a_refused_token_mint_backs_off_without_crashing_and_never_hammers(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     refused = RuntimeError("token endpoint: EKILL001")
     opener = Opener(refused, refused, refused, FakeSession())
     slept: list[float] = []
@@ -195,5 +199,7 @@ async def test_a_probe_that_hangs_times_out() -> None:
 
 def test_the_settings_default_and_read_the_environment() -> None:
     assert dl.Config.from_env({}) == dl.Config(interval=60, stopped_backoff=30)
-    cfg = dl.Config.from_env({"DEMO_INTERVAL_SECONDS": "5", "DEMO_STOPPED_BACKOFF_SECONDS": "x", "DEMO_DIRECT_PROVIDER_PROBE": "1"})
+    cfg = dl.Config.from_env(
+        {"DEMO_INTERVAL_SECONDS": "5", "DEMO_STOPPED_BACKOFF_SECONDS": "x", "DEMO_DIRECT_PROVIDER_PROBE": "1"}
+    )
     assert (cfg.interval, cfg.stopped_backoff, cfg.direct_probe) == (5, 30, True)

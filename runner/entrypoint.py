@@ -53,7 +53,11 @@ def problems(env: dict[str, str]) -> list[str]:
     if env.get("FW_SCRIPT", "").strip() and script_for(env) is None:
         out.append("FW_SCRIPT is not one of %s" % ", ".join(sorted(ALTERNATE.get(FRAMEWORK, {}))))
     if observing(env):
-        out += ["%s is set while AUTHFI_CONFIG_OBSERVE=1 (an observed run names no version)" % n for n in CONFIG_NAMES if env.get(n, "").strip()]
+        out += [
+            "%s is set while AUTHFI_CONFIG_OBSERVE=1 (an observed run names no version)" % n
+            for n in CONFIG_NAMES
+            if env.get(n, "").strip()
+        ]
         required = tuple(n for n in REQUIRED if n not in CONFIG_NAMES)
     else:
         required = REQUIRED
