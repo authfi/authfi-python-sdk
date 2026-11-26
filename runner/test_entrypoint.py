@@ -56,6 +56,21 @@ class Entrypoint(unittest.TestCase):
         self.assertTrue(ep.problems(dict(self.good, AUTHFI_CONFIG_VERSION="v3")))
         self.assertTrue(ep.problems(dict(self.good, AUTHFI_CONFIG_DIGEST="md5:00")))
 
+    def test_an_observed_first_run_names_no_version_and_a_named_one_is_refused(self) -> None:
+        ep = load()
+        env = {k: v for k, v in self.good.items() if not k.startswith("AUTHFI_CONFIG_")}
+        self.assertEqual(ep.problems(dict(env, AUTHFI_CONFIG_OBSERVE="1")), [])
+        self.assertTrue(ep.problems(env), "without observe, a missing version is still refused")
+        self.assertTrue(ep.problems(dict(self.good, AUTHFI_CONFIG_OBSERVE="1")), "observe and a version together")
+
+    def test_the_demo_script_is_selectable_by_name_only(self) -> None:
+        ep = load()
+        self.assertEqual(ep.script_for({"FW_SCRIPT": "demo"}), "langgraph/demo_agent.py")
+        self.assertEqual(ep.script_for({}), "langgraph/agent.py")
+        self.assertIsNone(ep.script_for({"FW_SCRIPT": "../common/harness.py"}))
+        self.assertTrue(ep.problems(dict(self.good, FW_SCRIPT="../x")))
+        self.assertEqual(ep.problems(dict(self.good, FW_SCRIPT="demo")), [])
+
     def test_an_unknown_framework_is_refused(self) -> None:
         self.assertTrue(load("claude-agent-sdk").problems(self.good), "claude-agent-sdk has no instance path yet")
         load()
@@ -65,7 +80,8 @@ class Image(unittest.TestCase):
     here = Path(__file__).resolve().parent
 
     def test_every_framework_script_is_in_the_image_context(self) -> None:
-        for rel in load().SCRIPT.values():
+        ep = load()
+        for rel in [*ep.SCRIPT.values(), *(r for alt in ep.ALTERNATE.values() for r in alt.values())]:
             self.assertTrue((self.here / "scripts" / rel).is_file(), rel)
 
     def test_the_copied_scripts_are_the_ones_that_were_recorded(self) -> None:
