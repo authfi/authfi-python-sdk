@@ -110,7 +110,7 @@ async def direct_probe(
 ) -> dict[str, Any]:
     """A deliberate "skip the gateway" attempt: a TCP and TLS handshake to the provider, sending nothing at all.
 
-    No request, header, key or prompt is written: the connection is closed right after the handshake.
+    No request, header, key or text of any kind is written: the connection is closed right after the handshake.
     """
     context = ssl.create_default_context()
     try:

@@ -88,7 +88,7 @@ async def test_a_stop_on_a_tool_call_backs_off_then_signs_in_afresh_and_resumes(
     assert await loop.step() == 60
     assert opener.opened == 2
     names = [e["event"] for e in events(capsys)]
-    assert names.count("stopped") == 1 and names[-1] == "model_call_end"
+    assert names.count("stopped") == 1 and names[-1] == "resume"
     assert "resume" in names and names.index("resume") > names.index("stopped")
 
 
